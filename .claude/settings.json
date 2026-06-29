@@ -1,0 +1,28 @@
+{
+  "enabledPlugins": {
+    "ponytail@ponytail": true
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'RAPPEL LucidFlow : consulte les notes pertinentes du coffre (00 Accueil, Conventions, 04 Stack technique) AVANT de répondre, ne devine pas ; journalise dans 08 Journal de bord en fin de session.'"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/liamlegaillard/Documents/LucidFlow/.claude/hooks/commit-vault.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

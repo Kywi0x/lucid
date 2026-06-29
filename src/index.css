@@ -1,0 +1,172 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+/* ─── Thème (clair par défaut, sombre via OS ou [data-theme="dark"]) ───────── */
+:root {
+  --color-bg: #ffffff;
+  --color-surface: #fbfbfb;
+  --color-surface-2: #eeeff1;
+  --color-border: #e6e7ea;
+  --color-text: #1e1e1e;
+  --color-muted: #8d8d8d;
+  --color-accent: #7c5cff;
+  --color-accent-hover: #6a47f5;
+  --color-accent-soft: rgba(124, 92, 255, 0.12);
+  --shadow-float: 0 8px 30px rgba(0, 0, 0, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: #1b1d21;
+    --color-surface: #232529;
+    --color-surface-2: #313337;
+    --color-border: #31333a;
+    --color-text: #ffffff;
+    --color-muted: #8d8d8d;
+    --color-accent-soft: rgba(124, 92, 255, 0.2);
+    --shadow-float: 0 8px 30px rgba(0, 0, 0, 0.45);
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #1b1d21;
+  --color-surface: #232529;
+  --color-surface-2: #313337;
+  --color-border: #31333a;
+  --color-text: #ffffff;
+  --color-muted: #8d8d8d;
+  --color-accent-soft: rgba(124, 92, 255, 0.2);
+  --shadow-float: 0 8px 30px rgba(0, 0, 0, 0.45);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Le canvas React Flow doit laisser voir le fond du thème */
+.react-flow,
+.react-flow__renderer {
+  background: transparent;
+}
+
+/* Bulle : animation de survol */
+.bubble {
+  transition:
+    transform 0.18s ease,
+    box-shadow 0.18s ease,
+    filter 0.18s ease;
+}
+.bubble:hover {
+  transform: scale(1.08);
+  filter: brightness(1.08);
+  z-index: 10;
+}
+.bubble__cat {
+  position: absolute;
+  bottom: -22px;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--color-surface);
+  color: var(--color-muted);
+  border: 1px solid var(--color-border);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.bubble:hover .bubble__cat {
+  opacity: 1;
+}
+
+/* Rendu markdown du brain.md */
+.prose-brain h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0.5rem 0 1rem;
+}
+.prose-brain h2 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 1.5rem 0 0.5rem;
+  color: var(--color-accent);
+}
+.prose-brain h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 1rem 0 0.25rem;
+}
+.prose-brain ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+  margin: 0.25rem 0;
+}
+.prose-brain li {
+  margin: 0.15rem 0;
+}
+.prose-brain p,
+.prose-brain blockquote {
+  margin: 0.4rem 0;
+  color: var(--color-muted);
+}
+.prose-brain blockquote {
+  border-left: 3px solid var(--color-accent);
+  padding-left: 0.75rem;
+  font-style: italic;
+}
+.prose-brain table {
+  border-collapse: collapse;
+  margin: 0.75rem 0;
+  width: 100%;
+  font-size: 0.85em;
+}
+.prose-brain th,
+.prose-brain td {
+  border: 1px solid var(--color-border);
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+}
+.prose-brain th {
+  background: var(--color-surface-2);
+}
+.prose-brain code {
+  background: var(--color-surface-2);
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+@keyframes bubblePop {
+  from { opacity: 0; transform: scale(0.4); }
+  to   { opacity: 1; transform: scale(1); }
+}
