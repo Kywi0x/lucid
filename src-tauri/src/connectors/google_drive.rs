@@ -4,11 +4,21 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 
-// ─── Credentials bundlées (pattern "installed app" Google — pas de secret côté user) ──
+// ─── Credentials Google (pattern "installed app" — lues depuis .env, jamais committées) ──
 
-// ponytail: à remplir depuis Google Cloud Console → OAuth 2.0 → Desktop app.
-const GOOGLE_CLIENT_ID: &str = "445187885318-ocn9o9u0akqpp0rs9h0ftvtpj441jl1r.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET: &str = "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";
+fn google_client_id() -> &'static str {
+    std::env::var("GOOGLE_CLIENT_ID")
+        .ok()
+        .map(|s| Box::leak(s.into_boxed_str()) as &str)
+        .unwrap_or("")
+}
+
+fn google_client_secret() -> &'static str {
+    std::env::var("GOOGLE_CLIENT_SECRET")
+        .ok()
+        .map(|s| Box::leak(s.into_boxed_str()) as &str)
+        .unwrap_or("")
+}
 
 // ─── Tokens ──────────────────────────────────────────────────────────────────
 
@@ -60,8 +70,8 @@ fn valid_access_token() -> Result<String, String> {
     let resp: serde_json::Value = client
         .post("https://oauth2.googleapis.com/token")
         .form(&[
-            ("client_id", GOOGLE_CLIENT_ID),
-            ("client_secret", GOOGLE_CLIENT_SECRET),
+            ("client_id", google_client_id()),
+            ("client_secret", google_client_secret()),
             ("refresh_token", rt.as_str()),
             ("grant_type", "refresh_token"),
         ])
@@ -89,9 +99,10 @@ pub fn prepare_connect() -> Result<(TcpListener, String, String), String> {
     let redirect_uri = format!("http://localhost:{port}");
 
     let redirect_enc = format!("http%3A%2F%2Flocalhost%3A{port}");
+    let client_id = google_client_id();
     let auth_url = format!(
         "https://accounts.google.com/o/oauth2/auth\
-         ?client_id={GOOGLE_CLIENT_ID}\
+         ?client_id={client_id}\
          &redirect_uri={redirect_enc}\
          &response_type=code\
          &scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly\
@@ -110,8 +121,8 @@ pub fn finish_connect(listener: TcpListener, redirect_uri: &str) -> Result<(), S
         .post("https://oauth2.googleapis.com/token")
         .form(&[
             ("code", code.as_str()),
-            ("client_id", GOOGLE_CLIENT_ID),
-            ("client_secret", GOOGLE_CLIENT_SECRET),
+            ("client_id", google_client_id()),
+            ("client_secret", google_client_secret()),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
         ])
