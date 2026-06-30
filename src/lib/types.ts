@@ -9,11 +9,9 @@ export interface Message {
 export interface ConversationSummary {
   id: string;
   title: string;
-  /** Affichage seulement — ne plus utiliser comme clé de groupe. */
   project: string;
   project_slug: string;
   source: string;
-  /** Hiérarchie native du connecteur (ex. ["Clients","Béaux Électricité"]). Vide = Non classé. */
   container_path: string[];
   message_count: number;
   first_timestamp: string | null;
@@ -25,19 +23,7 @@ export interface Conversation extends ConversationSummary {
 }
 
 /** Graphe de connaissances généré par l'IA (mind map à bulles). */
-export type NodeKind = "root" | "project" | "concept";
-
-/** Provenance d'un nœud (traçabilité / drill-down, multi-connecteurs). */
-export interface SourceRef {
-  connector: string; // "claude-code", "google-drive", ...
-  title: string;
-  id: string;
-  project_slug: string;
-  link: string | null;
-  timestamp: string | null;
-}
-
-export type Confidence = "extracted" | "inferred" | "ambiguous";
+export type NodeKind = "root" | "container" | "leaf" | "group" | "espace" | "page" | "source";
 
 export interface BrainNode {
   id: string;
@@ -48,24 +34,28 @@ export interface BrainNode {
   keywords: string[];
   decisions: string[];
   patterns: string[];
-  sources: SourceRef[];
-  community?: number; // 0 = global/pont, 1..n = projet
+  community?: number;
+  parent_id?: string | null;
+  synthesized_at?: string | null;
+  content?: string;
+  // Provenance (nœuds feuilles uniquement)
+  connector?: string;
+  source_id?: string;
+  source_project?: string;
 }
 
 export interface BrainEdge {
   source: string;
   target: string;
-  kind: "project" | "concept";
-  relation?: "contains" | "uses" | "bridges";
-  confidence?: Confidence;
-  confidence_score?: number;
+  kind: string;
+  relation?: string;
 }
 
 export interface BrainGraph {
   nodes: BrainNode[];
   edges: BrainEdge[];
   markdown: string;
-  report?: string; // compact, optimisé injection LLM
+  report?: string;
   generated_at: string;
 }
 
@@ -75,6 +65,5 @@ export interface ConnectorStatus {
   connected: boolean;
   last_sync: string | null;
   conversation_count: number;
-  /** true = credentials manquants, l'UI propose de les importer */
   needs_setup?: boolean;
 }

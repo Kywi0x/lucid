@@ -1,265 +1,697 @@
-import { useMemo } from "react";
+import {
+  useMemo, useState, useEffect, useRef, useCallback,
+} from "react";
 import {
   ReactFlow,
-  Background,
-  BackgroundVariant,
-  Controls,
-  Handle,
-  Position,
+  Background, BackgroundVariant,
+  Handle, Position,
+  useNodesState,
   useViewport,
-  type Node,
-  type Edge,
-  type NodeProps,
+  useReactFlow,
+  type Node, type Edge, type NodeProps,
 } from "@xyflow/react";
-import {
-  forceSimulation,
-  forceLink,
-  forceManyBody,
-  forceCenter,
-  forceCollide,
-  type SimulationNodeDatum,
-} from "d3-force";
 import type { BrainGraph, BrainNode } from "@/lib/types";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Props {
   graph: BrainGraph;
   onSelect: (node: BrainNode) => void;
   selectedId: string | null;
   query: string;
+  revealKey?: number;
+  streamLabels?: string[];
+  streamTotal?: number;
 }
 
-interface SimNode extends SimulationNodeDatum {
+interface NodeInfo {
   id: string;
-  r: number;
   node: BrainNode;
+  r: number;
+  finalX: number;
+  finalY: number;
+  birthX: number;
+  birthY: number;
+  birthDelay: number;
+  parentId: string | null;
 }
 
-/** Palette de catégories (lisible en clair comme en sombre). */
-const PALETTE = [
-  "#7c5cff", "#1f9d72", "#e0823d", "#d6457f", "#3a8ef0",
-  "#caa23a", "#9b59b6", "#2bb3a3", "#e0594b", "#5d6cf0",
-];
-const BRIDGE = "#7c5cff";
+// ─── Palette (genesis uniquement) ─────────────────────────────────────────────
 
-const CAT_LABEL: Record<string, string> = {
-  root: "Cerveau",
-  project: "Projet",
-  concept: "Concept",
-};
+const PALETTE = [
+  "#7b6fe0", "#3ea882", "#c97c4a", "#c95c88",
+  "#4a8dcc", "#b08a28", "#8752ba", "#38a09a",
+  "#b84c44", "#5060c0",
+];
 
 function radiusOf(n: BrainNode): number {
-  if (n.kind === "root") return 50;
-  if (n.kind === "project") return 24 + Math.sqrt(n.weight) * 7;
-  return 13 + Math.sqrt(n.weight) * 5;
+  if (n.kind === "root")                             return 44;
+  if (n.kind === "group")                            return 26 + Math.sqrt(n.weight) * 3;
+  if (n.kind === "espace" || n.kind === "container") return 14 + Math.sqrt(n.weight) * 3.5;
+  return 9; // leaf, page, concept, source
+}
+
+function isLeafKind(kind: string): boolean {
+  return kind === "leaf" || kind === "page" || kind === "concept" || kind === "source";
 }
 
 function matches(n: BrainNode, q: string): boolean {
-  if (!q) return true;
-  const hay = [n.label, n.summary, ...n.keywords].join(" ").toLowerCase();
-  return hay.includes(q);
+  return [n.label, n.summary, ...n.keywords].join(" ").toLowerCase().includes(q);
 }
 
-function layout(graph: BrainGraph): {
-  nodes: Node[];
-  edges: Edge[];
-  colorOf: Map<string, string>;
-} {
-  // Couleur par projet, héritée par ses concepts (concept-pont = violet).
-  const projColor = new Map<string, string>();
-  let pi = 0;
-  for (const n of graph.nodes) {
-    if (n.kind === "project") projColor.set(n.id, PALETTE[pi++ % PALETTE.length]);
+function orbitR(N: number, maxR: number, gap: number, minR: number): number {
+  if (N <= 1) return minR;
+  return Math.max(minR, (maxR + gap) / Math.sin(Math.PI / N));
+}
+
+function arcOrbitR(N: number, rs: number, gap: number, spread: number, minR: number): number {
+  if (N <= 1) return minR;
+  const angularStep = spread / (N - 1);
+  const minByArc = (rs + gap / 2) / Math.sin(angularStep / 2);
+  return Math.max(minR, minByArc);
+}
+
+function stableHash(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
+  return (h >>> 0) / 0xffffffff;
+}
+
+function jitter(id: string, axis: string, scale: number): number {
+  return (stableHash(id + axis) * 2 - 1) * scale;
+}
+
+function arcSpread(N: number): number {
+  if (N <= 1) return 0;
+  return Math.min(Math.PI * 0.83, Math.PI / 3 + N * 0.2);
+}
+
+// ─── Layout radial récursif (parent_id) ───────────────────────────────────────
+
+function buildLayout(
+  graph: BrainGraph,
+): { infos: Map<string, NodeInfo>; childrenOf: Map<string, string[]> } {
+  const infos = new Map<string, NodeInfo>();
+
+  // Index children par parent_id
+  const childrenByParent = new Map<string, BrainNode[]>();
+  for (const node of graph.nodes) {
+    if (!node.parent_id) continue;
+    if (!childrenByParent.has(node.parent_id)) childrenByParent.set(node.parent_id, []);
+    childrenByParent.get(node.parent_id)!.push(node);
   }
-  const conceptProjects = new Map<string, string[]>();
-  for (const e of graph.edges) {
-    if (e.kind === "concept") {
-      const arr = conceptProjects.get(e.target) ?? [];
-      arr.push(e.source);
-      conceptProjects.set(e.target, arr);
+
+  const rootNode = graph.nodes.find((n) => n.kind === "root");
+  const rootId = rootNode?.id ?? "root";
+  if (rootNode) {
+    infos.set(rootId, {
+      id: rootId, node: rootNode, r: 44,
+      finalX: 0, finalY: 0, birthX: 0, birthY: 0, birthDelay: 0, parentId: null,
+    });
+  }
+
+  function placeLevel(
+    parentId: string, px: number, py: number,
+    gpx: number, gpy: number,
+    parentDelay: number, depth: number,
+  ) {
+    const kids = childrenByParent.get(parentId) ?? [];
+    if (!kids.length) return;
+    const N = kids.length;
+    const maxR = kids.reduce((m, k) => Math.max(m, radiusOf(k)), 9);
+    const isFirst = depth === 1;
+    const spread = isFirst ? Math.PI * 2 : arcSpread(N);
+    const R = isFirst
+      ? orbitR(N, maxR, 50, 160)
+      : arcOrbitR(N, maxR, 18, spread, Math.max(28, 68 - depth * 8));
+    const outAngle = Math.atan2(py - gpy, px - gpx);
+
+    kids.forEach((kid, ki) => {
+      const t = N <= 1 ? 0.5 : ki / (N - 1);
+      const baseAngle = isFirst
+        ? (ki / N) * Math.PI * 2 - Math.PI / 2
+        : outAngle - spread / 2 + t * spread;
+      const jAng = jitter(kid.id, "ang", 0.18 / Math.max(N, 3));
+      const jRad = jitter(kid.id, "rad", R * 0.12);
+      const kx = px + (R + jRad) * Math.cos(baseAngle + jAng);
+      const ky = py + (R + jRad) * Math.sin(baseAngle + jAng);
+      const kidDelay = parentDelay + (ki + 1) * (isLeafKind(kid.kind) ? 60 : 200);
+
+      infos.set(kid.id, {
+        id: kid.id, node: kid, r: radiusOf(kid),
+        finalX: kx, finalY: ky, birthX: px, birthY: py,
+        birthDelay: kidDelay, parentId: parentId,
+      });
+
+      placeLevel(kid.id, kx, ky, px, py, kidDelay, depth + 1);
+    });
+  }
+
+  placeLevel(rootId, 0, 0, 0, 100, 0, 1);
+
+  const childrenOf = new Map<string, string[]>();
+  for (const info of infos.values()) {
+    if (!childrenOf.has(info.id)) childrenOf.set(info.id, []);
+    if (info.parentId) {
+      if (!childrenOf.has(info.parentId)) childrenOf.set(info.parentId, []);
+      childrenOf.get(info.parentId)!.push(info.id);
     }
   }
-  const colorOf = new Map<string, string>();
-  for (const n of graph.nodes) {
-    if (n.kind === "root") colorOf.set(n.id, "#7c5cff");
-    else if (n.kind === "project") colorOf.set(n.id, projColor.get(n.id) ?? BRIDGE);
-    else {
-      const ps = conceptProjects.get(n.id) ?? [];
-      colorOf.set(n.id, ps.length === 1 ? projColor.get(ps[0]) ?? BRIDGE : BRIDGE);
+
+  return { infos, childrenOf };
+}
+
+function computePushOffsets(
+  infos: Map<string, NodeInfo>,
+  focusedId: string,
+  dragOffsets: Map<string, { dx: number; dy: number }>,
+): Map<string, { dx: number; dy: number }> {
+  const focused = infos.get(focusedId);
+  if (!focused) return new Map();
+  const fx = focused.finalX + (dragOffsets.get(focusedId)?.dx ?? 0);
+  const fy = focused.finalY + (dragOffsets.get(focusedId)?.dy ?? 0);
+  const PUSH = 230;
+  const result = new Map<string, { dx: number; dy: number }>();
+  for (const info of infos.values()) {
+    if (info.id === focusedId || info.node.kind === "root") continue;
+    if (info.parentId === focusedId) continue;
+    const isLeaf = isLeafKind(info.node.kind);
+    const isContainer = !isLeaf;
+    if (!isContainer && !isLeaf) continue;
+    if (isLeaf) {
+      const par = infos.get(info.parentId ?? "");
+      if (par?.parentId === focusedId) continue;
     }
+    const refId = isLeaf ? (info.parentId ?? info.id) : info.id;
+    const ref = infos.get(refId)!;
+    const rx = ref.finalX + (dragOffsets.get(refId)?.dx ?? 0);
+    const ry = ref.finalY + (dragOffsets.get(refId)?.dy ?? 0);
+    const ddx = rx - fx, ddy = ry - fy;
+    const dist = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+    result.set(info.id, { dx: (ddx / dist) * PUSH, dy: (ddy / dist) * PUSH });
   }
-
-  const sim: SimNode[] = graph.nodes.map((n) => ({
-    id: n.id,
-    r: radiusOf(n),
-    node: n,
-  }));
-  const byId = new Map(sim.map((s) => [s.id, s]));
-  type SimLink = { source: string | SimNode; target: string | SimNode };
-  const links: SimLink[] = graph.edges
-    .filter((e) => byId.has(e.source) && byId.has(e.target))
-    .map((e) => ({ source: e.source, target: e.target }));
-
-  forceSimulation(sim)
-    .force(
-      "link",
-      forceLink<SimNode, SimLink>(links)
-        .id((d) => d.id)
-        .distance((l) => ((l.target as SimNode).node.kind === "project" ? 200 : 95))
-        .strength(0.5),
-    )
-    .force("charge", forceManyBody().strength(-340))
-    .force("center", forceCenter(0, 0))
-    .force(
-      "collide",
-      forceCollide<SimNode>().radius((d) => d.r + 12),
-    )
-    .stop()
-    .tick(420);
-
-  const nodes: Node[] = sim.map((s, i) => ({
-    id: s.id,
-    type: "bubble",
-    position: { x: (s.x ?? 0) - s.r, y: (s.y ?? 0) - s.r },
-    data: { node: s.node, r: s.r, color: colorOf.get(s.id) ?? BRIDGE, index: i },
-    draggable: true,
-  }));
-
-  const edges: Edge[] = graph.edges.map((e, i) => ({
-    id: `e${i}`,
-    source: e.source,
-    target: e.target,
-    type: "straight",
-    style: {
-      stroke: "var(--color-border)",
-      strokeWidth: e.kind === "project" ? 1.6 : 1,
-    },
-  }));
-
-  return { nodes, edges, colorOf };
+  return result;
 }
 
-function hexWithAlpha(hex: string, alpha: number): string {
-  const a = Math.round(alpha * 255).toString(16).padStart(2, "0");
-  return `${hex}${a}`;
+function getDescendants(id: string, childrenOf: Map<string, string[]>): string[] {
+  const out: string[] = [];
+  const q = [id];
+  while (q.length) {
+    for (const c of childrenOf.get(q.pop()!) ?? []) { out.push(c); q.push(c); }
+  }
+  return out;
 }
 
-// Seuils de zoom : 0.35 → label, 0.65 → catégorie, 1.1 → résumé court.
-function BubbleNode({ data, selected }: NodeProps) {
-  const { zoom } = useViewport();
-  const node = data.node as BrainNode;
-  const r = data.r as number;
-  const color = data.color as string;
-  const dim = data.dim as boolean;
-  const index = (data.index as number) ?? 0;
+// ─── Construction des nœuds RF ────────────────────────────────────────────────
+
+function makeNodes(
+  infos: Map<string, NodeInfo>,
+  dragOffsets: Map<string, { dx: number; dy: number }>,
+  revealKey: number,
+  showLeaves: boolean,
+  selectedId: string | null,
+  q: string,
+  focusedId: string | null,
+): Node[] {
+  const pushOffsets = focusedId
+    ? computePushOffsets(infos, focusedId, dragOffsets)
+    : null;
+
+  return Array.from(infos.values())
+    .filter((info) => {
+      if (isLeafKind(info.node.kind)) return showLeaves;
+      return true;
+    })
+    .map((info, i) => {
+      const off   = dragOffsets.get(info.id) ?? { dx: 0, dy: 0 };
+      const push  = pushOffsets?.get(info.id) ?? { dx: 0, dy: 0 };
+      const moved = off.dx !== 0 || off.dy !== 0;
+      const isLeaf = isLeafKind(info.node.kind);
+      const isParentFocused = isLeaf && info.parentId === focusedId;
+      return {
+        id: info.id,
+        type: "bubble",
+        position: {
+          x: info.finalX - info.r + off.dx + push.dx,
+          y: info.finalY - info.r + off.dy + push.dy,
+        },
+        selected: info.id === selectedId,
+        draggable: !isLeaf,
+        data: {
+          node: info.node, r: info.r, idx: i,
+          bx: moved ? 0 : info.birthX - info.finalX,
+          by: moved ? 0 : info.birthY - info.finalY,
+          delay: moved ? 0 : info.birthDelay,
+          revealKey, isLeaf, isParentFocused,
+          parentId: info.parentId,
+          dim: q ? !matches(info.node, q) : false,
+        },
+      };
+    });
+}
+
+function makeGenesisNodes(labels: string[], total: number, revealKey: number): Node[] {
+  const G = Math.max(total, labels.length, 1);
+  const Rg = orbitR(G, 26, 50, 220);
+
+  const nodes: Node[] = [{
+    id: "g-root", type: "genesis",
+    position: { x: -44, y: -44 },
+    data: { isRoot: true, revealKey },
+    draggable: false,
+  }];
+
+  labels.forEach((label, i) => {
+    const baseAngle = (i / G) * Math.PI * 2 - Math.PI / 2;
+    const jAng = jitter(label, "ang", 0.18 / Math.max(G, 3));
+    const jRad = jitter(label, "rad", Rg * 0.14);
+    const gx   = (Rg + jRad) * Math.cos(baseAngle + jAng);
+    const gy   = (Rg + jRad) * Math.sin(baseAngle + jAng);
+    const r    = 18;
+    const color = PALETTE[i % PALETTE.length];
+
+    nodes.push({
+      id: `g-${i}`, type: "genesis",
+      position: { x: gx - r, y: gy - r },
+      data: { label, idx: i, revealKey: i, r, color },
+      draggable: false,
+    });
+
+    const NB_SAT = 4;
+    const Rsat = 48;
+    for (let s = 0; s < NB_SAT; s++) {
+      const sa = (s / NB_SAT) * Math.PI * 2 + i * 0.7;
+      nodes.push({
+        id: `g-${i}-s-${s}`, type: "genesisSat",
+        position: { x: gx + Rsat * Math.cos(sa) - 5, y: gy + Rsat * Math.sin(sa) - 5 },
+        data: { idx: s, parentIdx: i, revealKey: i, color },
+        draggable: false,
+      });
+    }
+  });
+
+  return nodes;
+}
+
+// ─── Edges ────────────────────────────────────────────────────────────────────
+
+function makeEdges(infos: Map<string, NodeInfo>, showLeaves: boolean): Edge[] {
+  return Array.from(infos.values())
+    .filter((info) => {
+      if (!info.parentId || info.parentId === "root") return false;
+      if (isLeafKind(info.node.kind)) return showLeaves;
+      return true;
+    })
+    .map((info) => {
+      const isLeaf = isLeafKind(info.node.kind);
+      return {
+        id: `e-${info.parentId}-${info.id}`,
+        source: info.parentId!,
+        target: info.id,
+        type: "straight",
+        animated: false,
+        style: {
+          stroke: "var(--color-border)",
+          strokeWidth: isLeaf ? 0.6 : 1,
+          opacity: isLeaf ? 0.5 : 0.4,
+          strokeDasharray: isLeaf ? "3 6" : undefined,
+        },
+      };
+    });
+}
+
+// ─── Handle invisible ────────────────────────────────────────────────────────
+
+const H: React.CSSProperties = {
+  opacity: 0, top: "50%", left: "50%", width: 1, height: 1,
+  border: "none", background: "transparent",
+};
+
+// ─── BubbleNode ───────────────────────────────────────────────────────────────
+
+function BubbleNode({ data }: NodeProps) {
+  const node    = data.node          as BrainNode;
+  const r       = data.r             as number;
+  const dim     = (data.dim          as boolean) ?? false;
+  const bx      = (data.bx           as number)  ?? 0;
+  const by      = (data.by           as number)  ?? 0;
+  const delay   = (data.delay        as number)  ?? 0;
+  const revealKey = (data.revealKey  as number)  ?? 0;
+  const isLeaf  = (data.isLeaf       as boolean) ?? false;
+  const isParentFocused = (data.isParentFocused as boolean) ?? false;
+  const isRoot  = node.kind === "root";
+  const isGroup = node.kind === "group" || node.kind === "container";
+  const innerRef = useRef<HTMLDivElement>(null);
   const size = r * 2;
-  const solid = node.kind !== "concept";
 
-  const showLabel = zoom >= 0.35;
-  const showCategory = zoom >= 0.65;
-  const showSummary = zoom >= 1.1 && !!node.summary;
-  const fontSize = node.kind === "root" ? 13 : node.kind === "project" ? 11 : 9;
+  useEffect(() => {
+    const el = innerRef.current;
+    if (!el) return;
+    const anim = el.animate(
+      [
+        { transform: `translate(${bx}px,${by}px) scale(0.18)`, opacity: 0 },
+        { transform: "translate(0,0) scale(1)", opacity: 1 },
+      ],
+      {
+        duration: isLeaf ? 320 : 520,
+        delay,
+        fill: "both",
+        easing: isLeaf ? "ease-out" : "cubic-bezier(0.34, 1.56, 0.64, 1)",
+      },
+    );
+    return () => anim.cancel();
+  }, [revealKey]); // eslint-disable-line
 
-  return (
-    <div
-      className="bubble"
-      style={{
-        width: size,
-        height: size,
-        position: "relative",
-        background: solid ? color : hexWithAlpha(color, 0.18),
-        color: solid ? "#fff" : "var(--color-text)",
-        borderRadius: "50%",
-        border: `2px solid ${selected ? "var(--color-text)" : color}`,
-        boxShadow: selected ? "0 0 0 3px var(--color-accent-soft)" : "var(--shadow-float)",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        textAlign: "center",
-        padding: 6,
-        fontSize,
-        fontWeight: node.kind === "concept" ? 500 : 700,
-        lineHeight: 1.15,
-        cursor: "pointer",
-        opacity: dim ? 0.18 : 1,
-        overflow: "hidden",
-        animation: "bubblePop 0.35s cubic-bezier(0.34,1.56,0.64,1) both",
-        animationDelay: `${Math.min(index * 18, 400)}ms`,
-      }}
-    >
-      <Handle type="target" position={Position.Top} style={HANDLE} />
-      {showLabel && (
-        <span style={{ pointerEvents: "none", wordBreak: "break-word" }}>
-          {node.label}
-        </span>
-      )}
-      {showCategory && (
-        <span className="bubble__cat">{CAT_LABEL[node.kind] ?? "Nœud"}</span>
-      )}
-      {showSummary && (
-        <span style={{
-          pointerEvents: "none",
-          fontSize: fontSize - 1,
-          opacity: 0.75,
-          fontWeight: 400,
-          marginTop: 3,
-          lineHeight: 1.2,
-          display: "-webkit-box",
-          WebkitLineClamp: 2,
-          WebkitBoxOrient: "vertical",
-          overflow: "hidden",
+  // ── Lucid (root) ──────────────────────────────────────────────────────────
+  if (isRoot) {
+    return (
+      <div style={{
+        position: "relative", width: size, height: size + 28,
+        cursor: "default", userSelect: "none",
+        opacity: dim ? 0.15 : 1, transition: "opacity 0.2s",
+      }}>
+        <div ref={innerRef} className="lucid-orb" style={{
+          width: size, height: size,
+          animation: "lucidMorph 5.5s ease-in-out infinite, lucidGlow 4s ease-in-out infinite",
         }}>
-          {node.summary}
-        </span>
-      )}
-      <Handle type="source" position={Position.Bottom} style={HANDLE} />
+          <Handle type="target" position={Position.Top}    style={H} />
+          <Handle type="source" position={Position.Bottom} style={H} />
+        </div>
+        <div style={{
+          position: "absolute", top: size + 6, left: "50%",
+          transform: "translateX(-50%)", fontSize: 11, fontWeight: 700,
+          letterSpacing: "0.12em", textTransform: "uppercase",
+          color: "var(--color-text)", pointerEvents: "none", whiteSpace: "nowrap",
+        }}>
+          Lucid
+        </div>
+      </div>
+    );
+  }
+
+  // ── Feuille (leaf/page/concept) ───────────────────────────────────────────
+  if (isLeaf) {
+    return (
+      <div className="node-outer" style={{
+        position: "relative", width: size, height: size,
+        cursor: "pointer", userSelect: "none",
+        opacity: dim ? 0.07 : 1, transition: "opacity 0.2s",
+      }}>
+        <div ref={innerRef} className="node-concept" style={{
+          width: size, height: size, borderRadius: "50%",
+        }}>
+          <Handle type="target" position={Position.Top}    style={H} />
+          <Handle type="source" position={Position.Bottom} style={H} />
+        </div>
+        <div className={`node-label${isParentFocused ? " node-label--visible" : ""}`}>
+          {node.label}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Conteneur / Groupe ────────────────────────────────────────────────────
+  return (
+    <div style={{
+      position: "relative", width: size, height: size + 26,
+      cursor: "grab", userSelect: "none",
+      opacity: dim ? 0.1 : 1, transition: "opacity 0.2s",
+    }}>
+      <div ref={innerRef} className="bubble node-project" style={{
+        width: size, height: size, borderRadius: "50%",
+        boxShadow: isGroup
+          ? "0 4px 18px rgba(0,0,0,0.14), inset 0 1px 0 rgba(255,255,255,0.18)"
+          : "0 2px 8px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.12)",
+      }}>
+        <Handle type="target" position={Position.Top}    style={H} />
+        <Handle type="source" position={Position.Bottom} style={H} />
+      </div>
+      <div style={{
+        position: "absolute", top: size + 5, left: "50%",
+        transform: "translateX(-50%)", width: Math.max(size + 24, 64),
+        textAlign: "center", fontSize: isGroup ? 11 : 10,
+        fontWeight: isGroup ? 650 : 500,
+        color: "var(--color-text)",
+        lineHeight: 1.25, pointerEvents: "none",
+        overflow: "hidden", display: "-webkit-box",
+        WebkitLineClamp: 2, WebkitBoxOrient: "vertical",
+      }}>
+        {node.label}
+      </div>
     </div>
   );
 }
 
-const HANDLE: React.CSSProperties = {
-  opacity: 0,
-  top: "50%",
-  left: "50%",
-  width: 1,
-  height: 1,
-  border: "none",
-  background: "transparent",
-};
+// ─── GenesisNode ─────────────────────────────────────────────────────────────
 
-const nodeTypes = { bubble: BubbleNode };
+function GenesisNode({ data }: NodeProps) {
+  const isRoot = !!(data.isRoot);
+  const label  = (data.label     as string) ?? "";
+  const idx    = (data.idx       as number) ?? 0;
+  const rvk    = (data.revealKey as number) ?? 0;
+  const color  = (data.color     as string) ?? PALETTE[0];
+  const size   = isRoot ? 88 : 28;
+  const ref    = useRef<HTMLDivElement>(null);
 
-export function BrainMap({ graph, onSelect, selectedId, query }: Props) {
-  const base = useMemo(() => layout(graph), [graph]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const anim = el.animate(
+      [{ opacity: 0, transform: "scale(0.2)" }, { opacity: 1, transform: "scale(1)" }],
+      { duration: 480, delay: isRoot ? 0 : idx * 60,
+        fill: "both", easing: "cubic-bezier(0.34, 1.56, 0.64, 1)" },
+    );
+    return () => anim.cancel();
+  }, [rvk]); // eslint-disable-line
+
+  if (isRoot) {
+    return (
+      <div style={{ width: size, height: size }}>
+        <div ref={ref} className="lucid-orb" style={{
+          width: size, height: size,
+          animation: "lucidMorph 5.5s ease-in-out infinite, lucidGlow 4s ease-in-out infinite",
+        }} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: "relative", width: size, height: size + 18 }}>
+      <div ref={ref} style={{
+        width: size, height: size, borderRadius: "50%",
+        background: `radial-gradient(ellipse at 35% 30%, ${color}99, ${color}55)`,
+        border: `1.5px solid ${color}88`, boxShadow: `0 0 8px ${color}55`,
+      }} />
+      <div style={{
+        position: "absolute", top: size + 3, left: "50%",
+        transform: "translateX(-50%)", fontSize: 8,
+        color: "var(--color-muted)", textAlign: "center",
+        whiteSpace: "nowrap", maxWidth: 70,
+        overflow: "hidden", textOverflow: "ellipsis", pointerEvents: "none",
+      }}>
+        {label}
+      </div>
+    </div>
+  );
+}
+
+// ─── GenesisSat ───────────────────────────────────────────────────────────────
+
+function GenesisSat({ data }: NodeProps) {
+  const idx       = (data.idx       as number) ?? 0;
+  const parentIdx = (data.parentIdx as number) ?? 0;
+  const rvk       = (data.revealKey as number) ?? 0;
+  const color     = (data.color     as string) ?? PALETTE[0];
+  const ref       = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const anim = el.animate(
+      [{ opacity: 0, transform: "scale(0)" }, { opacity: 0.7, transform: "scale(1)" }],
+      { duration: 300, delay: parentIdx * 300 + 380 + idx * 60, fill: "both", easing: "ease-out" },
+    );
+    return () => anim.cancel();
+  }, [rvk]); // eslint-disable-line
+
+  return (
+    <div ref={ref} style={{
+      width: 10, height: 10, borderRadius: "50%",
+      background: color, opacity: 0.6, boxShadow: `0 0 6px ${color}88`,
+    }} />
+  );
+}
+
+// ─── ZoomSync ────────────────────────────────────────────────────────────────
+
+function ZoomSync({ onChange }: { onChange: (z: number) => void }) {
+  const { zoom } = useViewport();
+  const prev = useRef(zoom);
+  useEffect(() => {
+    if (Math.abs(zoom - prev.current) > 0.04) {
+      prev.current = zoom;
+      onChange(zoom);
+    }
+  }, [zoom, onChange]);
+  return null;
+}
+
+// ─── FocusSync ───────────────────────────────────────────────────────────────
+
+function FocusSync({
+  focusedId, infos, dragOffsets,
+}: {
+  focusedId: string | null;
+  infos: Map<string, NodeInfo>;
+  dragOffsets: React.RefObject<Map<string, { dx: number; dy: number }>>;
+}) {
+  const { setCenter } = useReactFlow();
+  useEffect(() => {
+    if (!focusedId) return;
+    const info = infos.get(focusedId);
+    if (!info) return;
+    const off = dragOffsets.current?.get(focusedId) ?? { dx: 0, dy: 0 };
+    setCenter(info.finalX + off.dx, info.finalY + off.dy, { zoom: 1.6, duration: 550 });
+  }, [focusedId]); // eslint-disable-line
+  return null;
+}
+
+const nodeTypes = { bubble: BubbleNode, genesis: GenesisNode, genesisSat: GenesisSat };
+
+// ─── BrainMap ─────────────────────────────────────────────────────────────────
+
+export function BrainMap({
+  graph, onSelect, selectedId, query,
+  revealKey = 0, streamLabels = [], streamTotal = 0,
+}: Props) {
+  const [showLeaves, setShowLeaves] = useState(false);
+  const [focusedId, setFocusedId]   = useState<string | null>(null);
   const q = query.trim().toLowerCase();
 
-  const decorated = useMemo(
-    () =>
-      base.nodes.map((n) => ({
-        ...n,
-        selected: n.id === selectedId,
-        data: {
-          ...n.data,
-          dim: !matches((n.data as { node: BrainNode }).node, q),
-        },
-      })),
-    [base.nodes, selectedId, q],
+  const { infos, childrenOf } = useMemo(() => buildLayout(graph), [graph]);
+
+  const dragOffsets = useRef(new Map<string, { dx: number; dy: number }>());
+
+  const prevRevealKey = useRef(revealKey);
+  if (revealKey !== prevRevealKey.current) {
+    prevRevealKey.current = revealKey;
+    dragOffsets.current.clear();
+  }
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const isGenesis = streamLabels.length > 0;
+
+  useEffect(() => {
+    setNodes(
+      isGenesis
+        ? makeGenesisNodes(streamLabels, streamTotal, revealKey)
+        : makeNodes(infos, dragOffsets.current, revealKey, showLeaves, selectedId, q, focusedId),
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isGenesis, streamLabels, streamTotal, infos, revealKey, showLeaves, selectedId, q, focusedId]);
+
+  const prevDrag = useRef(new Map<string, { x: number; y: number }>());
+
+  const handleNodeDrag = useCallback(
+    (_: unknown, node: Node) => {
+      const info = infos.get(node.id);
+      if (!info) return;
+      const cx = node.position.x + info.r;
+      const cy = node.position.y + info.r;
+      const prev = prevDrag.current.get(node.id);
+      if (prev) {
+        const dx = cx - prev.x, dy = cy - prev.y;
+        if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+          const kids = getDescendants(node.id, childrenOf);
+          if (kids.length) {
+            for (const id of kids) {
+              const d = dragOffsets.current.get(id) ?? { dx: 0, dy: 0 };
+              dragOffsets.current.set(id, { dx: d.dx + dx, dy: d.dy + dy });
+            }
+            setNodes((ns) => ns.map((n) =>
+              kids.includes(n.id)
+                ? { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } }
+                : n,
+            ));
+          }
+        }
+      }
+      prevDrag.current.set(node.id, { x: cx, y: cy });
+    },
+    [infos, childrenOf, setNodes],
+  );
+
+  const handleNodeDragStop = useCallback(
+    (_: unknown, node: Node) => {
+      const info = infos.get(node.id);
+      if (info) {
+        dragOffsets.current.set(node.id, {
+          dx: node.position.x + info.r - info.finalX,
+          dy: node.position.y + info.r - info.finalY,
+        });
+      }
+      prevDrag.current.delete(node.id);
+    },
+    [infos],
+  );
+
+  const handleNodeClick = useCallback(
+    (_: React.MouseEvent, n: Node) => {
+      if (isGenesis) return;
+      const nd = n.data as { node?: BrainNode };
+      if (nd.node) onSelect(nd.node);
+    },
+    [isGenesis, onSelect],
+  );
+
+  const handleNodeDoubleClick = useCallback(
+    (_: React.MouseEvent, n: Node) => {
+      if (isGenesis) return;
+      const nd = n.data as { node?: BrainNode };
+      if (!nd.node) return;
+      const k = nd.node.kind;
+      if (isLeafKind(k) || k === "root") return;
+      setFocusedId((prev) => prev === n.id ? null : n.id);
+    },
+    [isGenesis],
+  );
+
+  const handlePaneClick = useCallback(() => setFocusedId(null), []);
+
+  const handleZoom = useCallback((z: number) => {
+    setShowLeaves(z >= 0.4);
+  }, []);
+
+  const edges = useMemo(
+    () => isGenesis ? [] : makeEdges(infos, showLeaves),
+    [isGenesis, infos, showLeaves],
   );
 
   return (
     <ReactFlow
-      nodes={decorated}
-      edges={base.edges}
+      nodes={nodes}
+      edges={edges}
+      onNodesChange={onNodesChange}
+      onNodeDrag={handleNodeDrag}
+      onNodeDragStop={handleNodeDragStop}
+      onNodeClick={handleNodeClick}
+      onNodeDoubleClick={handleNodeDoubleClick}
+      onPaneClick={handlePaneClick}
       nodeTypes={nodeTypes}
       fitView
-      minZoom={0.1}
-      maxZoom={2.5}
+      fitViewOptions={{ padding: 0.15 }}
+      minZoom={0.07}
+      maxZoom={3}
       nodesConnectable={false}
       proOptions={{ hideAttribution: true }}
-      onNodeClick={(_, n) => onSelect((n.data as unknown as { node: BrainNode }).node)}
     >
-      <Background variant={BackgroundVariant.Dots} gap={22} size={1.5} color="var(--color-border)" />
-      <Controls showInteractive={false} />
+      <ZoomSync onChange={handleZoom} />
+      <FocusSync focusedId={focusedId} infos={infos} dragOffsets={dragOffsets} />
+      <Background
+        variant={BackgroundVariant.Dots}
+        gap={20} size={1.2}
+        color="var(--color-border)"
+      />
     </ReactFlow>
   );
 }

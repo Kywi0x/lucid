@@ -4,20 +4,56 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 
-// ─── Credentials Google (pattern "installed app" — lues depuis .env, jamais committées) ──
+// ─── Credentials Google (stockées dans app data, jamais committées) ─────────
 
-fn google_client_id() -> &'static str {
-    std::env::var("GOOGLE_CLIENT_ID")
-        .ok()
-        .map(|s| Box::leak(s.into_boxed_str()) as &str)
-        .unwrap_or("")
+#[derive(Serialize, Deserialize)]
+struct Credentials {
+    client_id: String,
+    client_secret: String,
 }
 
-fn google_client_secret() -> &'static str {
-    std::env::var("GOOGLE_CLIENT_SECRET")
+fn credentials_path() -> Option<std::path::PathBuf> {
+    crate::ai::llama::app_data_dir().map(|d| d.join("google_credentials.json"))
+}
+
+fn load_credentials() -> Option<Credentials> {
+    std::fs::read_to_string(credentials_path()?)
         .ok()
-        .map(|s| Box::leak(s.into_boxed_str()) as &str)
-        .unwrap_or("")
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+pub fn save_creds(client_id: &str, client_secret: &str) -> Result<(), String> {
+    let path = credentials_path().ok_or("Dossier de données introuvable.")?;
+    let c = Credentials { client_id: client_id.to_string(), client_secret: client_secret.to_string() };
+    std::fs::write(path, serde_json::to_string(&c).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+pub fn has_credentials() -> bool {
+    load_credentials().is_some()
+        || (!std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default().is_empty()
+            && !std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default().is_empty())
+}
+
+fn google_client_id() -> String {
+    // option_env! = baked in at compile time when GOOGLE_CLIENT_ID is set during `tauri build`
+    if let Some(id) = option_env!("GOOGLE_CLIENT_ID") {
+        if !id.is_empty() { return id.to_string(); }
+    }
+    load_credentials()
+        .map(|c| c.client_id)
+        .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
+        .unwrap_or_default()
+}
+
+fn google_client_secret() -> String {
+    if let Some(s) = option_env!("GOOGLE_CLIENT_SECRET") {
+        if !s.is_empty() { return s.to_string(); }
+    }
+    load_credentials()
+        .map(|c| c.client_secret)
+        .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok())
+        .unwrap_or_default()
 }
 
 // ─── Tokens ──────────────────────────────────────────────────────────────────
@@ -67,11 +103,13 @@ fn valid_access_token() -> Result<String, String> {
         .refresh_token
         .ok_or("Pas de refresh token — reconnecte-toi à Google.")?;
     let client = reqwest::blocking::Client::new();
+    let cid = google_client_id();
+    let csecret = google_client_secret();
     let resp: serde_json::Value = client
         .post("https://oauth2.googleapis.com/token")
         .form(&[
-            ("client_id", google_client_id()),
-            ("client_secret", google_client_secret()),
+            ("client_id", cid.as_str()),
+            ("client_secret", csecret.as_str()),
             ("refresh_token", rt.as_str()),
             ("grant_type", "refresh_token"),
         ])
@@ -117,12 +155,14 @@ pub fn finish_connect(listener: TcpListener, redirect_uri: &str) -> Result<(), S
     let code = wait_for_code(listener)?;
 
     let client = reqwest::blocking::Client::new();
+    let cid = google_client_id();
+    let csecret = google_client_secret();
     let resp: serde_json::Value = client
         .post("https://oauth2.googleapis.com/token")
         .form(&[
             ("code", code.as_str()),
-            ("client_id", google_client_id()),
-            ("client_secret", google_client_secret()),
+            ("client_id", cid.as_str()),
+            ("client_secret", csecret.as_str()),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
         ])
@@ -255,7 +295,8 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
                 ("q", "trashed=false"),
                 ("fields", "nextPageToken,files(id,name,createdTime,modifiedTime,mimeType,parents)"),
                 ("pageSize", "1000"),
-                ("orderBy", "modifiedTime desc"),
+                // orderBy retiré : incompatible avec corpora=allDrives (Drive API renvoie 400)
+                ("corpora", "allDrives"),
                 ("includeItemsFromAllDrives", "true"),
                 ("supportsAllDrives", "true"),
             ])
@@ -299,23 +340,32 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
         .map(|c| (c.summary.id.clone(), c))
         .collect();
 
+    // — DEBUG temporaire : affiche tous les types MIME présents —
+    {
+        let mut types: Vec<String> = all_files.iter().map(|f| f.mime_type.clone()).collect();
+        types.sort(); types.dedup();
+        eprintln!("🗂 Drive total={} | types: {}", all_files.len(), types.join(", "));
+        let pdf_count = all_files.iter().filter(|f| f.mime_type == "application/pdf" || f.name.to_lowercase().ends_with(".pdf")).count();
+        eprintln!("📄 PDFs trouvés : {pdf_count}");
+        eprintln!("🔧 pdftotext PATH: {:?}", which_bin("pdftotext"));
+    }
+
     let mut convs: Vec<Conversation> = Vec::new();
     let mut new_count = 0usize;
 
     for f in all_files {
-        // Dossiers, audio et vidéo : pas de contenu textuel exploitable.
-        if f.mime_type == "application/vnd.google-apps.folder"
-            || f.mime_type.starts_with("audio/")
-            || f.mime_type.starts_with("video/")
-        {
+        // PDF uniquement — Google Docs, images, vidéos ignorés.
+        if f.mime_type != "application/pdf" && !f.name.to_lowercase().ends_with(".pdf") {
             continue;
         }
+        eprintln!("📋 PDF détecté : {} ({})", f.name, f.mime_type);
 
         let id = f.id.clone();
         let modified = f.modified_time.clone();
 
         // Hiérarchie complète des dossiers parents (racine → feuille immédiate).
         let container_path = build_container_path(&f.parents, &folder_names, &folder_parents);
+        eprintln!("  📁 parents_ids={:?} → path={:?}", f.parents, container_path);
         let project = container_path.last().cloned().unwrap_or_else(|| "Google Drive".to_string());
         let project_slug = slugify(&project);
 
@@ -348,9 +398,7 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     Ok((new_count, convs.len()))
 }
 
-/// Ingère un fichier Drive. Stratégie par type :
-/// - Google Workspace (Doc/Sheet/Slide) → export texte via API
-/// - Autres (PDF, Word, image…) → stub avec nom + métadonnées (le brain sait que ça existe)
+/// Ingère un PDF Drive → Conversation.
 fn ingest_file(
     client: &reqwest::blocking::Client,
     access_token: &str,
@@ -359,45 +407,7 @@ fn ingest_file(
     project_slug: &str,
     container_path: Vec<String>,
 ) -> Option<Conversation> {
-    let is_google_workspace = file.mime_type.starts_with("application/vnd.google-apps.")
-        && !matches!(
-            file.mime_type.as_str(),
-            "application/vnd.google-apps.folder"
-                | "application/vnd.google-apps.shortcut"
-                | "application/vnd.google-apps.unknown"
-        );
-
-    let text = if is_google_workspace {
-        let export_mime = if file.mime_type.contains("spreadsheet") {
-            "text/csv"
-        } else {
-            "text/plain"
-        };
-        let resp = client
-            .get(format!(
-                "https://www.googleapis.com/drive/v3/files/{}/export",
-                file.id
-            ))
-            .query(&[("mimeType", export_mime)])
-            .bearer_auth(access_token)
-            .send()
-            .ok()?;
-        if !resp.status().is_success() {
-            eprintln!("⚠️ Export échoué ({}) : {}", file.name, resp.status());
-            return None;
-        }
-        let t = resp.text().ok()?;
-        if t.trim().is_empty() {
-            return None;
-        }
-        t
-    } else {
-        try_extract_binary(client, access_token, &file).unwrap_or_else(|| {
-            let ext = file.name.rsplit('.').next().unwrap_or("?").to_uppercase();
-            format!("Fichier Drive : {}\nType : {ext}", file.name)
-        })
-    };
-
+    let text = extract_pdf(client, access_token, &file)?;
     let ts = file.modified_time.clone();
     Some(Conversation {
         summary: ConversationSummary {
@@ -419,74 +429,254 @@ fn ingest_file(
     })
 }
 
-// ─── Extraction binaire (PDF / image) ────────────────────────────────────────
+// ─── Extraction PDF → Markdown ───────────────────────────────────────────────
 
-fn try_extract_binary(
+/// Télécharge le PDF depuis Drive et extrait le texte en markdown.
+fn extract_pdf(
     client: &reqwest::blocking::Client,
     access_token: &str,
     file: &DriveFile,
 ) -> Option<String> {
-    let mime = file.mime_type.as_str();
-    let is_pdf = mime == "application/pdf" || file.name.to_lowercase().ends_with(".pdf");
-    let is_image = mime.starts_with("image/") && !mime.contains("svg");
-
-    if !is_pdf && !is_image {
-        return None; // Word/Excel/vidéo → stub (OCR/whisper phase 2)
-    }
-
     let resp = client
         .get(format!("https://www.googleapis.com/drive/v3/files/{}", file.id))
         .query(&[("alt", "media")])
         .bearer_auth(access_token)
         .send()
         .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
+    if !resp.status().is_success() { return None; }
     let bytes = resp.bytes().ok()?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        eprintln!("⚠️ {} trop volumineux (>10 Mo), skipped.", file.name);
+    if bytes.len() > 25 * 1024 * 1024 {
+        eprintln!("⚠️ {} trop volumineux (>25 Mo), skipped.", file.name);
         return None;
     }
-
-    let safe_id: String = file.id.chars().take(8).collect();
-    let ext = if is_pdf {
-        "pdf".to_string()
-    } else {
-        file.name.rsplit('.').next().unwrap_or("jpg").to_lowercase()
-    };
-    let tmp = std::env::temp_dir().join(format!("brainlink_{safe_id}.{ext}"));
+    let safe_id: String = file.id.chars().take(8).filter(|c| c.is_alphanumeric()).collect();
+    let tmp = std::env::temp_dir().join(format!("brainlink_{safe_id}.pdf"));
     std::fs::write(&tmp, &bytes).ok()?;
-
-    let result = if is_pdf {
-        extract_pdf_text(&tmp)
-    } else {
-        extract_image_text(&tmp)
-    };
+    let result = pdf_to_markdown(&tmp, &file.name);
     let _ = std::fs::remove_file(&tmp);
     result
 }
 
-/// pdftotext (poppler) — `brew install poppler` sur macOS.
-fn extract_pdf_text(path: &std::path::Path) -> Option<String> {
-    let out = Command::new("pdftotext").arg(path).arg("-").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+fn which_bin(name: &str) -> Option<String> {
+    Command::new("which").arg(name).output().ok()
+        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
 }
 
-/// tesseract OCR — `brew install tesseract tesseract-lang` sur macOS.
-fn extract_image_text(path: &std::path::Path) -> Option<String> {
-    let out = Command::new("tesseract")
+/// pdftotext (poppler) en premier ; fallback OCR (pdftoppm + tesseract) pour les PDFs scannés.
+/// `brew install poppler tesseract tesseract-lang`
+fn pdf_to_markdown(path: &std::path::Path, name: &str) -> Option<String> {
+    eprintln!("🔍 Extraction PDF : {name}");
+    if let Some(text) = run_pdftotext(path) {
+        eprintln!("✅ pdftotext OK ({} chars)", text.len());
+        return Some(post_process(text));
+    }
+    eprintln!("⚠️ pdftotext vide — tentative OCR…");
+    if let Some(text) = ocr_pdf(path) {
+        eprintln!("✅ OCR OK ({} chars)", text.len());
+        return Some(post_process(text));
+    }
+    eprintln!("❌ Extraction impossible : {name}");
+    None
+}
+
+fn run_pdftotext(path: &std::path::Path) -> Option<String> {
+    // Cherche dans Homebrew si absent du PATH par défaut
+    let bin = which_bin("pdftotext")
+        .unwrap_or_else(|| "/opt/homebrew/bin/pdftotext".to_string());
+    let out = Command::new(&bin)
+        .args(["-layout", "-nopgbrk"])
         .arg(path)
-        .arg("stdout")
-        .arg("-l").arg("fra+eng")
+        .arg("-")
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // < 30 chars = probablement du bruit OCR
-    if text.len() < 30 { None } else { Some(text) }
+    if text.len() < 20 { None } else { Some(text) }
+}
+
+/// OCR via pdftoppm (rend le PDF en images) + tesseract — pour les PDFs scannés.
+fn ocr_pdf(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("pdf");
+    let tmp_dir = std::env::temp_dir().join(format!("brainlink_ocr_{stem}"));
+    std::fs::create_dir_all(&tmp_dir).ok()?;
+
+    let pdftoppm = which_bin("pdftoppm")
+        .unwrap_or_else(|| "/opt/homebrew/bin/pdftoppm".to_string());
+    let tesseract = which_bin("tesseract")
+        .unwrap_or_else(|| "/opt/homebrew/bin/tesseract".to_string());
+
+    // 200 DPI, max 10 pages
+    let _ = Command::new(&pdftoppm)
+        .args(["-r", "200", "-png", "-l", "10"])
+        .arg(path)
+        .arg(tmp_dir.join("page"))
+        .output();
+
+    let mut entries: Vec<_> = std::fs::read_dir(&tmp_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |x| x == "png"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut pages = Vec::new();
+    for entry in &entries {
+        if let Ok(ocr) = Command::new(&tesseract)
+            .arg(entry.path())
+            .arg("stdout")
+            .args(["-l", "fra+eng"])
+            .output()
+        {
+            let t = String::from_utf8_lossy(&ocr.stdout).trim().to_string();
+            if t.len() > 20 { pages.push(t); }
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+    let _ = std::fs::remove_dir(&tmp_dir);
+
+    if pages.is_empty() { None } else { Some(pages.join("\n\n---\n\n")) }
+}
+
+/// Transforme le texte brut pdftotext en Markdown structuré :
+/// tableaux alignés → pipes, ALL CAPS courts → ## heading, numéros de page supprimés.
+fn post_process(text: String) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let raw  = lines[i];
+        let trim = raw.trim();
+
+        // Numéro de page isolé (seulement chiffres/tirets, < 8 chars)
+        if !trim.is_empty()
+            && trim.len() < 8
+            && trim.chars().all(|c| c.is_ascii_digit() || c == '-' || c == ' ')
+        {
+            i += 1; continue;
+        }
+
+        // Ligne vide
+        if trim.is_empty() {
+            if !out.ends_with("\n\n") { out.push('\n'); }
+            i += 1; continue;
+        }
+
+        // Tableau : 2+ lignes consécutives avec 2+ colonnes séparées par 3+ espaces
+        if let Some((table_md, next_i)) = try_table_block(&lines, i) {
+            if !out.ends_with('\n') { out.push('\n'); }
+            out.push('\n');
+            out.push_str(&table_md);
+            out.push('\n');
+            i = next_i; continue;
+        }
+
+        // Heading : ALL CAPS OU ligne courte sans ponctuation, entourée de blancs
+        let alpha: String = trim.chars().filter(|c| c.is_alphabetic()).collect();
+        let wc = trim.split_whitespace().count();
+        let is_all_caps = alpha.len() >= 3 && alpha.chars().all(|c| c.is_uppercase());
+        let prev_blank = i == 0 || lines[i - 1].trim().is_empty();
+        let next_blank = i + 1 >= lines.len() || lines[i + 1].trim().is_empty();
+        let looks_like_heading = trim.len() <= 60
+            && wc >= 1 && wc <= 8
+            && !trim.ends_with('.')
+            && !trim.contains(". ")
+            && !trim.contains('|')
+            && (is_all_caps || (prev_blank && next_blank));
+        if looks_like_heading {
+            if !out.ends_with("\n\n") { out.push('\n'); }
+            let level = if is_all_caps || wc <= 3 { "##" } else { "###" };
+            out.push_str(&format!("{level} {}\n\n", to_title_case(trim)));
+            i += 1; continue;
+        }
+
+        out.push_str(trim);
+        out.push('\n');
+        i += 1;
+    }
+
+    // Collapse 3+ sauts de ligne consécutifs → 2
+    let mut final_out = String::new();
+    let mut nl_count = 0u8;
+    for c in out.trim().chars() {
+        if c == '\n' { nl_count += 1; if nl_count <= 2 { final_out.push(c); } }
+        else { nl_count = 0; final_out.push(c); }
+    }
+    final_out
+}
+
+/// Découpe une ligne en colonnes en utilisant 2+ espaces consécutifs comme séparateur.
+fn split_cols(line: &str) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut spaces = 0usize;
+    for c in line.chars() {
+        if c == ' ' {
+            spaces += 1;
+        } else {
+            if spaces >= 2 && !cell.trim().is_empty() {
+                cols.push(cell.trim().to_string());
+                cell = String::new();
+            } else if spaces > 0 {
+                cell.push(' ');
+            }
+            spaces = 0;
+            cell.push(c);
+        }
+    }
+    if !cell.trim().is_empty() { cols.push(cell.trim().to_string()); }
+    cols
+}
+
+/// Tente de lire un bloc de tableau à partir de `start`.
+/// Retourne (markdown_table, next_line_index) ou None.
+fn try_table_block(lines: &[&str], start: usize) -> Option<(String, usize)> {
+    let is_row = |l: &str| split_cols(l).len() >= 2;
+    if !is_row(lines[start]) { return None; }
+
+    // Collecte les lignes du bloc (tolère 1 ligne vide interne)
+    let mut end = start + 1;
+    let mut gap = 0u8;
+    while end < lines.len() {
+        if lines[end].trim().is_empty() { gap += 1; if gap > 1 { break; } end += 1; }
+        else if is_row(lines[end]) { gap = 0; end += 1; }
+        else { break; }
+    }
+
+    let rows: Vec<Vec<String>> = lines[start..end]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| split_cols(l))
+        .filter(|c| c.len() >= 2)
+        .collect();
+
+    if rows.len() < 2 { return None; }
+
+    let ncols = rows.iter().map(|r| r.len()).max()?;
+    let mut md = String::new();
+    for (idx, row) in rows.iter().enumerate() {
+        let mut cells = row.clone();
+        while cells.len() < ncols { cells.push(String::new()); }
+        let escaped: Vec<String> = cells.iter().map(|c| c.replace('|', "\\|")).collect();
+        md.push_str(&format!("| {} |\n", escaped.join(" | ")));
+        if idx == 0 {
+            md.push_str(&format!("| {} |\n", (0..ncols).map(|_| "---").collect::<Vec<_>>().join(" | ")));
+        }
+    }
+    Some((md, end))
+}
+
+fn to_title_case(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            let lower = w.to_lowercase();
+            let mut chars = lower.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ─── Déconnexion ──────────────────────────────────────────────────────────────

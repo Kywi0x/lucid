@@ -1,29 +1,23 @@
-//! Pipeline d'analyse : conversations → extraction IA → agrégation → `brain.md`.
+//! Pipeline d'analyse : conversations → extraction IA → arbre de nœuds → `brain.md`.
 //!
-//! Stratégie hybride (de-risque la qualité du clustering, risque #1 du projet) :
-//!   - le modèle fait l'extraction *par conversation* (résumé, décisions, patterns, concepts) ;
-//!   - l'agrégation, le clustering par projet et les connexions sont assemblés
-//!     *déterministiquement* en Rust → résultat reproductible et robuste.
+//! Modèle de données : arbre récursif agnostique de la source.
+//! Feuille  = une source (conv Claude Code, page Notion, fichier Drive).
+//! Conteneur = espace / dossier, profondeur illimitée (container_path).
+//! Agrégation déterministe en Rust, aucun appel API après sync.
 
 use crate::ai::LlamaEngine;
-use crate::models::{BrainEdge, BrainGraph, BrainNode, Confidence, Conversation, SourceRef};
+use crate::models::{BrainEdge, BrainGraph, BrainNode, Conversation};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-/// Nombre maximum de bulles "concept" dans le graphe (lisibilité).
-const MAX_CONCEPT_NODES: usize = 60;
-
-/// Budget de caractères du texte condensé envoyé au modèle par conversation
-/// (~8k tokens de contexte ; on garde de la marge pour le prompt et la sortie).
+/// Budget de caractères du texte condensé envoyé au modèle par conversation.
 const CONDENSE_CHARS: usize = 6000;
-const MAX_OUTPUT_TOKENS: u32 = 512;
+const MAX_OUTPUT_TOKENS: u32 = 256;
 
 /// Résultat structuré attendu du modèle pour une conversation.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct Extraction {
-    /// Résumé d'une phrase. Demandé au modèle pour l'amener à « réfléchir » avant
-    /// de lister décisions/concepts ; non rendu directement dans le brain.md.
     #[serde(default)]
     #[allow(dead_code)]
     pub summary: String,
@@ -48,7 +42,9 @@ fn condense(conv: &Conversation) -> String {
         out.push_str(m.text.trim());
         out.push('\n');
         if out.len() >= CONDENSE_CHARS {
-            out.truncate(CONDENSE_CHARS);
+            let mut end = CONDENSE_CHARS;
+            while !out.is_char_boundary(end) { end -= 1; }
+            out.truncate(end);
             out.push_str("\n[…tronqué]");
             break;
         }
@@ -63,6 +59,14 @@ fn extraction_prompt(conv: &Conversation) -> String {
             "Analyse ce document ou fichier Google Drive.\n\
 Si le contenu est uniquement un nom de fichier, infère les concepts, \
 l'entité (client, fournisseur, entreprise) et le thème depuis ce nom."
+        }
+        "notion" => {
+            "Analyse cette page ou base de données Notion.\n\
+Extrais les concepts, entités, thèmes et décisions clés présents dans le contenu."
+        }
+        "obsidian" => {
+            "Analyse cette note Obsidian (markdown).\n\
+Extrais les concepts, thèmes, décisions et entités clés présents dans le contenu."
         }
         _ => "Analyse cette conversation entre un développeur et une IA.",
     };
@@ -92,7 +96,7 @@ pub fn short_project(path: &str) -> String {
 }
 
 /// Extrait le premier objet JSON équilibré d'une chaîne (sortie modèle parfois bruitée).
-fn extract_json(s: &str) -> Option<&str> {
+pub fn extract_json(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let bytes = s.as_bytes();
     let mut depth = 0i32;
@@ -136,70 +140,43 @@ fn norm(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
-/// Clé de groupe depuis container_path : chemin normalisé, profondeur ≤ 2.
-/// Vide → "non-classé" (bac par défaut).
+/// Clé de groupe : chemin normalisé complet, profondeur illimitée.
 fn group_key(path: &[String]) -> String {
     if path.is_empty() {
         return "non-classé".to_string();
     }
-    let depth = path.len().min(2);
-    path[..depth].iter().map(|s| norm(s)).collect::<Vec<_>>().join("/")
+    path.iter().map(|s| norm(s)).collect::<Vec<_>>().join("/")
 }
 
-/// Libellé d'affichage d'un groupe (dernier segment significatif).
+/// Libellé d'affichage : dernier segment du chemin.
 fn group_display(path: &[String]) -> String {
     if path.is_empty() {
         return "Non classé".to_string();
     }
-    path[path.len().min(2) - 1].clone()
+    path.last().unwrap().clone()
 }
 
-/// Clé du groupe parent (remonte d'un niveau, ou "non-classé").
-fn parent_group_key(key: &str) -> String {
-    if key == "non-classé" {
-        return "non-classé".to_string();
-    }
-    match key.rfind('/') {
-        Some(i) => key[..i].to_string(),
-        None => "non-classé".to_string(),
-    }
-}
+// ─── Agrégat conteneur ────────────────────────────────────────────────────────
 
-/// Libellé depuis une clé normée (dernier segment). Utilisé pour les groupes parents fantômes.
-fn display_from_key(key: &str) -> String {
-    if key == "non-classé" {
-        return "Non classé".to_string();
-    }
-    // ponytail: casse perdue ici — seuls les parents créés ex-nihilo par la passe de fusion passent par là
-    key.rsplit('/').next().unwrap_or(key).to_string()
-}
-
-// ─── Agrégats ──────────────────────────────────────────────────────────────
-
-struct ProjectAgg {
+/// Remplace ProjectAgg + ConceptAgg. Un par nœud conteneur (espace ou sous-dossier).
+struct ContainerAgg {
     display: String,
-    conv_count: usize,
-    decisions: Vec<(String, String)>, // (texte, date courte)
+    /// "root" ou "p:{parent_path_normalisé}"
+    parent_id: String,
+    summaries: Vec<String>,
+    decisions: Vec<(String, String)>,
     patterns: Vec<String>,
-    summaries: Vec<String>,                       // résumés par conversation
-    concept_counts: BTreeMap<String, (String, usize)>, // norm -> (display, count)
-    sources: Vec<SourceRef>,
-    link: Option<String>, // chemin/cwd du projet
-    objective: String,    // rempli par la passe de synthèse
+    keyword_counts: BTreeMap<String, (String, usize)>,
+    /// Nombre de feuilles dans le sous-arbre (calculé pendant la boucle principale).
+    leaf_count: usize,
+    /// Objectif synthétisé par Gemma (rempli en passe synthèse).
+    objective: String,
 }
 
-struct ConceptAgg {
-    display: String,
-    occurrences: usize,
-    projects: std::collections::BTreeSet<String>,
-    sources: Vec<SourceRef>,
-}
+// ─── Cache incrémental ────────────────────────────────────────────────────────
 
-// ─── Cache incrémental ─────────────────────────────────────────────────────
-
-/// Clé de cache : id + last_timestamp. Si la conv n'a pas changé, on réutilise.
 fn cache_key(conv: &Conversation) -> String {
-    format!("{}:{}", conv.summary.id, conv.summary.last_timestamp.as_deref().unwrap_or(""))
+    format!("{}:{}:{}", conv.summary.source, conv.summary.id, conv.summary.last_timestamp.as_deref().unwrap_or(""))
 }
 
 fn load_cache(path: &Path) -> HashMap<String, Extraction> {
@@ -215,6 +192,15 @@ fn save_cache(path: &Path, cache: &HashMap<String, Extraction>) {
     }
 }
 
+fn synth_cache_key(c_key: &str, summaries: &[String], decisions: &[(String, String)]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    c_key.hash(&mut h);
+    summaries.hash(&mut h);
+    decisions.iter().for_each(|(d, _)| d.hash(&mut h));
+    format!("{:x}", h.finish())
+}
+
 /// Événement de progression remonté au frontend.
 pub struct Progress {
     pub current: usize,
@@ -222,18 +208,17 @@ pub struct Progress {
     pub label: String,
 }
 
-/// Génère le graphe à partir des conversations.
-/// `cache_path` : chemin du fichier de cache incrémental (optionnel).
-/// `progress` est appelé avant chaque conversation analysée.
+/// Génère le graphe à partir des conversations (arbre récursif agnostique de la source).
 pub fn generate_brain(
     engine: &LlamaEngine,
     conversations: &[Conversation],
     cache_path: Option<&Path>,
     mut progress: impl FnMut(Progress),
+    mut on_node: impl FnMut(&str, usize, usize),
 ) -> Result<BrainGraph, String> {
     let total = conversations.len();
-    let mut projects: BTreeMap<String, ProjectAgg> = BTreeMap::new();
-    let mut concepts: BTreeMap<String, ConceptAgg> = BTreeMap::new();
+    let mut containers: BTreeMap<String, ContainerAgg> = BTreeMap::new();
+    let mut leaves: Vec<BrainNode> = Vec::new();
     let mut failures = 0usize;
 
     let mut cache: HashMap<String, Extraction> =
@@ -252,105 +237,118 @@ pub fn generate_brain(
             cache_hits += 1;
             cached.clone()
         } else {
-            // Résilience : une conversation qui échoue est ignorée, pas fatale.
-            let raw = match engine.complete(
-                Some(SYSTEM_PROMPT),
-                &extraction_prompt(conv),
-                MAX_OUTPUT_TOKENS,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("⚠️ Conversation ignorée ({}) : {e}", conv.summary.id);
-                    failures += 1;
-                    continue;
-                }
+            let total_text: usize = conv.messages.iter().map(|m| m.text.len()).sum();
+            let ex = if total_text < 150 {
+                Extraction::default()
+            } else {
+                let raw = match engine.complete(
+                    Some(SYSTEM_PROMPT),
+                    &extraction_prompt(conv),
+                    MAX_OUTPUT_TOKENS,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("⚠️ Conversation ignorée ({}) : {e}", conv.summary.id);
+                        failures += 1;
+                        continue;
+                    }
+                };
+                parse_extraction(&raw)
             };
-            let ex = parse_extraction(&raw);
             cache.insert(key, ex.clone());
             ex
         };
 
-        // Provisoire chantier 2 : si container_path vide, utilise short_project
-        // pour que Claude Code reste identique avant que le connecteur le remplisse (chantier 4).
+        // Chemin effectif (fallback sur short_project pour Claude Code sans container_path).
         let effective_path: Vec<String> = if conv.summary.container_path.is_empty() {
             vec![short_project(&conv.summary.project)]
         } else {
             conv.summary.container_path.clone()
         };
-        let proj_key = group_key(&effective_path);
-        let date = conv
-            .summary
-            .last_timestamp
-            .as_deref()
+
+        // Créer les conteneurs ancêtres si inexistants (racine → feuille).
+        for depth in 1..=effective_path.len() {
+            let c_key = group_key(&effective_path[..depth]);
+            if !containers.contains_key(&c_key) {
+                let parent_id = if depth == 1 {
+                    "root".to_string()
+                } else {
+                    format!("p:{}", group_key(&effective_path[..depth - 1]))
+                };
+                let label = effective_path[depth - 1].clone();
+                // Notifie l'UI uniquement pour les conteneurs de premier niveau.
+                if depth == 1 {
+                    on_node(&label, i + 1, total);
+                }
+                containers.insert(c_key, ContainerAgg {
+                    display: label,
+                    parent_id,
+                    summaries: Vec::new(),
+                    decisions: Vec::new(),
+                    patterns: Vec::new(),
+                    keyword_counts: BTreeMap::new(),
+                    leaf_count: 0,
+                    objective: String::new(),
+                });
+            }
+        }
+
+        // Incrémenter leaf_count sur tous les ancêtres.
+        for depth in 1..=effective_path.len() {
+            let c_key = group_key(&effective_path[..depth]);
+            if let Some(c) = containers.get_mut(&c_key) {
+                c.leaf_count += 1;
+            }
+        }
+
+        // Alimenter le conteneur direct avec l'extraction de cette conv.
+        let parent_key = group_key(&effective_path);
+        let date = conv.summary.last_timestamp.as_deref()
             .map(|t| t.chars().take(10).collect::<String>())
             .unwrap_or_default();
-
-        // Référence de provenance pour cette conversation (multi-connecteurs).
-        let src = SourceRef {
-            connector: conv.summary.source.clone(),
-            title: conv.summary.title.clone(),
-            id: conv.summary.id.clone(),
-            project_slug: conv.summary.project_slug.clone(),
-            link: Some(conv.summary.project.clone()),
-            timestamp: conv.summary.last_timestamp.clone(),
-        };
-
-        let entry = projects
-            .entry(proj_key.clone())
-            .or_insert_with(|| ProjectAgg {
-                display: group_display(&effective_path),
-                conv_count: 0,
-                decisions: Vec::new(),
-                patterns: Vec::new(),
-                summaries: Vec::new(),
-                concept_counts: BTreeMap::new(),
-                sources: Vec::new(),
-                link: None,
-                objective: String::new(),
-            });
-        entry.conv_count += 1;
-        entry.sources.push(src.clone());
-        entry.link.get_or_insert_with(|| conv.summary.project.clone());
-        if !ex.summary.trim().is_empty() {
-            entry.summaries.push(ex.summary.clone());
-        }
-        for d in ex.decisions {
-            if !d.trim().is_empty() {
-                entry.decisions.push((d, date.clone()));
+        if let Some(c) = containers.get_mut(&parent_key) {
+            if !ex.summary.trim().is_empty() {
+                c.summaries.push(ex.summary.clone());
             }
-        }
-        for p in ex.patterns {
-            if !p.trim().is_empty() {
-                entry.patterns.push(p);
+            for d in &ex.decisions {
+                if !d.trim().is_empty() {
+                    c.decisions.push((d.clone(), date.clone()));
+                }
+            }
+            for p in &ex.patterns {
+                if !p.trim().is_empty() {
+                    c.patterns.push(p.clone());
+                }
+            }
+            for concept in &ex.concepts {
+                let cn = norm(concept);
+                if cn.is_empty() { continue; }
+                let e = c.keyword_counts.entry(cn).or_insert_with(|| (concept.clone(), 0));
+                e.1 += 1;
             }
         }
 
-        for c in ex.concepts {
-            let c = c.trim().to_string();
-            if c.is_empty() {
-                continue;
-            }
-            let ckey = norm(&c);
-            // Compte par projet (pour les mots-clés du projet).
-            let pc = entry
-                .concept_counts
-                .entry(ckey.clone())
-                .or_insert_with(|| (c.clone(), 0));
-            pc.1 += 1;
-
-            let ce = concepts.entry(ckey).or_insert_with(|| ConceptAgg {
-                display: c.clone(),
-                occurrences: 0,
-                projects: Default::default(),
-                sources: Vec::new(),
-            });
-            ce.occurrences += 1;
-            ce.projects.insert(proj_key.clone());
-            ce.sources.push(src.clone());
-        }
+        // Nœud feuille.
+        leaves.push(BrainNode {
+            id: format!("leaf:{}", conv.summary.id),
+            label: conv.summary.title.clone(),
+            kind: "leaf".into(),
+            weight: 1,
+            summary: ex.summary.clone(),
+            keywords: unique_concepts(&ex.concepts, 5),
+            decisions: ex.decisions.iter().filter(|d| !d.trim().is_empty()).cloned().collect(),
+            patterns: ex.patterns.iter().filter(|p| !p.trim().is_empty()).cloned().collect(),
+            community: 0,
+            parent_id: Some(format!("p:{parent_key}")),
+            synthesized_at: None,
+            content: String::new(),
+            connector: Some(conv.summary.source.clone()),
+            source_id: Some(conv.summary.id.clone()),
+            source_project: Some(conv.summary.project_slug.clone()),
+        });
     }
 
-    if projects.is_empty() {
+    if containers.is_empty() && leaves.is_empty() {
         return Err(format!(
             "Aucune conversation n'a pu être analysée ({failures} échec(s))."
         ));
@@ -361,73 +359,42 @@ pub fn generate_brain(
         save_cache(path, &cache);
     }
 
-    // Garde-fou 2 : groupes à 1 item → fusionnés dans le parent.
-    // Profondeur max = 2, donc une seule passe suffit si on traite les feuilles en premier.
-    // ponytail: single pass avec re-check — pas de cascade au-delà de depth 2
-    {
-        let mut to_merge: Vec<(String, String)> = projects
-            .iter()
-            .filter(|(key, p)| p.conv_count == 1 && key.as_str() != "non-classé")
-            .map(|(key, _)| (key.clone(), parent_group_key(key)))
-            .collect();
-        // Feuilles en premier (plus de '/' = plus profond) pour ne pas remonter un parent
-        // encore vide avant qu'il ait reçu ses enfants.
-        to_merge.sort_unstable_by(|(a, _), (b, _)| {
-            b.chars().filter(|&c| c == '/').count()
-                .cmp(&a.chars().filter(|&c| c == '/').count())
-        });
-        for (child_key, parent_key) in &to_merge {
-            if child_key == parent_key { continue; }
-            // Re-check : un parent peut avoir reçu des merges et ne plus être singleton.
-            if projects.get(child_key.as_str()).map(|p| p.conv_count).unwrap_or(0) != 1 {
-                continue;
-            }
-            let child = projects.remove(child_key.as_str()).unwrap();
-            let parent = projects.entry(parent_key.clone()).or_insert_with(|| ProjectAgg {
-                display: display_from_key(parent_key),
-                conv_count: 0,
-                decisions: Vec::new(),
-                patterns: Vec::new(),
-                summaries: Vec::new(),
-                concept_counts: BTreeMap::new(),
-                sources: Vec::new(),
-                link: None,
-                objective: String::new(),
-            });
-            parent.conv_count += child.conv_count;
-            parent.decisions.extend(child.decisions);
-            parent.patterns.extend(child.patterns);
-            parent.summaries.extend(child.summaries);
-            parent.sources.extend(child.sources);
-            if parent.link.is_none() {
-                parent.link = child.link;
-            }
-            for (ck, cv) in child.concept_counts {
-                let e = parent.concept_counts.entry(ck).or_insert_with(|| (cv.0.clone(), 0));
-                e.1 += cv.1;
-            }
-            // Repointe les concepts vers la clé parent.
-            for ca in concepts.values_mut() {
-                if ca.projects.remove(child_key.as_str()) {
-                    ca.projects.insert(parent_key.clone());
-                }
-            }
-        }
-    }
+    // Passe de synthèse : objectif par conteneur (mis en cache).
+    let synth_cache_path: Option<std::path::PathBuf> =
+        cache_path.map(|p| p.with_file_name("brain_synth_cache.json"));
+    let mut synth_cache: HashMap<String, String> = synth_cache_path
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut synth_hits = 0usize;
 
-    // Passe de synthèse : objectif + thématiques par projet.
-    for p in projects.values_mut() {
+    for (c_key, c) in containers.iter_mut() {
+        let skey = synth_cache_key(c_key, &c.summaries, &c.decisions);
+        if let Some(cached_obj) = synth_cache.get(&skey) {
+            c.objective = cached_obj.clone();
+            synth_hits += 1;
+            continue;
+        }
         progress(Progress {
             current: total,
             total,
-            label: format!("Synthèse : {}", p.display),
+            label: format!("Synthèse : {}", c.display),
         });
-        p.objective = synthesize_project(engine, p);
+        c.objective = synthesize_container(engine, &c.display, &c.summaries, &c.decisions);
+        synth_cache.insert(skey, c.objective.clone());
     }
 
-    let (nodes, edges) = build_graph(&projects, &concepts);
-    let markdown = assemble_markdown(&projects, &concepts);
-    let report = generate_report(&projects, &concepts, &nodes);
+    if let Some(path) = synth_cache_path.as_deref() {
+        if let Ok(json) = serde_json::to_string(&synth_cache) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+    eprintln!("🔄 Synthèse : {synth_hits}/{} depuis cache.", containers.len());
+
+    let (nodes, edges) = build_graph(&containers, &leaves);
+    let markdown = assemble_markdown(&nodes);
+    let report = generate_report(&containers, &leaves);
 
     Ok(BrainGraph {
         nodes,
@@ -439,43 +406,37 @@ pub fn generate_brain(
 }
 
 #[derive(Deserialize, Default)]
-struct ProjSynth {
+struct ContainerSynth {
     #[serde(default)]
     objective: String,
     #[serde(default)]
     themes: Vec<String>,
 }
 
-/// Synthèse projet : à partir des résumés de conversations + décisions, demande
-/// au modèle un objectif global et les thématiques. Échec → chaîne vide (non bloquant).
-fn synthesize_project(engine: &LlamaEngine, p: &ProjectAgg) -> String {
-    let summaries: Vec<String> = p.summaries.iter().take(10).cloned().collect();
+fn synthesize_container(
+    engine: &LlamaEngine,
+    display: &str,
+    summaries: &[String],
+    decisions: &[(String, String)],
+) -> String {
+    let summaries: Vec<String> = summaries.iter().take(10).cloned().collect();
     let decisions: Vec<String> =
-        dedup_pairs(&p.decisions).into_iter().take(8).map(|(d, _)| d).collect();
+        dedup_pairs(decisions).into_iter().take(8).map(|(d, _)| d).collect();
     if summaries.is_empty() && decisions.is_empty() {
         return String::new();
     }
     let user = format!(
-        "Projet : {name}\n\nRésumés de conversations :\n{summaries}\n\nDécisions clés :\n{decisions}\n\n\
-Produis UNIQUEMENT un JSON {{\"objective\": \"objectif global du projet en 1 à 2 phrases\", \
-\"themes\": [\"thématique principale\"]}}. En français, concis.",
-        name = p.display,
-        summaries = summaries
-            .iter()
-            .map(|s| format!("- {s}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        decisions = decisions
-            .iter()
-            .map(|s| format!("- {s}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        "Projet : {display}\n\nRésumés :\n{s}\n\nDécisions clés :\n{d}\n\n\
+Produis UNIQUEMENT un JSON {{\"objective\": \"objectif global en 1 à 2 phrases\", \
+\"themes\": [\"thème\"]}}. En français, concis.",
+        s = summaries.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n"),
+        d = decisions.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n"),
     );
     let raw = match engine.complete(Some(SYSTEM_PROMPT), &user, 300) {
         Ok(r) => r,
         Err(_) => return String::new(),
     };
-    let synth: ProjSynth = extract_json(&raw)
+    let synth: ContainerSynth = extract_json(&raw)
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
     let mut out = synth.objective.trim().to_string();
@@ -490,212 +451,120 @@ Produis UNIQUEMENT un JSON {{\"objective\": \"objectif global du projet en 1 à 
     out
 }
 
-/// Mots-clés d'un projet : ses concepts les plus fréquents.
+/// Mots-clés d'un conteneur : concepts les plus fréquents.
 fn top_keywords(counts: &BTreeMap<String, (String, usize)>, n: usize) -> Vec<String> {
     let mut v: Vec<&(String, usize)> = counts.values().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     v.into_iter().take(n).map(|(d, _)| d.clone()).collect()
 }
 
-/// Déduplique des sources par (connecteur, id).
-fn dedup_sources(sources: &[SourceRef]) -> Vec<SourceRef> {
+/// Déduplique les concepts d'une feuille pour ses mots-clés.
+fn unique_concepts(concepts: &[String], n: usize) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    sources
-        .iter()
-        .filter(|s| seen.insert((s.connector.clone(), s.id.clone())))
+    concepts.iter()
+        .filter(|c| seen.insert(norm(c)))
+        .take(n)
         .cloned()
         .collect()
 }
 
-/// Construit le graphe de bulles : cerveau central → projets → concepts.
-/// Un concept partagé par plusieurs projets est une seule bulle reliée à
-/// chacun → c'est ce qui tisse les connexions inter-projets (façon Obsidian).
+/// Construit les vecteurs nodes + edges depuis les conteneurs et les feuilles.
 fn build_graph(
-    projects: &BTreeMap<String, ProjectAgg>,
-    concepts: &BTreeMap<String, ConceptAgg>,
+    containers: &BTreeMap<String, ContainerAgg>,
+    leaves: &[BrainNode],
 ) -> (Vec<BrainNode>, Vec<BrainEdge>) {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
-    // Communauté par projet : 0 = global, 1..n = projet (BTreeMap → ordre stable).
-    let proj_community: BTreeMap<&str, u32> = projects
-        .keys()
-        .enumerate()
-        .map(|(i, k)| (k.as_str(), (i + 1) as u32))
-        .collect();
+    let total_leaves = leaves.len();
+    let root_containers = containers.values().filter(|c| c.parent_id == "root").count();
 
-    let total_convs: usize = projects.values().map(|p| p.conv_count).sum();
     nodes.push(BrainNode {
         id: "root".into(),
-        label: "Second Brain".into(),
+        label: "Lucid".into(),
         kind: "root".into(),
-        weight: total_convs.max(1),
-        summary: format!(
-            "{} projets · {} conversations analysées.",
-            projects.len(),
-            total_convs
-        ),
+        weight: total_leaves.max(1),
+        summary: format!("{root_containers} espaces · {total_leaves} sources analysées."),
         keywords: Vec::new(),
         decisions: Vec::new(),
         patterns: Vec::new(),
-        sources: Vec::new(),
         community: 0,
+        parent_id: None,
+        synthesized_at: None,
+        content: String::new(),
+        connector: None,
+        source_id: None,
+        source_project: None,
     });
 
-    for (key, p) in projects {
-        let pid = format!("p:{key}");
-        let community = proj_community.get(key.as_str()).copied().unwrap_or(0);
-        nodes.push(BrainNode {
-            id: pid.clone(),
-            label: p.display.clone(),
-            kind: "project".into(),
-            weight: p.conv_count,
-            summary: p.objective.clone(),
-            keywords: top_keywords(&p.concept_counts, 8),
-            decisions: dedup_pairs(&p.decisions)
-                .into_iter()
-                .map(|(d, _)| d)
-                .collect(),
-            patterns: dedup(&p.patterns),
-            sources: dedup_sources(&p.sources),
-            community,
-        });
-        edges.push(BrainEdge {
-            source: "root".into(),
-            target: pid,
-            kind: "project".into(),
-            relation: "contains".into(),
-            confidence: Confidence::Extracted,
-            confidence_score: 1.0,
-        });
-    }
-
-    // Concepts : les plus fréquents d'abord, plafonnés pour la lisibilité.
-    let mut cvec: Vec<(&String, &ConceptAgg)> = concepts.iter().collect();
-    cvec.sort_by(|a, b| b.1.occurrences.cmp(&a.1.occurrences));
-    for (ckey, c) in cvec.into_iter().take(MAX_CONCEPT_NODES) {
-        let cid = format!("c:{ckey}");
-        let is_bridge = c.projects.len() >= 2;
-        let proj_displays: Vec<String> = c
-            .projects
-            .iter()
-            .map(|k| {
-                projects
-                    .get(k)
-                    .map(|p| p.display.clone())
-                    .unwrap_or_else(|| k.clone())
-            })
-            .collect();
-        let summary = if is_bridge {
-            format!(
-                "Pont entre {} projets : {}",
-                proj_displays.len(),
-                proj_displays.join(", ")
-            )
-        } else if let Some(d) = proj_displays.first() {
-            format!("Concept du projet {d}")
-        } else {
-            String::new()
-        };
-        // Communauté : pont → 0, concept exclusif → communauté du projet.
-        let community = if is_bridge {
-            0
-        } else {
-            c.projects
-                .iter()
-                .next()
-                .and_then(|k| proj_community.get(k.as_str()).copied())
-                .unwrap_or(0)
-        };
+    for (c_key, c) in containers {
+        let cid = format!("p:{c_key}");
         nodes.push(BrainNode {
             id: cid.clone(),
             label: c.display.clone(),
-            kind: "concept".into(),
-            weight: c.occurrences,
-            summary,
-            keywords: Vec::new(),
-            decisions: Vec::new(),
-            patterns: Vec::new(),
-            sources: dedup_sources(&c.sources),
-            community,
+            kind: "container".into(),
+            weight: c.leaf_count,
+            summary: c.objective.clone(),
+            keywords: top_keywords(&c.keyword_counts, 8),
+            decisions: dedup_pairs(&c.decisions).into_iter().map(|(d, _)| d).collect(),
+            patterns: dedup(&c.patterns),
+            community: 0,
+            parent_id: Some(c.parent_id.clone()),
+            synthesized_at: None,
+            content: String::new(),
+            connector: None,
+            source_id: None,
+            source_project: None,
         });
-        for pk in &c.projects {
-            // Confiance selon la fréquence du concept dans ce projet.
-            let count = projects
-                .get(pk)
-                .and_then(|p| p.concept_counts.get(ckey))
-                .map(|(_, n)| *n)
-                .unwrap_or(1);
-            let (confidence, confidence_score) = match count {
-                n if n >= 3 => (Confidence::Extracted, 0.95),
-                2 => (Confidence::Inferred, 0.80),
-                _ => (Confidence::Ambiguous, 0.65),
-            };
-            let relation = if is_bridge { "bridges" } else { "uses" }.to_string();
-            edges.push(BrainEdge {
-                source: format!("p:{pk}"),
-                target: cid.clone(),
-                kind: "concept".into(),
-                relation,
-                confidence,
-                confidence_score,
-            });
-        }
+        edges.push(BrainEdge {
+            source: c.parent_id.clone(),
+            target: cid,
+            kind: "contains".into(),
+            relation: "contains".into(),
+        });
+    }
+
+    for leaf in leaves {
+        let parent = leaf.parent_id.clone().unwrap_or_else(|| "root".to_string());
+        edges.push(BrainEdge {
+            source: parent,
+            target: leaf.id.clone(),
+            kind: "contains".into(),
+            relation: "contains".into(),
+        });
+        nodes.push(leaf.clone());
     }
 
     (nodes, edges)
 }
 
-/// Rapport compact optimisé pour l'injection LLM (~10× moins de tokens que brain.md).
-fn generate_report(
-    projects: &BTreeMap<String, ProjectAgg>,
-    concepts: &BTreeMap<String, ConceptAgg>,
-    nodes: &[BrainNode],
-) -> String {
+/// Rapport compact optimisé pour l'injection LLM.
+fn generate_report(containers: &BTreeMap<String, ContainerAgg>, leaves: &[BrainNode]) -> String {
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let total_convs: usize = projects.values().map(|p| p.conv_count).sum();
-    let n_bridges = nodes.iter().filter(|n| n.community == 0 && n.kind == "concept").count();
+    let top_level = containers.values().filter(|c| c.parent_id == "root").count();
 
     let mut r = format!(
-        "# Brain Report — {date}\n> {total_convs} conversations · {} projets · {} concepts · {n_bridges} ponts\n\n",
-        projects.len(),
-        concepts.len(),
+        "# Brain Report — {date}\n> {} sources · {} espaces\n\n",
+        leaves.len(),
+        top_level,
     );
 
-    // Top projets (tableau compact)
-    r.push_str("## Projets\n| Projet | Convs | Concepts clés |\n|---|---|---|\n");
-    let mut projs: Vec<&ProjectAgg> = projects.values().collect();
-    projs.sort_by(|a, b| b.conv_count.cmp(&a.conv_count));
-    for p in &projs {
-        let kw = top_keywords(&p.concept_counts, 4).join(", ");
-        r.push_str(&format!("| {} | {} | {} |\n", p.display, p.conv_count, kw));
+    r.push_str("## Espaces\n| Espace | Sources | Concepts clés |\n|---|---|---|\n");
+    let mut cs: Vec<(&String, &ContainerAgg)> = containers.iter()
+        .filter(|(_, c)| c.parent_id == "root")
+        .collect();
+    cs.sort_by(|a, b| b.1.leaf_count.cmp(&a.1.leaf_count));
+    for (_, c) in &cs {
+        let kw = top_keywords(&c.keyword_counts, 4).join(", ");
+        r.push_str(&format!("| {} | {} | {} |\n", c.display, c.leaf_count, kw));
     }
     r.push('\n');
 
-    // Ponts inter-projets
-    let bridges: Vec<&ConceptAgg> =
-        concepts.values().filter(|c| c.projects.len() >= 2).collect();
-    if !bridges.is_empty() {
-        r.push_str("## Ponts inter-projets\n");
-        let mut bv = bridges;
-        bv.sort_by(|a, b| b.occurrences.cmp(&a.occurrences));
-        for c in bv.iter().take(10) {
-            let ps: Vec<String> = c.projects.iter()
-                .filter_map(|k| projects.get(k).map(|p| p.display.clone()))
-                .collect();
-            r.push_str(&format!("- **{}** ({} occ.) : {}\n", c.display, c.occurrences, ps.join(" ↔ ")));
-        }
-        r.push('\n');
-    }
-
-    // Décisions récentes (toutes sources, les 10 dernières)
     r.push_str("## Décisions récentes\n");
-    let mut all_decisions: Vec<(String, String, String)> = projs
-        .iter()
-        .flat_map(|p| {
-            dedup_pairs(&p.decisions)
-                .into_iter()
-                .map(|(d, date)| (p.display.clone(), d, date))
+    let mut all_decisions: Vec<(String, String, String)> = containers.iter()
+        .flat_map(|(_, c)| {
+            dedup_pairs(&c.decisions).into_iter()
+                .map(|(d, date)| (c.display.clone(), d, date))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -710,95 +579,98 @@ fn generate_report(
 
 fn dedup(items: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    items
-        .iter()
-        .filter(|s| seen.insert(norm(s)))
-        .cloned()
-        .collect()
+    items.iter().filter(|s| seen.insert(norm(s))).cloned().collect()
 }
 
-fn assemble_markdown(
-    projects: &BTreeMap<String, ProjectAgg>,
-    concepts: &BTreeMap<String, ConceptAgg>,
-) -> String {
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut md = format!("# 🧠 Second Brain — {date}\n\n");
-
-    // Projets, triés par nombre de conversations décroissant.
-    md.push_str("## 🗂 Projets actifs\n\n");
-    let mut projs: Vec<&ProjectAgg> = projects.values().collect();
-    projs.sort_by(|a, b| b.conv_count.cmp(&a.conv_count));
-    for p in projs {
-        md.push_str(&format!("### {} ({} conversations)\n", p.display, p.conv_count));
-        if !p.objective.is_empty() {
-            md.push_str(&format!("> {}\n", p.objective));
-        }
-        let connectors: std::collections::BTreeSet<&str> =
-            p.sources.iter().map(|s| s.connector.as_str()).collect();
-        let src_label = if connectors.is_empty() {
-            "source".to_string()
-        } else {
-            connectors.into_iter().collect::<Vec<_>>().join(", ")
-        };
-        for (d, date) in dedup_pairs(&p.decisions) {
-            if date.is_empty() {
-                md.push_str(&format!("- {d} (source: {src_label})\n"));
-            } else {
-                md.push_str(&format!("- {d} (source: {src_label} · {date})\n"));
-            }
-        }
-        for pat in dedup(&p.patterns) {
-            md.push_str(&format!("- 🔁 {pat}\n"));
-        }
-        md.push('\n');
-    }
-
-    // Concepts récurrents (apparaissant au moins 2 fois), les plus fréquents d'abord.
-    md.push_str("## 💡 Concepts récurrents\n\n");
-    let mut cs: Vec<&ConceptAgg> = concepts.values().filter(|c| c.occurrences >= 2).collect();
-    cs.sort_by(|a, b| b.occurrences.cmp(&a.occurrences));
-    if cs.is_empty() {
-        md.push_str("_Pas encore de concept récurrent détecté._\n\n");
-    }
-    let display_of = |key: &str| -> String {
-        projects
-            .get(key)
-            .map(|p| p.display.clone())
-            .unwrap_or_else(|| key.to_string())
+/// Émet un nœud comme section markdown parseable.
+pub fn emit_section(buf: &mut String, n: &BrainNode, level: usize) {
+    let hashes = "#".repeat(level);
+    let kind_label = match n.kind.as_str() {
+        "container" | "group" | "espace" => "Espace",
+        "leaf" | "page" => "Page",
+        _ => return,
     };
+    buf.push_str(&format!("{hashes} {kind_label}: {}\n", n.label));
 
-    for c in &cs {
-        let projs: Vec<String> = c.projects.iter().map(|k| display_of(k)).collect();
-        md.push_str(&format!(
-            "### {}\n- {} occurrences · {} projet(s) : {}\n\n",
-            c.display,
-            c.occurrences,
-            c.projects.len(),
-            projs.join(", ")
-        ));
+    // Métadonnées machine-readable (lues par brain_md.rs pour reconstruire l'arbre).
+    let parent_part = n.parent_id.as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|p| format!(" | parent: {p}"))
+        .unwrap_or_default();
+    let mut connector_part = String::new();
+    if let Some(c) = &n.connector {
+        connector_part.push_str(&format!(" | connector: {c}"));
     }
+    if let Some(sid) = &n.source_id {
+        connector_part.push_str(&format!(" | source_id: {sid}"));
+    }
+    if let Some(sp) = &n.source_project {
+        connector_part.push_str(&format!(" | source_project: {sp}"));
+    }
+    buf.push_str(&format!(
+        "<!-- id: {} | weight: {}{parent_part} | community: {}{connector_part} -->\n\n",
+        n.id, n.weight, n.community,
+    ));
 
-    // Connexions : concepts présents dans plusieurs projets → ponts entre projets.
-    md.push_str("## 🔗 Connexions identifiées\n\n");
-    let mut found = false;
-    for c in concepts.values() {
-        if c.projects.len() >= 2 {
-            let projs: Vec<String> = c.projects.iter().map(|k| display_of(k)).collect();
-            md.push_str(&format!("- {} : relient {}\n", c.display, projs.join(" ↔ ")));
-            found = true;
+    if !n.summary.is_empty() {
+        buf.push_str(&format!("{}\n\n", n.summary));
+    }
+    if !n.keywords.is_empty() {
+        buf.push_str(&format!("**Mots-clés** : {}\n\n", n.keywords.join(", ")));
+    }
+    if !n.decisions.is_empty() {
+        buf.push_str("**Décisions** :\n");
+        for d in &n.decisions { buf.push_str(&format!("- {d}\n")); }
+        buf.push('\n');
+    }
+    if !n.patterns.is_empty() {
+        buf.push_str("**Patterns** :\n");
+        for p in &n.patterns { buf.push_str(&format!("- {p}\n")); }
+        buf.push('\n');
+    }
+    if !n.content.is_empty() {
+        buf.push_str(&n.content);
+        buf.push_str("\n\n");
+    }
+}
+
+/// Sérialise le graphe en brain.md structuré — arbre récursif, profondeur illimitée.
+fn assemble_markdown(nodes: &[BrainNode]) -> String {
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let node_count = nodes.iter().filter(|n| n.kind != "root").count();
+    let mut md = format!("# Lucid\n<!-- generated: {date} | nodes: {node_count} | version: 3 -->\n\n");
+
+    // Index parent_id → enfants, triés par poids décroissant.
+    let mut children_of: HashMap<String, Vec<&BrainNode>> = HashMap::new();
+    for n in nodes {
+        if let Some(pid) = &n.parent_id {
+            children_of.entry(pid.clone()).or_default().push(n);
         }
     }
-    if !found {
-        md.push_str("_Aucune connexion inter-projets pour l'instant._\n");
+    for v in children_of.values_mut() {
+        v.sort_by(|a, b| b.weight.cmp(&a.weight));
     }
 
+    emit_recursive(&mut md, "root", &children_of, 2);
     md
+}
+
+fn emit_recursive(
+    buf: &mut String,
+    parent_id: &str,
+    index: &HashMap<String, Vec<&BrainNode>>,
+    level: usize,
+) {
+    let Some(children) = index.get(parent_id) else { return };
+    for child in children {
+        emit_section(buf, child, level);
+        emit_recursive(buf, &child.id, index, level + 1);
+    }
 }
 
 fn dedup_pairs(items: &[(String, String)]) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
-    items
-        .iter()
+    items.iter()
         .filter(|(s, _)| seen.insert(norm(s)))
         .cloned()
         .collect()
@@ -841,9 +713,9 @@ mod tests {
     }
 
     #[test]
-    fn group_key_caps_depth_at_2() {
+    fn group_key_uses_full_path() {
         let path = vec!["A".into(), "B".into(), "C".into()];
-        assert_eq!(group_key(&path), "a/b");
+        assert_eq!(group_key(&path), "a/b/c");
     }
 
     #[test]
@@ -853,13 +725,8 @@ mod tests {
     }
 
     #[test]
-    fn parent_group_key_depth_2() {
-        assert_eq!(parent_group_key("clients/béaux électricité"), "clients");
-    }
-
-    #[test]
-    fn parent_group_key_depth_1_gives_non_classe() {
-        assert_eq!(parent_group_key("brainlink"), "non-classé");
-        assert_eq!(parent_group_key("non-classé"), "non-classé");
+    fn group_display_takes_last_segment() {
+        let path = vec!["Clients".into(), "Béaux Electricité".into()];
+        assert_eq!(group_display(&path), "Béaux Electricité");
     }
 }

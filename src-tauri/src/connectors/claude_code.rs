@@ -32,27 +32,76 @@ fn decode_slug(slug: &str) -> String {
 }
 
 /// Extrait le texte exploitable d'un champ `content` (string ou tableau de blocs).
-/// - string  → tel quel
-/// - tableau → concatène uniquement les blocs `{ "type": "text" }`
+/// - `text`     → tel quel (Markdown natif des réponses Claude)
+/// - `tool_use` → ligne de résumé compacte (outil + argument clé)
+/// - `tool_result` → ignoré (souvent du contenu brut verbeux)
 fn extract_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => {
-            let mut out = String::new();
+            let mut parts: Vec<String> = Vec::new();
             for block in blocks {
-                if block.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(t) = block.get("text").and_then(Value::as_str) {
-                        if !out.is_empty() {
-                            out.push('\n');
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(Value::as_str) {
+                            let t = t.trim();
+                            if !t.is_empty() { parts.push(t.to_string()); }
                         }
-                        out.push_str(t);
                     }
+                    Some("tool_use") => {
+                        if let Some(name) = block.get("name").and_then(Value::as_str) {
+                            let arg = tool_summary(name, block.get("input"));
+                            let line = if arg.is_empty() {
+                                format!("> `{name}`")
+                            } else {
+                                format!("> `{name}` {arg}")
+                            };
+                            parts.push(line);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            out
+            parts.join("\n\n")
         }
         _ => String::new(),
     }
+}
+
+fn char_truncate(s: &str, max: usize) -> String {
+    let mut indices = s.char_indices();
+    match indices.nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// Résume l'argument principal d'un appel d'outil en une ligne courte.
+fn tool_summary(name: &str, input: Option<&Value>) -> String {
+    let Some(inp) = input else { return String::new(); };
+    // Argument principal selon le type d'outil
+    let key = match name {
+        "Read" | "Edit" | "Write" | "MultiEdit" => "file_path",
+        "Bash"                                   => "command",
+        "Agent"                                  => "prompt",
+        "WebFetch" | "WebSearch"                 => "url",
+        _                                        => "",
+    };
+    if !key.is_empty() {
+        if let Some(val) = inp.get(key).and_then(Value::as_str) {
+            let short = char_truncate(val, 80);
+            return format!("`{short}`");
+        }
+    }
+    // Fallback : premier champ string de l'input
+    if let Some(obj) = inp.as_object() {
+        if let Some((_, v)) = obj.iter().find(|(_, v)| v.is_string()) {
+            if let Some(s) = v.as_str() {
+                return format!("`{}`", char_truncate(s, 60));
+            }
+        }
+    }
+    String::new()
 }
 
 /// Parse un fichier `.jsonl` en une conversation complète.
@@ -248,13 +297,19 @@ mod tests {
     }
 
     #[test]
-    fn extracts_text_blocks_only() {
+    fn extracts_text_and_formats_tool_use() {
         let v: Value = serde_json::json!([
             {"type": "text", "text": "première"},
-            {"type": "tool_use", "name": "x"},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "src/main.rs"}},
+            {"type": "tool_result", "content": "…file content…"},
             {"type": "text", "text": "seconde"}
         ]);
-        assert_eq!(extract_text(&v), "première\nseconde");
+        let result = extract_text(&v);
+        assert!(result.contains("première"), "text block missing");
+        assert!(result.contains("> `Read`"), "tool_use line missing");
+        assert!(result.contains("src/main.rs"), "tool arg missing");
+        assert!(result.contains("seconde"), "second text block missing");
+        assert!(!result.contains("file content"), "tool_result should be ignored");
     }
 
     #[test]

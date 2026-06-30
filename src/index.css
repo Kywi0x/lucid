@@ -77,6 +77,41 @@ body {
   background: transparent;
 }
 
+/* ── Liquid glass ─────────────────────────────────────────────────────────── */
+.glass {
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(28px) saturate(180%) brightness(1.06);
+  -webkit-backdrop-filter: blur(28px) saturate(180%) brightness(1.06);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.8),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.04),
+    0 8px 32px rgba(0, 0, 0, 0.1),
+    0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .glass {
+    background: rgba(28, 30, 36, 0.6);
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.2),
+      0 8px 32px rgba(0, 0, 0, 0.4),
+      0 2px 8px rgba(0, 0, 0, 0.2);
+  }
+}
+
+:root[data-theme="dark"] .glass {
+  background: rgba(28, 30, 36, 0.6);
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2),
+    0 8px 32px rgba(0, 0, 0, 0.4),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
 /* Bulle : animation de survol */
 .bubble {
   transition:
@@ -166,7 +201,302 @@ body {
   font-size: 0.85em;
 }
 
+/* ── prose-notion : rendu markdown inspiré Notion ─────────────────────────── */
+.prose-notion {
+  line-height: 1.65;
+  color: var(--color-text);
+}
+/* Titres — hiérarchie sobre, aucune couleur accent */
+.prose-notion h1 {
+  font-size: 1.05rem; font-weight: 700;
+  margin: 1rem 0 0.35rem; color: var(--color-text);
+}
+.prose-notion h2 {
+  font-size: 0.92rem; font-weight: 600;
+  margin: 0.9rem 0 0.25rem; color: var(--color-text);
+}
+.prose-notion h3 {
+  font-size: 0.82rem; font-weight: 600;
+  margin: 0.75rem 0 0.2rem; color: var(--color-text);
+}
+.prose-notion h4, .prose-notion h5, .prose-notion h6 {
+  font-size: 0.78rem; font-weight: 500;
+  margin: 0.5rem 0 0.15rem; color: var(--color-muted);
+}
+.prose-notion p { margin: 0.35rem 0; }
+.prose-notion ul, .prose-notion ol { padding-left: 1.25rem; margin: 0.25rem 0; }
+.prose-notion ul { list-style: disc; }
+.prose-notion ol { list-style: decimal; }
+.prose-notion li { margin: 0.15rem 0; }
+.prose-notion strong { font-weight: 600; }
+.prose-notion em    { font-style: italic; }
+/* Blockquote : barre latérale sobre */
+.prose-notion blockquote {
+  border-left: 3px solid var(--color-border);
+  padding: 0.1rem 0 0.1rem 0.75rem;
+  margin: 0.4rem 0;
+  color: var(--color-muted);
+}
+.prose-notion hr { border: none; border-top: 1px solid var(--color-border); margin: 0.75rem 0; }
+/* Code inline */
+.prose-notion code {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+  font-size: 0.8em;
+  font-family: ui-monospace, monospace;
+}
+/* Bloc de code */
+.prose-notion pre {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+  font-size: 0.8em;
+  line-height: 1.55;
+}
+.prose-notion pre code { background: none; border: none; padding: 0; }
+
+/* ── Table — style Notion : propre, aéré, sans surcharge colorée ── */
+.prose-notion-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+.prose-notion table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 100%;
+  font-size: 0.8em;
+}
+.prose-notion thead tr {
+  background: var(--color-surface-2);
+}
+.prose-notion th {
+  padding: 0.45rem 0.9rem;
+  text-align: left;
+  font-weight: 500;
+  font-size: 0.73em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.prose-notion td {
+  padding: 0.4rem 0.9rem;
+  text-align: left;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.prose-notion tbody tr:last-child td { border-bottom: none; }
+.prose-notion tbody tr:hover { background: var(--color-surface-2); }
+
 @keyframes bubblePop {
   from { opacity: 0; transform: scale(0.4); }
   to   { opacity: 1; transform: scale(1); }
 }
+
+/* ── Lucid orb (bubble centrale animée) ─────────────────────────────────── */
+@keyframes lucidMorph {
+  0%   { border-radius: 58% 42% 68% 32% / 52% 64% 36% 48%; }
+  16%  { border-radius: 72% 28% 42% 58% / 38% 52% 48% 62%; }
+  33%  { border-radius: 38% 62% 56% 44% / 68% 32% 68% 32%; }
+  50%  { border-radius: 62% 38% 34% 66% / 44% 62% 38% 56%; }
+  66%  { border-radius: 44% 56% 72% 28% / 58% 44% 56% 42%; }
+  83%  { border-radius: 28% 72% 48% 52% / 42% 68% 32% 58%; }
+  100% { border-radius: 58% 42% 68% 32% / 52% 64% 36% 48%; }
+}
+@keyframes lucidGlow {
+  0%, 100% { box-shadow: 0 0 28px #7c5cff99, 0 0 60px #7c5cff33, inset 0 0 20px rgba(255,255,255,0.08); }
+  33%       { box-shadow: 0 0 40px #a855f7aa, 0 0 90px #a855f744, inset 0 0 28px rgba(255,255,255,0.12); }
+  66%       { box-shadow: 0 0 32px #6366f199, 0 0 72px #6366f133, inset 0 0 22px rgba(255,255,255,0.1);  }
+}
+@keyframes lucidInner {
+  0%, 100% { transform: rotate(0deg)   scale(1);    opacity: 0.55; }
+  50%       { transform: rotate(180deg) scale(0.82); opacity: 0.85; }
+}
+@keyframes lucidSpin {
+  from { filter: hue-rotate(0deg)   brightness(1.05); }
+  to   { filter: hue-rotate(360deg) brightness(1.15); }
+}
+.lucid-orb {
+  position: relative;
+  background:
+    radial-gradient(ellipse at 30% 25%, #b8acff 0%, transparent 50%),
+    radial-gradient(ellipse at 70% 75%, #7c5cff 0%, transparent 55%),
+    radial-gradient(ellipse at 62% 18%, rgba(255,255,255,0.45) 0%, transparent 28%),
+    radial-gradient(ellipse at 50% 50%, #5a3fd4 0%, transparent 70%);
+  display: flex; align-items: center; justify-content: center;
+  overflow: visible;
+  animation: lucidMorph 5.5s ease-in-out infinite, lucidGlow 4s ease-in-out infinite;
+}
+.lucid-orb::before {
+  content: '';
+  position: absolute;
+  inset: 18%;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at 35% 30%, rgba(255,255,255,0.55) 0%, transparent 65%);
+  animation: lucidInner 7s ease-in-out infinite reverse;
+  filter: blur(3px);
+  pointer-events: none;
+}
+.lucid-orb::after {
+  content: '';
+  position: absolute;
+  inset: 8%;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, #a855f722, #7c5cff44, #6366f122, #7c5cff44, #a855f722);
+  animation: lucidSpin 10s linear infinite;
+  pointer-events: none;
+}
+
+/* ── Concept : label tooltip ─────────────────────────────────────────────── */
+.concept-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) translateY(-18px);
+  white-space: nowrap;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 2px 6px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 20;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+}
+.concept-outer:hover .concept-label,
+.concept-label--visible {
+  opacity: 1 !important;
+  transform: translate(-50%, -50%) translateY(-20px);
+}
+
+/* ── Design system gris — tous les nœuds non-root ────────────────────────── */
+.node-outer {
+  transition: transform 0.15s ease, filter 0.15s ease;
+}
+.node-outer:hover {
+  transform: scale(1.14);
+  filter: brightness(1.12);
+  z-index: 10;
+}
+
+.node-source,
+.node-concept {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.node-project {
+  background: var(--color-surface-2);
+  border: 1.5px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.node-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) translateY(-18px);
+  white-space: nowrap;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 2px 6px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 20;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+}
+.node-outer:hover .node-label,
+.node-label--visible {
+  opacity: 1 !important;
+  transform: translate(-50%, -50%) translateY(-20px);
+}
+
+@keyframes nodeFloat {
+  0%,  100% { transform: translate(0,    0);    }
+  25%        { transform: translate(1px,  -5px); }
+  55%        { transform: translate(-2px,  3px); }
+  80%        { transform: translate(1px,  -2px); }
+}
+
+@keyframes glowRing {
+  0%,  100% { transform: scale(1);    opacity: 0.25; }
+  50%        { transform: scale(1.18); opacity: 0.7;  }
+}
+
+/* Edge : micro-impulsion neuronale (override React Flow animated) */
+.react-flow__edge-animated .react-flow__edge-path {
+  stroke-dasharray: 3 18 !important;
+  animation-duration: 2.8s !important;
+}
+
+@keyframes slideInLeft {
+  from { transform: translateX(-100%); opacity: 0; }
+  to   { transform: translateX(0);     opacity: 1; }
+}
+.animate-slideInLeft {
+  animation: slideInLeft 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+.animate-slideInRight {
+  animation: slideInRight 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ─── TipTap — prose-lucid ────────────────────────────────────────────────── */
+.prose-lucid { color: var(--color-text); }
+.prose-lucid p { margin: 0 0 0.5em; line-height: 1.6; }
+.prose-lucid p:last-child { margin-bottom: 0; }
+.prose-lucid h2 { font-size: 0.95rem; font-weight: 700; margin: 1em 0 0.4em; }
+.prose-lucid h3 { font-size: 0.875rem; font-weight: 600; margin: 0.8em 0 0.3em; }
+.prose-lucid ul { list-style: disc; padding-left: 1.25em; margin: 0.4em 0; }
+.prose-lucid ol { list-style: decimal; padding-left: 1.25em; margin: 0.4em 0; }
+.prose-lucid li { margin: 0.15em 0; line-height: 1.5; }
+.prose-lucid code { font-family: monospace; font-size: 0.8em; background: var(--color-surface-2); border-radius: 3px; padding: 0.1em 0.35em; }
+.prose-lucid blockquote { border-left: 3px solid var(--color-accent); padding-left: 0.75em; color: var(--color-muted); margin: 0.5em 0; }
+.prose-lucid hr { border: none; border-top: 1px solid var(--color-border); margin: 0.75em 0; }
+
+/* TipTap placeholder */
+.prose-lucid p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--color-muted);
+  pointer-events: none;
+  float: left;
+  height: 0;
+}
+
+/* Tables TipTap — même style que les tables de l'app */
+.prose-lucid table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin: 0.5em 0; }
+.prose-lucid th { background: var(--color-surface-2); color: var(--color-text); font-weight: 600; text-align: left; padding: 0.4em 0.6em; border: 1px solid var(--color-border); }
+.prose-lucid td { padding: 0.35em 0.6em; border: 1px solid var(--color-border); vertical-align: top; }
+.prose-lucid tr:nth-child(even) td { background: var(--color-surface); }
+.prose-lucid .selectedCell { background: var(--color-accent-soft) !important; }
+
+/* Resize handle */
+.prose-lucid .column-resize-handle { background: var(--color-accent); width: 2px; opacity: 0.5; }
+.tableWrapper { overflow-x: auto; }
+

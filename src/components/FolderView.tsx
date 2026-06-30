@@ -1,49 +1,34 @@
 import { useMemo, useState } from "react";
 import {
-  ChevronRight,
-  ChevronDown,
-  FolderGit2,
-  Lightbulb,
-  MessageSquare,
-  Brain,
+  ChevronRight, ChevronDown, FolderGit2, FileText, Brain,
 } from "lucide-react";
-import type { BrainGraph, BrainNode, SourceRef } from "@/lib/types";
+import type { BrainGraph, BrainNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface Props {
   graph: BrainGraph;
   onSelect: (node: BrainNode) => void;
-  onOpenSource: (s: SourceRef) => void;
   selectedId: string | null;
   query: string;
 }
 
-export function FolderView({
-  graph,
-  onSelect,
-  onOpenSource,
-  selectedId,
-  query,
-}: Props) {
+export function FolderView({ graph, onSelect, selectedId, query }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const q = query.trim().toLowerCase();
 
-  const { projects, conceptsByProject } = useMemo(() => {
-    const projects = graph.nodes.filter((n) => n.kind === "project");
-    const conceptNode = new Map(
-      graph.nodes.filter((n) => n.kind === "concept").map((n) => [n.id, n]),
-    );
-    const conceptsByProject = new Map<string, BrainNode[]>();
-    for (const e of graph.edges) {
-      if (e.kind !== "concept") continue;
-      const c = conceptNode.get(e.target);
-      if (!c) continue;
-      const arr = conceptsByProject.get(e.source) ?? [];
-      arr.push(c);
-      conceptsByProject.set(e.source, arr);
+  // Build children map from parent_id
+  const childrenOf = useMemo(() => {
+    const map = new Map<string, BrainNode[]>();
+    for (const node of graph.nodes) {
+      if (!node.parent_id) continue;
+      if (!map.has(node.parent_id)) map.set(node.parent_id, []);
+      map.get(node.parent_id)!.push(node);
     }
-    return { projects, conceptsByProject };
+    return map;
   }, [graph]);
+
+  const rootNode = graph.nodes.find((n) => n.kind === "root");
+  const topLevel = childrenOf.get(rootNode?.id ?? "root") ?? [];
 
   function toggle(id: string) {
     setExpanded((prev) => {
@@ -53,13 +38,69 @@ export function FolderView({
     });
   }
 
-  const projMatch = (p: BrainNode) =>
-    !q ||
-    [p.label, p.summary, ...p.keywords].join(" ").toLowerCase().includes(q) ||
-    (conceptsByProject.get(p.id) ?? []).some((c) =>
-      c.label.toLowerCase().includes(q),
-    ) ||
-    p.sources.some((s) => s.title.toLowerCase().includes(q));
+  function nodeMatches(node: BrainNode): boolean {
+    if (!q) return true;
+    if ([node.label, node.summary, ...node.keywords].join(" ").toLowerCase().includes(q)) return true;
+    // Check descendants recursively
+    for (const child of childrenOf.get(node.id) ?? []) {
+      if (nodeMatches(child)) return true;
+    }
+    return false;
+  }
+
+  function renderNode(node: BrainNode, depth: number): React.ReactNode {
+    if (!nodeMatches(node)) return null;
+    const children = childrenOf.get(node.id) ?? [];
+    const hasChildren = children.length > 0;
+    const isOpen = expanded.has(node.id) || !!q;
+    const isLeaf = !hasChildren;
+
+    return (
+      <li key={node.id}>
+        <div
+          className={cn(
+            "flex items-center gap-1.5 rounded-md px-2 py-1.5",
+            selectedId === node.id
+              ? "bg-[var(--color-accent-soft)]"
+              : "hover:bg-[var(--color-surface-2)]",
+          )}
+          style={{ paddingLeft: `${0.5 + depth * 1.25}rem` }}
+        >
+          {hasChildren ? (
+            <button onClick={() => toggle(node.id)} className="text-[var(--color-muted)]">
+              {isOpen
+                ? <ChevronDown className="size-4" />
+                : <ChevronRight className="size-4" />}
+            </button>
+          ) : (
+            <span className="size-4 shrink-0" />
+          )}
+          <button
+            onClick={() => onSelect(node)}
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            {isLeaf
+              ? <FileText className="size-4 shrink-0 text-[var(--color-muted)]" />
+              : <FolderGit2 className="size-4 shrink-0 text-[var(--color-accent)]" />}
+            <span className="truncate text-sm font-medium">{node.label}</span>
+            {!isLeaf && (
+              <span className="ml-auto text-xs text-[var(--color-muted)]">
+                {children.length}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {isOpen && hasChildren && (
+          <ul>
+            {children.map((child) => renderNode(child, depth + 1))}
+          </ul>
+        )}
+      </li>
+    );
+  }
+
+  const totalLeaves = graph.nodes.filter((n) => !childrenOf.has(n.id) && n.kind !== "root").length;
 
   return (
     <div className="h-full overflow-y-auto px-6 py-5">
@@ -68,75 +109,11 @@ export function FolderView({
           <Brain className="size-4 text-[var(--color-accent)]" />
           Second Brain
           <span className="text-xs font-normal text-[var(--color-muted)]">
-            {projects.length} projets
+            {topLevel.length} espaces · {totalLeaves} documents
           </span>
         </div>
-
         <ul className="space-y-0.5">
-          {projects.filter(projMatch).map((p) => {
-            const open = expanded.has(p.id) || !!q;
-            const concepts = conceptsByProject.get(p.id) ?? [];
-            return (
-              <li key={p.id}>
-                <div
-                  className={cn(
-                    "flex items-center gap-1.5 rounded-md px-2 py-1.5",
-                    selectedId === p.id
-                      ? "bg-[var(--color-accent-soft)]"
-                      : "hover:bg-[var(--color-surface-2)]",
-                  )}
-                >
-                  <button onClick={() => toggle(p.id)} className="text-[var(--color-muted)]">
-                    {open ? (
-                      <ChevronDown className="size-4" />
-                    ) : (
-                      <ChevronRight className="size-4" />
-                    )}
-                  </button>
-                  <button
-                    onClick={() => onSelect(p)}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                  >
-                    <FolderGit2 className="size-4 shrink-0 text-[var(--color-accent)]" />
-                    <span className="truncate text-sm font-medium">{p.label}</span>
-                    <span className="ml-auto text-xs text-[var(--color-muted)]">
-                      {p.sources.length} src · {concepts.length} concepts
-                    </span>
-                  </button>
-                </div>
-
-                {open && (
-                  <ul className="ml-7 border-l border-[var(--color-border)] pl-3">
-                    {p.sources.map((s, i) => (
-                      <li key={`s${i}`}>
-                        <button
-                          onClick={() => onOpenSource(s)}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
-                        >
-                          <MessageSquare className="size-3.5 shrink-0" />
-                          <span className="truncate">{s.title}</span>
-                        </button>
-                      </li>
-                    ))}
-                    {concepts.map((c) => (
-                      <li key={c.id}>
-                        <button
-                          onClick={() => onSelect(c)}
-                          className={cn(
-                            "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs hover:bg-[var(--color-surface-2)]",
-                            selectedId === c.id && "bg-[var(--color-accent-soft)]",
-                          )}
-                        >
-                          <Lightbulb className="size-3.5 shrink-0 text-[var(--color-accent)]" />
-                          <span className="truncate">{c.label}</span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </li>
-            );
-          })}
+          {topLevel.filter(nodeMatches).map((node) => renderNode(node, 0))}
         </ul>
       </div>
     </div>
