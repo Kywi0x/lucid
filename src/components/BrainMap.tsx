@@ -1,16 +1,7 @@
 import {
-  useMemo, useState, useEffect, useRef, useCallback,
+  useMemo, useState, useEffect, useRef,
 } from "react";
-import {
-  ReactFlow,
-  Background, BackgroundVariant,
-  Handle, Position,
-  useNodesState,
-  useViewport,
-  useReactFlow,
-  type Node, type Edge, type NodeProps,
-} from "@xyflow/react";
-import type { BrainGraph, BrainNode } from "@/lib/types";
+import type { BrainGraph, BrainNode, Space } from "@/lib/types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -22,6 +13,10 @@ interface Props {
   revealKey?: number;
   streamLabels?: string[];
   streamTotal?: number;
+  spaces?: Space[];
+  onAddNodeToSpace?: (nodeId: string, spaceId: string) => void;
+  onCreateNote?: (parentId: string, title: string) => void;
+  onMoveNode?: (nodeId: string, parentId: string) => void;
 }
 
 interface NodeInfo {
@@ -30,25 +25,26 @@ interface NodeInfo {
   r: number;
   finalX: number;
   finalY: number;
-  birthX: number;
-  birthY: number;
-  birthDelay: number;
   parentId: string | null;
 }
 
-// ─── Palette (genesis uniquement) ─────────────────────────────────────────────
+// ─── Palette (couleurs de l'app : clusters + racine accent + notes ambre) ───────
 
 const PALETTE = [
   "#7b6fe0", "#3ea882", "#c97c4a", "#c95c88",
   "#4a8dcc", "#b08a28", "#8752ba", "#38a09a",
   "#b84c44", "#5060c0",
 ];
+const ACCENT_FALLBACK = "#7c5cff";
+const VOID_BG = "#0a0c10";
+const LEAF_ZOOM = 0.5; // les feuilles n'apparaissent qu'au-delà de ce zoom
 
 function radiusOf(n: BrainNode): number {
-  if (n.kind === "root")                             return 44;
-  if (n.kind === "group")                            return 26 + Math.sqrt(n.weight) * 3;
-  if (n.kind === "espace" || n.kind === "container") return 14 + Math.sqrt(n.weight) * 3.5;
-  return 9; // leaf, page, concept, source
+  if (n.kind === "root")                             return 20;
+  if (n.kind === "group")                            return 10;
+  if (n.kind === "note")                             return 6;
+  if (n.kind === "espace" || n.kind === "container") return 6;
+  return 4; // leaf, page, concept, source
 }
 
 function isLeafKind(kind: string): boolean {
@@ -66,9 +62,31 @@ function orbitR(N: number, maxR: number, gap: number, minR: number): number {
 
 function arcOrbitR(N: number, rs: number, gap: number, spread: number, minR: number): number {
   if (N <= 1) return minR;
-  const angularStep = spread / (N - 1);
-  const minByArc = (rs + gap / 2) / Math.sin(angularStep / 2);
-  return Math.max(minR, minByArc);
+  const step = spread / (N - 1);
+  return Math.max(minR, (rs + gap / 2) / Math.sin(step / 2));
+}
+
+/** Repousse les paires de nœuds qui se chevauchent — passe itérative simple. */
+function resolveOverlaps(infos: Map<string, NodeInfo>, iterations = 4, minGap = 16): void {
+  const nodes = Array.from(infos.values());
+  for (let iter = 0; iter < iterations; iter++) {
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        if (a.node.kind === "root" && b.node.kind === "root") continue;
+        const dx = b.finalX - a.finalX;
+        const dy = b.finalY - a.finalY;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        const needed = a.r + b.r + minGap;
+        if (dist < needed) {
+          const push = (needed - dist) / 2;
+          const nx = dx / dist, ny = dy / dist;
+          if (a.node.kind !== "root") { a.finalX -= nx * push; a.finalY -= ny * push; }
+          if (b.node.kind !== "root") { b.finalX += nx * push; b.finalY += ny * push; }
+        }
+      }
+    }
+  }
 }
 
 function stableHash(s: string): number {
@@ -81,19 +99,13 @@ function jitter(id: string, axis: string, scale: number): number {
   return (stableHash(id + axis) * 2 - 1) * scale;
 }
 
-function arcSpread(N: number): number {
-  if (N <= 1) return 0;
-  return Math.min(Math.PI * 0.83, Math.PI / 3 + N * 0.2);
-}
-
-// ─── Layout radial récursif (parent_id) ───────────────────────────────────────
+// ─── Layout sectoriel proportionnel (réutilisé tel quel de l'ancienne version) ──
 
 function buildLayout(
   graph: BrainGraph,
 ): { infos: Map<string, NodeInfo>; childrenOf: Map<string, string[]> } {
   const infos = new Map<string, NodeInfo>();
 
-  // Index children par parent_id
   const childrenByParent = new Map<string, BrainNode[]>();
   for (const node of graph.nodes) {
     if (!node.parent_id) continue;
@@ -103,51 +115,58 @@ function buildLayout(
 
   const rootNode = graph.nodes.find((n) => n.kind === "root");
   const rootId = rootNode?.id ?? "root";
-  if (rootNode) {
-    infos.set(rootId, {
-      id: rootId, node: rootNode, r: 44,
-      finalX: 0, finalY: 0, birthX: 0, birthY: 0, birthDelay: 0, parentId: null,
-    });
-  }
+  if (!rootNode) return { infos, childrenOf: new Map() };
 
-  function placeLevel(
+  infos.set(rootId, {
+    id: rootId, node: rootNode, r: 20,
+    finalX: 0, finalY: 0, parentId: null,
+  });
+
+  const GAP = 16;
+
+  function place(
     parentId: string, px: number, py: number,
-    gpx: number, gpy: number,
-    parentDelay: number, depth: number,
+    outAngle: number, depth: number,
   ) {
     const kids = childrenByParent.get(parentId) ?? [];
     if (!kids.length) return;
+
     const N = kids.length;
-    const maxR = kids.reduce((m, k) => Math.max(m, radiusOf(k)), 9);
+    const maxKidR = kids.reduce((m, k) => Math.max(m, radiusOf(k)), 9);
+    const parentR = infos.get(parentId)!.r;
     const isFirst = depth === 1;
-    const spread = isFirst ? Math.PI * 2 : arcSpread(N);
+
+    const spread = isFirst
+      ? Math.PI * 2
+      : Math.min(Math.PI * 0.95, Math.max(Math.PI * 0.22, N * Math.PI * 0.22));
+
     const R = isFirst
-      ? orbitR(N, maxR, 50, 160)
-      : arcOrbitR(N, maxR, 18, spread, Math.max(28, 68 - depth * 8));
-    const outAngle = Math.atan2(py - gpy, px - gpx);
+      ? orbitR(N, maxKidR, GAP * 2, 110)
+      : arcOrbitR(N, maxKidR, GAP, spread, parentR + maxKidR + GAP);
 
     kids.forEach((kid, ki) => {
       const t = N <= 1 ? 0.5 : ki / (N - 1);
       const baseAngle = isFirst
         ? (ki / N) * Math.PI * 2 - Math.PI / 2
         : outAngle - spread / 2 + t * spread;
-      const jAng = jitter(kid.id, "ang", 0.18 / Math.max(N, 3));
-      const jRad = jitter(kid.id, "rad", R * 0.12);
+
+      const jAng = jitter(kid.id, "ang", 0.06 / Math.max(N, 2));
+      const jRad = jitter(kid.id, "rad", R * 0.04);
+
       const kx = px + (R + jRad) * Math.cos(baseAngle + jAng);
       const ky = py + (R + jRad) * Math.sin(baseAngle + jAng);
-      const kidDelay = parentDelay + (ki + 1) * (isLeafKind(kid.kind) ? 60 : 200);
 
       infos.set(kid.id, {
         id: kid.id, node: kid, r: radiusOf(kid),
-        finalX: kx, finalY: ky, birthX: px, birthY: py,
-        birthDelay: kidDelay, parentId: parentId,
+        finalX: kx, finalY: ky, parentId,
       });
 
-      placeLevel(kid.id, kx, ky, px, py, kidDelay, depth + 1);
+      place(kid.id, kx, ky, Math.atan2(ky - py, kx - px), depth + 1);
     });
   }
 
-  placeLevel(rootId, 0, 0, 0, 100, 0, 1);
+  place(rootId, 0, 0, -Math.PI / 2, 1);
+  resolveOverlaps(infos, 6, GAP);
 
   const childrenOf = new Map<string, string[]>();
   for (const info of infos.values()) {
@@ -161,38 +180,6 @@ function buildLayout(
   return { infos, childrenOf };
 }
 
-function computePushOffsets(
-  infos: Map<string, NodeInfo>,
-  focusedId: string,
-  dragOffsets: Map<string, { dx: number; dy: number }>,
-): Map<string, { dx: number; dy: number }> {
-  const focused = infos.get(focusedId);
-  if (!focused) return new Map();
-  const fx = focused.finalX + (dragOffsets.get(focusedId)?.dx ?? 0);
-  const fy = focused.finalY + (dragOffsets.get(focusedId)?.dy ?? 0);
-  const PUSH = 230;
-  const result = new Map<string, { dx: number; dy: number }>();
-  for (const info of infos.values()) {
-    if (info.id === focusedId || info.node.kind === "root") continue;
-    if (info.parentId === focusedId) continue;
-    const isLeaf = isLeafKind(info.node.kind);
-    const isContainer = !isLeaf;
-    if (!isContainer && !isLeaf) continue;
-    if (isLeaf) {
-      const par = infos.get(info.parentId ?? "");
-      if (par?.parentId === focusedId) continue;
-    }
-    const refId = isLeaf ? (info.parentId ?? info.id) : info.id;
-    const ref = infos.get(refId)!;
-    const rx = ref.finalX + (dragOffsets.get(refId)?.dx ?? 0);
-    const ry = ref.finalY + (dragOffsets.get(refId)?.dy ?? 0);
-    const ddx = rx - fx, ddy = ry - fy;
-    const dist = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
-    result.set(info.id, { dx: (ddx / dist) * PUSH, dy: (ddy / dist) * PUSH });
-  }
-  return result;
-}
-
 function getDescendants(id: string, childrenOf: Map<string, string[]>): string[] {
   const out: string[] = [];
   const q = [id];
@@ -202,496 +189,503 @@ function getDescendants(id: string, childrenOf: Map<string, string[]>): string[]
   return out;
 }
 
-// ─── Construction des nœuds RF ────────────────────────────────────────────────
+// ─── Helpers canvas ─────────────────────────────────────────────────────────────
 
-function makeNodes(
-  infos: Map<string, NodeInfo>,
-  dragOffsets: Map<string, { dx: number; dy: number }>,
-  revealKey: number,
-  showLeaves: boolean,
-  selectedId: string | null,
-  q: string,
-  focusedId: string | null,
-): Node[] {
-  const pushOffsets = focusedId
-    ? computePushOffsets(infos, focusedId, dragOffsets)
-    : null;
-
-  return Array.from(infos.values())
-    .filter((info) => {
-      if (isLeafKind(info.node.kind)) return showLeaves;
-      return true;
-    })
-    .map((info, i) => {
-      const off   = dragOffsets.get(info.id) ?? { dx: 0, dy: 0 };
-      const push  = pushOffsets?.get(info.id) ?? { dx: 0, dy: 0 };
-      const moved = off.dx !== 0 || off.dy !== 0;
-      const isLeaf = isLeafKind(info.node.kind);
-      const isParentFocused = isLeaf && info.parentId === focusedId;
-      return {
-        id: info.id,
-        type: "bubble",
-        position: {
-          x: info.finalX - info.r + off.dx + push.dx,
-          y: info.finalY - info.r + off.dy + push.dy,
-        },
-        selected: info.id === selectedId,
-        draggable: !isLeaf,
-        data: {
-          node: info.node, r: info.r, idx: i,
-          bx: moved ? 0 : info.birthX - info.finalX,
-          by: moved ? 0 : info.birthY - info.finalY,
-          delay: moved ? 0 : info.birthDelay,
-          revealKey, isLeaf, isParentFocused,
-          parentId: info.parentId,
-          dim: q ? !matches(info.node, q) : false,
-        },
-      };
-    });
+function hexA(hex: string, a: number): string {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
 }
 
-function makeGenesisNodes(labels: string[], total: number, revealKey: number): Node[] {
-  const G = Math.max(total, labels.length, 1);
-  const Rg = orbitR(G, 26, 50, 220);
-
-  const nodes: Node[] = [{
-    id: "g-root", type: "genesis",
-    position: { x: -44, y: -44 },
-    data: { isRoot: true, revealKey },
-    draggable: false,
-  }];
-
-  labels.forEach((label, i) => {
-    const baseAngle = (i / G) * Math.PI * 2 - Math.PI / 2;
-    const jAng = jitter(label, "ang", 0.18 / Math.max(G, 3));
-    const jRad = jitter(label, "rad", Rg * 0.14);
-    const gx   = (Rg + jRad) * Math.cos(baseAngle + jAng);
-    const gy   = (Rg + jRad) * Math.sin(baseAngle + jAng);
-    const r    = 18;
-    const color = PALETTE[i % PALETTE.length];
-
-    nodes.push({
-      id: `g-${i}`, type: "genesis",
-      position: { x: gx - r, y: gy - r },
-      data: { label, idx: i, revealKey: i, r, color },
-      draggable: false,
-    });
-
-    const NB_SAT = 4;
-    const Rsat = 48;
-    for (let s = 0; s < NB_SAT; s++) {
-      const sa = (s / NB_SAT) * Math.PI * 2 + i * 0.7;
-      nodes.push({
-        id: `g-${i}-s-${s}`, type: "genesisSat",
-        position: { x: gx + Rsat * Math.cos(sa) - 5, y: gy + Rsat * Math.sin(sa) - 5 },
-        data: { idx: s, parentIdx: i, revealKey: i, color },
-        draggable: false,
-      });
-    }
-  });
-
-  return nodes;
-}
-
-// ─── Edges ────────────────────────────────────────────────────────────────────
-
-function makeEdges(infos: Map<string, NodeInfo>, showLeaves: boolean): Edge[] {
-  return Array.from(infos.values())
-    .filter((info) => {
-      if (!info.parentId || info.parentId === "root") return false;
-      if (isLeafKind(info.node.kind)) return showLeaves;
-      return true;
-    })
-    .map((info) => {
-      const isLeaf = isLeafKind(info.node.kind);
-      return {
-        id: `e-${info.parentId}-${info.id}`,
-        source: info.parentId!,
-        target: info.id,
-        type: "straight",
-        animated: false,
-        style: {
-          stroke: "var(--color-border)",
-          strokeWidth: isLeaf ? 0.6 : 1,
-          opacity: isLeaf ? 0.5 : 0.4,
-          strokeDasharray: isLeaf ? "3 6" : undefined,
-        },
-      };
-    });
-}
-
-// ─── Handle invisible ────────────────────────────────────────────────────────
-
-const H: React.CSSProperties = {
-  opacity: 0, top: "50%", left: "50%", width: 1, height: 1,
-  border: "none", background: "transparent",
-};
-
-// ─── BubbleNode ───────────────────────────────────────────────────────────────
-
-function BubbleNode({ data }: NodeProps) {
-  const node    = data.node          as BrainNode;
-  const r       = data.r             as number;
-  const dim     = (data.dim          as boolean) ?? false;
-  const bx      = (data.bx           as number)  ?? 0;
-  const by      = (data.by           as number)  ?? 0;
-  const delay   = (data.delay        as number)  ?? 0;
-  const revealKey = (data.revealKey  as number)  ?? 0;
-  const isLeaf  = (data.isLeaf       as boolean) ?? false;
-  const isParentFocused = (data.isParentFocused as boolean) ?? false;
-  const isRoot  = node.kind === "root";
-  const isGroup = node.kind === "group" || node.kind === "container";
-  const innerRef = useRef<HTMLDivElement>(null);
-  const size = r * 2;
-
-  useEffect(() => {
-    const el = innerRef.current;
-    if (!el) return;
-    const anim = el.animate(
-      [
-        { transform: `translate(${bx}px,${by}px) scale(0.18)`, opacity: 0 },
-        { transform: "translate(0,0) scale(1)", opacity: 1 },
-      ],
-      {
-        duration: isLeaf ? 320 : 520,
-        delay,
-        fill: "both",
-        easing: isLeaf ? "ease-out" : "cubic-bezier(0.34, 1.56, 0.64, 1)",
-      },
-    );
-    return () => anim.cancel();
-  }, [revealKey]); // eslint-disable-line
-
-  // ── Lucid (root) ──────────────────────────────────────────────────────────
-  if (isRoot) {
-    return (
-      <div style={{
-        position: "relative", width: size, height: size + 28,
-        cursor: "default", userSelect: "none",
-        opacity: dim ? 0.15 : 1, transition: "opacity 0.2s",
-      }}>
-        <div ref={innerRef} className="lucid-orb" style={{
-          width: size, height: size,
-          animation: "lucidMorph 5.5s ease-in-out infinite, lucidGlow 4s ease-in-out infinite",
-        }}>
-          <Handle type="target" position={Position.Top}    style={H} />
-          <Handle type="source" position={Position.Bottom} style={H} />
-        </div>
-        <div style={{
-          position: "absolute", top: size + 6, left: "50%",
-          transform: "translateX(-50%)", fontSize: 11, fontWeight: 700,
-          letterSpacing: "0.12em", textTransform: "uppercase",
-          color: "var(--color-text)", pointerEvents: "none", whiteSpace: "nowrap",
-        }}>
-          Lucid
-        </div>
-      </div>
-    );
+/** Trace la membrane ondulante (soma) d'un nœud. */
+function neuronPath(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, phase: number, time: number) {
+  ctx.beginPath();
+  const seg = r > 16 ? 40 : 24;
+  for (let i = 0; i <= seg; i++) {
+    const a = (i / seg) * Math.PI * 2;
+    const wob = 1 + 0.10 * Math.sin(a * 3 + phase + time * 0.6) + 0.06 * Math.sin(a * 5 - phase * 1.3 + time * 0.4);
+    const rr = r * wob;
+    const nx = x + Math.cos(a) * rr, ny = y + Math.sin(a) * rr;
+    i === 0 ? ctx.moveTo(nx, ny) : ctx.lineTo(nx, ny);
   }
-
-  // ── Feuille (leaf/page/concept) ───────────────────────────────────────────
-  if (isLeaf) {
-    return (
-      <div className="node-outer" style={{
-        position: "relative", width: size, height: size,
-        cursor: "pointer", userSelect: "none",
-        opacity: dim ? 0.07 : 1, transition: "opacity 0.2s",
-      }}>
-        <div ref={innerRef} className="node-concept" style={{
-          width: size, height: size, borderRadius: "50%",
-        }}>
-          <Handle type="target" position={Position.Top}    style={H} />
-          <Handle type="source" position={Position.Bottom} style={H} />
-        </div>
-        <div className={`node-label${isParentFocused ? " node-label--visible" : ""}`}>
-          {node.label}
-        </div>
-      </div>
-    );
-  }
-
-  // ── Conteneur / Groupe ────────────────────────────────────────────────────
-  return (
-    <div style={{
-      position: "relative", width: size, height: size + 26,
-      cursor: "grab", userSelect: "none",
-      opacity: dim ? 0.1 : 1, transition: "opacity 0.2s",
-    }}>
-      <div ref={innerRef} className="bubble node-project" style={{
-        width: size, height: size, borderRadius: "50%",
-        boxShadow: isGroup
-          ? "0 4px 18px rgba(0,0,0,0.14), inset 0 1px 0 rgba(255,255,255,0.18)"
-          : "0 2px 8px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.12)",
-      }}>
-        <Handle type="target" position={Position.Top}    style={H} />
-        <Handle type="source" position={Position.Bottom} style={H} />
-      </div>
-      <div style={{
-        position: "absolute", top: size + 5, left: "50%",
-        transform: "translateX(-50%)", width: Math.max(size + 24, 64),
-        textAlign: "center", fontSize: isGroup ? 11 : 10,
-        fontWeight: isGroup ? 650 : 500,
-        color: "var(--color-text)",
-        lineHeight: 1.25, pointerEvents: "none",
-        overflow: "hidden", display: "-webkit-box",
-        WebkitLineClamp: 2, WebkitBoxOrient: "vertical",
-      }}>
-        {node.label}
-      </div>
-    </div>
-  );
+  ctx.closePath();
 }
 
-// ─── GenesisNode ─────────────────────────────────────────────────────────────
-
-function GenesisNode({ data }: NodeProps) {
-  const isRoot = !!(data.isRoot);
-  const label  = (data.label     as string) ?? "";
-  const idx    = (data.idx       as number) ?? 0;
-  const rvk    = (data.revealKey as number) ?? 0;
-  const color  = (data.color     as string) ?? PALETTE[0];
-  const size   = isRoot ? 88 : 28;
-  const ref    = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const anim = el.animate(
-      [{ opacity: 0, transform: "scale(0.2)" }, { opacity: 1, transform: "scale(1)" }],
-      { duration: 480, delay: isRoot ? 0 : idx * 60,
-        fill: "both", easing: "cubic-bezier(0.34, 1.56, 0.64, 1)" },
-    );
-    return () => anim.cancel();
-  }, [rvk]); // eslint-disable-line
-
-  if (isRoot) {
-    return (
-      <div style={{ width: size, height: size }}>
-        <div ref={ref} className="lucid-orb" style={{
-          width: size, height: size,
-          animation: "lucidMorph 5.5s ease-in-out infinite, lucidGlow 4s ease-in-out infinite",
-        }} />
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ position: "relative", width: size, height: size + 18 }}>
-      <div ref={ref} style={{
-        width: size, height: size, borderRadius: "50%",
-        background: `radial-gradient(ellipse at 35% 30%, ${color}99, ${color}55)`,
-        border: `1.5px solid ${color}88`, boxShadow: `0 0 8px ${color}55`,
-      }} />
-      <div style={{
-        position: "absolute", top: size + 3, left: "50%",
-        transform: "translateX(-50%)", fontSize: 8,
-        color: "var(--color-muted)", textAlign: "center",
-        whiteSpace: "nowrap", maxWidth: 70,
-        overflow: "hidden", textOverflow: "ellipsis", pointerEvents: "none",
-      }}>
-        {label}
-      </div>
-    </div>
-  );
-}
-
-// ─── GenesisSat ───────────────────────────────────────────────────────────────
-
-function GenesisSat({ data }: NodeProps) {
-  const idx       = (data.idx       as number) ?? 0;
-  const parentIdx = (data.parentIdx as number) ?? 0;
-  const rvk       = (data.revealKey as number) ?? 0;
-  const color     = (data.color     as string) ?? PALETTE[0];
-  const ref       = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const anim = el.animate(
-      [{ opacity: 0, transform: "scale(0)" }, { opacity: 0.7, transform: "scale(1)" }],
-      { duration: 300, delay: parentIdx * 300 + 380 + idx * 60, fill: "both", easing: "ease-out" },
-    );
-    return () => anim.cancel();
-  }, [rvk]); // eslint-disable-line
-
-  return (
-    <div ref={ref} style={{
-      width: 10, height: 10, borderRadius: "50%",
-      background: color, opacity: 0.6, boxShadow: `0 0 6px ${color}88`,
-    }} />
-  );
-}
-
-// ─── ZoomSync ────────────────────────────────────────────────────────────────
-
-function ZoomSync({ onChange }: { onChange: (z: number) => void }) {
-  const { zoom } = useViewport();
-  const prev = useRef(zoom);
-  useEffect(() => {
-    if (Math.abs(zoom - prev.current) > 0.04) {
-      prev.current = zoom;
-      onChange(zoom);
-    }
-  }, [zoom, onChange]);
-  return null;
-}
-
-// ─── FocusSync ───────────────────────────────────────────────────────────────
-
-function FocusSync({
-  focusedId, infos, dragOffsets,
-}: {
-  focusedId: string | null;
-  infos: Map<string, NodeInfo>;
-  dragOffsets: React.RefObject<Map<string, { dx: number; dy: number }>>;
-}) {
-  const { setCenter } = useReactFlow();
-  useEffect(() => {
-    if (!focusedId) return;
-    const info = infos.get(focusedId);
-    if (!info) return;
-    const off = dragOffsets.current?.get(focusedId) ?? { dx: 0, dy: 0 };
-    setCenter(info.finalX + off.dx, info.finalY + off.dy, { zoom: 1.6, duration: 550 });
-  }, [focusedId]); // eslint-disable-line
-  return null;
-}
-
-const nodeTypes = { bubble: BubbleNode, genesis: GenesisNode, genesisSat: GenesisSat };
-
-// ─── BrainMap ─────────────────────────────────────────────────────────────────
+// ─── BrainMap (rendu canvas neuronal) ───────────────────────────────────────────
 
 export function BrainMap({
   graph, onSelect, selectedId, query,
   revealKey = 0, streamLabels = [], streamTotal = 0,
+  spaces, onAddNodeToSpace, onCreateNote, onMoveNode,
 }: Props) {
-  const [showLeaves, setShowLeaves] = useState(false);
-  const [focusedId, setFocusedId]   = useState<string | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const [ctxMenu, setCtxMenu] = useState<{ nodeId: string; x: number; y: number } | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newParent, setNewParent] = useState("");
+  const [accent, setAccent] = useState(ACCENT_FALLBACK);
+
+  const isGenesis = streamLabels.length > 0;
   const q = query.trim().toLowerCase();
+
+  const rootId = useMemo(() => graph.nodes.find((n) => n.kind === "root")?.id ?? "", [graph]);
+  const parentCandidates = useMemo(
+    () => graph.nodes.filter((n) => !isLeafKind(n.kind)),
+    [graph],
+  );
 
   const { infos, childrenOf } = useMemo(() => buildLayout(graph), [graph]);
 
-  const dragOffsets = useRef(new Map<string, { dx: number; dy: number }>());
+  // Couleur par nœud : racine = accent, note = ambre, sinon couleur du cluster.
+  const { colorOf, neighbors, maxR } = useMemo(() => {
+    const groupColor = new Map<string, string>();
+    let gci = 0;
+    for (const info of infos.values()) {
+      if (info.node.kind === "group") groupColor.set(info.id, PALETTE[gci++ % PALETTE.length]);
+    }
+    const clusterColor = (info: NodeInfo): string => {
+      let cur: NodeInfo | undefined = info;
+      while (cur) {
+        const c = groupColor.get(cur.id);
+        if (c) return c;
+        cur = cur.parentId ? infos.get(cur.parentId) : undefined;
+      }
+      return "#7f8aa8";
+    };
+    const colorOf = new Map<string, string>();
+    for (const info of infos.values()) {
+      if (info.node.kind === "root") colorOf.set(info.id, accent);
+      else colorOf.set(info.id, clusterColor(info)); // notes incluses : couleur du cluster, pas d'orange
+    }
+    const neighbors = new Map<string, Set<string>>();
+    const add = (a: string, b: string) => {
+      if (!neighbors.has(a)) neighbors.set(a, new Set());
+      neighbors.get(a)!.add(b);
+    };
+    for (const info of infos.values()) {
+      if (info.parentId) { add(info.id, info.parentId); add(info.parentId, info.id); }
+    }
+    let maxR = 1;
+    for (const info of infos.values()) maxR = Math.max(maxR, Math.hypot(info.finalX, info.finalY) + info.r);
+    return { colorOf, neighbors, maxR: maxR + 30 };
+  }, [infos, accent]);
 
-  const prevRevealKey = useRef(revealKey);
-  if (revealKey !== prevRevealKey.current) {
-    prevRevealKey.current = revealKey;
-    dragOffsets.current.clear();
-  }
-
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
-  const isGenesis = streamLabels.length > 0;
-
+  // Lit la couleur d'accent réelle du thème.
   useEffect(() => {
-    setNodes(
-      isGenesis
-        ? makeGenesisNodes(streamLabels, streamTotal, revealKey)
-        : makeNodes(infos, dragOffsets.current, revealKey, showLeaves, selectedId, q, focusedId),
-    );
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isGenesis, streamLabels, streamTotal, infos, revealKey, showLeaves, selectedId, q, focusedId]);
-
-  const prevDrag = useRef(new Map<string, { x: number; y: number }>());
-
-  const handleNodeDrag = useCallback(
-    (_: unknown, node: Node) => {
-      const info = infos.get(node.id);
-      if (!info) return;
-      const cx = node.position.x + info.r;
-      const cy = node.position.y + info.r;
-      const prev = prevDrag.current.get(node.id);
-      if (prev) {
-        const dx = cx - prev.x, dy = cy - prev.y;
-        if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
-          const kids = getDescendants(node.id, childrenOf);
-          if (kids.length) {
-            for (const id of kids) {
-              const d = dragOffsets.current.get(id) ?? { dx: 0, dy: 0 };
-              dragOffsets.current.set(id, { dx: d.dx + dx, dy: d.dy + dy });
-            }
-            setNodes((ns) => ns.map((n) =>
-              kids.includes(n.id)
-                ? { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } }
-                : n,
-            ));
-          }
-        }
-      }
-      prevDrag.current.set(node.id, { x: cx, y: cy });
-    },
-    [infos, childrenOf, setNodes],
-  );
-
-  const handleNodeDragStop = useCallback(
-    (_: unknown, node: Node) => {
-      const info = infos.get(node.id);
-      if (info) {
-        dragOffsets.current.set(node.id, {
-          dx: node.position.x + info.r - info.finalX,
-          dy: node.position.y + info.r - info.finalY,
-        });
-      }
-      prevDrag.current.delete(node.id);
-    },
-    [infos],
-  );
-
-  const handleNodeClick = useCallback(
-    (_: React.MouseEvent, n: Node) => {
-      if (isGenesis) return;
-      const nd = n.data as { node?: BrainNode };
-      if (nd.node) onSelect(nd.node);
-    },
-    [isGenesis, onSelect],
-  );
-
-  const handleNodeDoubleClick = useCallback(
-    (_: React.MouseEvent, n: Node) => {
-      if (isGenesis) return;
-      const nd = n.data as { node?: BrainNode };
-      if (!nd.node) return;
-      const k = nd.node.kind;
-      if (isLeafKind(k) || k === "root") return;
-      setFocusedId((prev) => prev === n.id ? null : n.id);
-    },
-    [isGenesis],
-  );
-
-  const handlePaneClick = useCallback(() => setFocusedId(null), []);
-
-  const handleZoom = useCallback((z: number) => {
-    setShowLeaves(z >= 0.4);
+    const v = getComputedStyle(document.documentElement).getPropertyValue("--color-accent").trim();
+    if (v) setAccent(v);
   }, []);
 
-  const edges = useMemo(
-    () => isGenesis ? [] : makeEdges(infos, showLeaves),
-    [isGenesis, infos, showLeaves],
-  );
+  // Refs partagés avec la boucle de rendu / les handlers (évite les closures périmées).
+  const cam = useRef({ x: 0, y: 0, zoom: 1 });
+  const camTarget = useRef({ x: 0, y: 0, zoom: 1 });
+  const needsFit = useRef(true);
+  const dragOffsets = useRef(new Map<string, { dx: number; dy: number }>());
+  const hovered = useRef<string | null>(null);
+  const drag = useRef<{ mode: "node" | "pan"; id?: string; ids?: string[]; moved: number; sx: number; sy: number } | null>(null);
 
+  const S = useRef<any>(null);
+  S.current = {
+    infos, childrenOf, colorOf, neighbors, q, selectedId, accent,
+    onSelect, onMoveNode, isGenesis, streamLabels, streamTotal, rootId,
+  };
+
+  // Refit caméra au chargement / à chaque régénération.
+  useEffect(() => {
+    dragOffsets.current.clear();
+    needsFit.current = true;
+  }, [revealKey, maxR]);
+
+  // ── Boucle de rendu ────────────────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext("2d")!;
+    let raf = 0;
+    let W = 0, H = 0, dpr = 1;
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    const ro = new ResizeObserver(() => {
+      const el = wrapRef.current!;
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      W = el.clientWidth; H = el.clientHeight;
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    });
+    ro.observe(wrapRef.current!);
+
+    const pos = (info: NodeInfo) => {
+      const o = dragOffsets.current.get(info.id) ?? { dx: 0, dy: 0 };
+      return { x: info.finalX + o.dx, y: info.finalY + o.dy };
+    };
+
+    const draw = (ts: number) => {
+      const s = S.current;
+      const time = reduce ? 0 : ts / 1000;
+      const c = cam.current, ct = camTarget.current;
+
+      if (needsFit.current && W > 0) {
+        const fit = Math.min(1, (Math.min(W, H) / 2 * 0.88) / maxR);
+        c.x = 0; c.y = 0; c.zoom = fit;
+        ct.x = 0; ct.y = 0; ct.zoom = fit;
+        needsFit.current = false;
+      }
+      // lerp caméra (pour le focus animé)
+      c.x += (ct.x - c.x) * 0.14; c.y += (ct.y - c.y) * 0.14; c.zoom += (ct.zoom - c.zoom) * 0.14;
+
+      const sx = (wx: number) => W / 2 + (wx - c.x) * c.zoom;
+      const sy = (wy: number) => H / 2 + (wy - c.y) * c.zoom;
+      const showLeaves = c.zoom >= LEAF_ZOOM;
+
+      // Fond
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = VOID_BG; ctx.fillRect(0, 0, W, H);
+      const ox = sx(0), oy = sy(0);
+      let g = ctx.createRadialGradient(ox, oy, 0, ox, oy, Math.max(W, H) * 0.72);
+      g.addColorStop(0, "rgba(34,40,52,0.30)"); g.addColorStop(0.55, "rgba(16,20,28,0.14)"); g.addColorStop(1, "rgba(6,8,12,0)");
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+      // grille de points
+      const gap = 30, gox = ((ox % gap) + gap) % gap, goy = ((oy % gap) + gap) % gap;
+      ctx.fillStyle = "rgba(205,216,235,0.06)";
+      for (let x = gox; x < W; x += gap) for (let y = goy; y < H; y += gap) { ctx.beginPath(); ctx.arc(x, y, 0.9, 0, Math.PI * 2); ctx.fill(); }
+
+      // ── Genèse (pendant la génération) ──
+      if (s.isGenesis) {
+        ctx.globalCompositeOperation = "lighter";
+        const G = Math.max(s.streamTotal, s.streamLabels.length, 1);
+        // orbe racine
+        const rr = 34 + Math.sin(time * 1.6) * 3;
+        let rg = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, rr * 3);
+        rg.addColorStop(0, "rgba(255,255,255,0.9)"); rg.addColorStop(0.3, hexA(s.accent, 0.7)); rg.addColorStop(1, hexA(s.accent, 0));
+        ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(W / 2, H / 2, rr * 3, 0, Math.PI * 2); ctx.fill();
+        const R = Math.min(W, H) * 0.32;
+        s.streamLabels.forEach((label: string, i: number) => {
+          const a = (i / G) * Math.PI * 2 - Math.PI / 2;
+          const nx = W / 2 + Math.cos(a) * R, ny = H / 2 + Math.sin(a) * R;
+          const col = PALETTE[i % PALETTE.length];
+          let ng = ctx.createRadialGradient(nx, ny, 0, nx, ny, 40);
+          ng.addColorStop(0, hexA("#ffffff", 0.7)); ng.addColorStop(0.4, hexA(col, 0.5)); ng.addColorStop(1, hexA(col, 0));
+          ctx.fillStyle = ng; ctx.beginPath(); ctx.arc(nx, ny, 40, 0, Math.PI * 2); ctx.fill();
+          ctx.globalCompositeOperation = "source-over";
+          ctx.font = "600 11px ui-sans-serif, system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillStyle = "rgba(212,218,226,0.75)"; ctx.fillText(label, nx, ny + 26);
+          ctx.globalCompositeOperation = "lighter";
+        });
+        raf = requestAnimationFrame(draw);
+        return;
+      }
+
+      const hv = hovered.current;
+      const near = hv ? (id: string) => id === hv || (s.neighbors.get(hv)?.has(id) ?? false) : null;
+      const visible = (info: NodeInfo) => (isLeafKind(info.node.kind) ? showLeaves : true);
+
+      ctx.globalCompositeOperation = "lighter";
+      ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(c.zoom, c.zoom); ctx.translate(-c.x, -c.y);
+
+      // ── Filaments ──
+      for (const info of s.infos.values()) {
+        const parent = info.parentId ? s.infos.get(info.parentId) : null;
+        if (!parent) continue;
+        if (!visible(info) || !visible(parent)) continue;
+        const a = pos(parent), b = pos(info);
+        const conn = !!hv && (info.id === hv || info.parentId === hv);
+        const k = hv ? (conn ? 1.9 : 0.15) : 1;
+        const ca = s.colorOf.get(parent.id)!, cb = s.colorOf.get(info.id)!;
+        const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+        grad.addColorStop(0, hexA(ca, 0.26)); grad.addColorStop(0.5, "rgba(120,132,150,0.07)"); grad.addColorStop(1, hexA(cb, 0.26));
+        for (const [w, alpha] of [[3, 0.03], [1.4, 0.06], [0.7, 0.18]] as const) {
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+          ctx.strokeStyle = grad; ctx.globalAlpha = Math.min(1, alpha * k); ctx.lineWidth = conn ? w * 1.4 : w; ctx.lineCap = "round"; ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // ── Nœuds ──
+      for (const info of s.infos.values()) {
+        if (!visible(info)) continue;
+        const p = pos(info);
+        const kind = info.node.kind;
+        const isRoot = kind === "root";
+        const color = s.colorOf.get(info.id)!;
+        const isSel = info.id === s.selectedId;
+        const dim = s.q && !matches(info.node, s.q) ? 0.12 : 1;
+        const vis = (hv && near ? (near(info.id) ? 1 : 0.24) : 1) * dim;
+        const boost = (info.id === hv ? 0.4 : 0) + (isSel ? 0.35 : 0);
+        const phase = stableHash(info.id) * 6.28;
+        const pulse = 0.5 + 0.35 * Math.sin(time * (isRoot ? 1.4 : 0.9) + phase);
+        const r = info.r;
+        ctx.globalAlpha = vis;
+
+        // halo
+        const haloR = r * (isRoot ? 4 : 2.8) * (1 + boost * 0.25);
+        let hg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, haloR);
+        hg.addColorStop(0, hexA(color, (isRoot ? 0.24 : 0.15) + boost * 0.3));
+        hg.addColorStop(0.4, hexA(color, 0.05 + boost * 0.1)); hg.addColorStop(1, hexA(color, 0));
+        ctx.fillStyle = hg; ctx.beginPath(); ctx.arc(p.x, p.y, haloR, 0, Math.PI * 2); ctx.fill();
+
+        // membrane
+        neuronPath(ctx, p.x, p.y, r * (1 + boost * 0.06), phase, time);
+        let mg = ctx.createRadialGradient(p.x - r * 0.3, p.y - r * 0.3, 0, p.x, p.y, r * 1.3);
+        mg.addColorStop(0, hexA("#eef3f9", 0.4 + boost * 0.25)); mg.addColorStop(0.5, hexA(color, 0.3 + boost * 0.18)); mg.addColorStop(1, hexA(color, 0.04));
+        ctx.fillStyle = mg; ctx.fill();
+        ctx.lineWidth = 1; ctx.strokeStyle = hexA("#e6eefa", 0.16 + boost * 0.4); ctx.stroke();
+
+        // sélection : anneau net
+        if (isSel) {
+          ctx.lineWidth = 1.5; ctx.strokeStyle = hexA("#ffffff", 0.85);
+          ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.9, 0, Math.PI * 2); ctx.stroke();
+        }
+
+        // cœur
+        const coreR = r * (0.3 + 0.1 * pulse) * (1 + boost * 0.8);
+        const cg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, coreR * 2.4);
+        const hot = 0.3 + 0.24 * pulse + boost * 0.7;
+        cg.addColorStop(0, `rgba(255,255,255,${Math.min(1, hot)})`); cg.addColorStop(0.4, hexA("#eef3f9", Math.min(1, hot * 0.6))); cg.addColorStop(1, hexA(color, 0));
+        ctx.fillStyle = cg; ctx.beginPath(); ctx.arc(p.x, p.y, coreR * 2.4, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+
+      // ── Labels (espace écran) ──
+      ctx.globalCompositeOperation = "source-over";
+      for (const info of s.infos.values()) {
+        if (!visible(info)) continue;
+        const kind = info.node.kind;
+        const isRoot = kind === "root";
+        const isContainer = !isLeafKind(kind) && !isRoot;
+        const isHover = info.id === hv;
+        const always = isRoot || (isContainer && kind === "group");
+        const show = always || isHover || (!!hv && near!(info.id)) || info.id === s.selectedId;
+        if (!show) continue;
+        const p = pos(info);
+        const px = sx(p.x), py = sy(p.y);
+        const fs = isRoot ? 14 : isContainer ? 11 : 10;
+        ctx.font = `${isRoot ? 700 : 600} ${fs}px ui-sans-serif, system-ui, sans-serif`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        const ly = py + info.r * c.zoom + (isRoot ? 20 : 11);
+        const alpha = isHover ? 1 : (isRoot ? 0.9 : 0.55);
+        ctx.shadowColor = "rgba(0,0,0,0.85)"; ctx.shadowBlur = 6;
+        ctx.fillStyle = isHover ? "#ffffff" : hexA("#d4dae2", alpha);
+        ctx.fillText(info.node.label, px, ly);
+        ctx.shadowBlur = 0;
+      }
+
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+
+    // ── Interaction ──
+    const rect = () => canvas.getBoundingClientRect();
+    const toWorld = (cx: number, cy: number) => {
+      const c = cam.current, r = rect();
+      return { x: c.x + (cx - r.left - canvas.clientWidth / 2) / c.zoom, y: c.y + (cy - r.top - canvas.clientHeight / 2) / c.zoom };
+    };
+    const showLeavesNow = () => cam.current.zoom >= LEAF_ZOOM;
+    const nodeAt = (cx: number, cy: number): NodeInfo | null => {
+      const w = toWorld(cx, cy); let best: NodeInfo | null = null, bd = 1e9;
+      for (const info of S.current.infos.values()) {
+        if (isLeafKind(info.node.kind) && !showLeavesNow()) continue;
+        const p = pos(info); const d = Math.hypot(p.x - w.x, p.y - w.y);
+        if (d < info.r + 7 && d < bd) { bd = d; best = info; }
+      }
+      return best;
+    };
+    const dropTarget = (draggedId: string, cx: number, cy: number): string | null => {
+      const w = toWorld(cx, cy);
+      const banned = new Set([draggedId, ...getDescendants(draggedId, S.current.childrenOf)]);
+      let best: string | null = null, bd = 1e9;
+      for (const info of S.current.infos.values()) {
+        if (banned.has(info.id) || isLeafKind(info.node.kind)) continue;
+        const p = pos(info); const d = Math.hypot(p.x - w.x, p.y - w.y);
+        if (d < info.r + 26 && d < bd) { bd = d; best = info.id; }
+      }
+      return best;
+    };
+
+    const onDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      setCtxMenu(null);
+      const n = nodeAt(e.clientX, e.clientY);
+      const canDrag = !!n && n.node.kind !== "root" && !isLeafKind(n.node.kind);
+      // On garde toujours l'id du nœud sous le curseur → clic (sans déplacement) = sélection,
+      // même pour une feuille/page non déplaçable (qui, elle, laisse le pan agir).
+      drag.current = canDrag
+        ? { mode: "node", id: n!.id, ids: [n!.id, ...getDescendants(n!.id, S.current.childrenOf)], moved: 0, sx: e.clientX, sy: e.clientY }
+        : { mode: "pan", id: n?.id, moved: 0, sx: e.clientX, sy: e.clientY };
+      canvas.style.cursor = canDrag ? "grabbing" : "move";
+    };
+    const onMove = (e: MouseEvent) => {
+      const d = drag.current;
+      if (d) {
+        const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
+        d.moved += Math.abs(dx) + Math.abs(dy); d.sx = e.clientX; d.sy = e.clientY;
+        const c = cam.current, ct = camTarget.current;
+        if (d.mode === "pan") { c.x -= dx / c.zoom; c.y -= dy / c.zoom; ct.x = c.x; ct.y = c.y; }
+        else { const wx = dx / c.zoom, wy = dy / c.zoom; for (const id of d.ids!) { const o = dragOffsets.current.get(id) ?? { dx: 0, dy: 0 }; dragOffsets.current.set(id, { dx: o.dx + wx, dy: o.dy + wy }); } }
+        return;
+      }
+      const n = nodeAt(e.clientX, e.clientY);
+      hovered.current = n ? n.id : null;
+      canvas.style.cursor = n ? "grab" : "default";
+    };
+    const onUp = (e: MouseEvent) => {
+      const d = drag.current; drag.current = null; canvas.style.cursor = "default";
+      if (!d) return;
+      // Clic net sur un nœud (quel qu'il soit) → sélection / ouverture.
+      if (d.moved < 4 && d.id) {
+        const info = S.current.infos.get(d.id);
+        if (info) S.current.onSelect(info.node);
+        return;
+      }
+      // Déplacement d'un nœud lâché sur un autre → reparentage.
+      if (d.mode === "node" && d.moved >= 4 && S.current.onMoveNode) {
+        const info = S.current.infos.get(d.id!);
+        const target = dropTarget(d.id!, e.clientX, e.clientY);
+        if (info && target && target !== info.parentId) S.current.onMoveNode(d.id!, target);
+      }
+    };
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const c = cam.current, ct = camTarget.current, r = rect();
+      const w = toWorld(e.clientX, e.clientY);
+      const f = Math.exp(-e.deltaY * 0.0015);
+      const nz = Math.max(0.12, Math.min(4, c.zoom * f));
+      c.zoom = nz; ct.zoom = nz;
+      c.x = w.x - (e.clientX - r.left - canvas.clientWidth / 2) / nz;
+      c.y = w.y - (e.clientY - r.top - canvas.clientHeight / 2) / nz;
+      ct.x = c.x; ct.y = c.y;
+    };
+    const onDbl = (e: MouseEvent) => {
+      const n = nodeAt(e.clientX, e.clientY);
+      if (!n || isLeafKind(n.node.kind) || n.node.kind === "root") return;
+      const p = pos(n);
+      camTarget.current = { x: p.x, y: p.y, zoom: Math.max(1.4, cam.current.zoom) };
+    };
+    const onCtx = (e: MouseEvent) => {
+      e.preventDefault();
+      const n = nodeAt(e.clientX, e.clientY);
+      if (n) setCtxMenu({ nodeId: n.id, x: e.clientX, y: e.clientY });
+      else setCtxMenu(null);
+    };
+
+    canvas.addEventListener("mousedown", onDown);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("dblclick", onDbl);
+    canvas.addEventListener("contextmenu", onCtx);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+      canvas.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("dblclick", onDbl);
+      canvas.removeEventListener("contextmenu", onCtx);
+    };
+  }, [maxR]); // relance si le graphe (donc maxR) change
+
+  // ── Rendu React (canvas + overlays) ──────────────────────────────────────────
   return (
-    <ReactFlow
-      nodes={nodes}
-      edges={edges}
-      onNodesChange={onNodesChange}
-      onNodeDrag={handleNodeDrag}
-      onNodeDragStop={handleNodeDragStop}
-      onNodeClick={handleNodeClick}
-      onNodeDoubleClick={handleNodeDoubleClick}
-      onPaneClick={handlePaneClick}
-      nodeTypes={nodeTypes}
-      fitView
-      fitViewOptions={{ padding: 0.15 }}
-      minZoom={0.07}
-      maxZoom={3}
-      nodesConnectable={false}
-      proOptions={{ hideAttribution: true }}
-    >
-      <ZoomSync onChange={handleZoom} />
-      <FocusSync focusedId={focusedId} infos={infos} dragOffsets={dragOffsets} />
-      <Background
-        variant={BackgroundVariant.Dots}
-        gap={20} size={1.2}
-        color="var(--color-border)"
-      />
-    </ReactFlow>
+    <div ref={wrapRef} style={{ width: "100%", height: "100%", position: "relative", overflow: "hidden", background: VOID_BG }}>
+      <canvas ref={canvasRef} style={{ display: "block", position: "absolute", inset: 0 }} />
+
+      {ctxMenu && (onMoveNode || (spaces && onAddNodeToSpace)) && (
+        <div
+          style={{ position: "fixed", left: ctxMenu.x, top: ctxMenu.y, zIndex: 100 }}
+          className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] py-1 min-w-[180px]"
+        >
+          {onMoveNode && (() => {
+            const banned = new Set([ctxMenu.nodeId, ...getDescendants(ctxMenu.nodeId, childrenOf)]);
+            const curParent = infos.get(ctxMenu.nodeId)?.parentId ?? null;
+            const targets = parentCandidates.filter(n => !banned.has(n.id) && n.id !== curParent);
+            return (
+              <>
+                <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                  Déplacer vers
+                </p>
+                <div className="max-h-52 overflow-auto">
+                  {targets.map(t => (
+                    <button key={t.id}
+                      onClick={() => { onMoveNode(ctxMenu.nodeId, t.id); setCtxMenu(null); }}
+                      className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] transition-colors truncate"
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                  {targets.length === 0 && (
+                    <p className="px-3 py-1.5 text-xs text-[var(--color-muted)]">Aucune destination</p>
+                  )}
+                </div>
+              </>
+            );
+          })()}
+          {onMoveNode && spaces && onAddNodeToSpace && (
+            <div className="my-1 border-t border-[var(--color-border)]" />
+          )}
+          {spaces && onAddNodeToSpace && (
+            <>
+              <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                Ajouter à la space
+              </p>
+              {spaces.filter(s => s.id !== "lucid").map(s => (
+                <button key={s.id}
+                  onClick={() => { onAddNodeToSpace(ctxMenu.nodeId, s.id); setCtxMenu(null); }}
+                  className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] transition-colors"
+                >
+                  {s.name}
+                </button>
+              ))}
+              {spaces.filter(s => s.id !== "lucid").length === 0 && (
+                <p className="px-3 py-1.5 text-xs text-[var(--color-muted)]">Crée une space d&apos;abord</p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {onCreateNote && !isGenesis && (
+        <button
+          onClick={() => { setNewTitle(""); setNewParent(rootId); setCreating(true); }}
+          title="Créer une note"
+          className="absolute bottom-5 right-5 z-20 h-11 w-11 rounded-full bg-[var(--color-accent,#7c5cff)] text-white text-2xl leading-none shadow-[var(--shadow-float)] hover:opacity-90 transition"
+        >
+          +
+        </button>
+      )}
+
+      {creating && onCreateNote && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/40" onClick={() => setCreating(false)}>
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-[340px] rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-4 shadow-[var(--shadow-float)]"
+          >
+            <p className="mb-3 text-sm font-semibold text-[var(--color-text)]">Nouvelle note</p>
+            <input
+              autoFocus value={newTitle} onChange={(e) => setNewTitle(e.target.value)}
+              placeholder="Titre de la note"
+              className="mb-3 w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-sm text-[var(--color-text)] outline-none"
+            />
+            <label className="mb-1 block text-[11px] uppercase tracking-wide text-[var(--color-muted)]">Rattacher à</label>
+            <select
+              value={newParent} onChange={(e) => setNewParent(e.target.value)}
+              className="mb-4 w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-sm text-[var(--color-text)] outline-none"
+            >
+              {parentCandidates.map(n => (
+                <option key={n.id} value={n.id}>{n.kind === "root" ? "Lucid (racine)" : n.label}</option>
+              ))}
+            </select>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setCreating(false)} className="rounded-lg px-3 py-1.5 text-sm text-[var(--color-muted)] hover:bg-[var(--color-surface-2)]">Annuler</button>
+              <button onClick={() => { onCreateNote(newParent || rootId, newTitle); setCreating(false); }} className="rounded-lg bg-[var(--color-accent,#7c5cff)] px-3 py-1.5 text-sm text-white hover:opacity-90">Créer</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

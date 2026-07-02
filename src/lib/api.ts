@@ -114,6 +114,16 @@ export function askBrain(question: string): Promise<string> {
   return invoke("ask_brain", { question });
 }
 
+/** Chat contextuel sur une page (contenu de la page + sous-pages si includeChildren). */
+export function askNode(nodeId: string, question: string, includeChildren: boolean): Promise<string> {
+  return invoke("ask_node", { nodeId, question, includeChildren });
+}
+
+/** Génère du contenu markdown pour une page selon une consigne (contexte page + sous-pages). */
+export function generateContent(nodeId: string, instruction: string, includeChildren: boolean): Promise<string> {
+  return invoke("generate_content", { nodeId, instruction, includeChildren });
+}
+
 /** Indique si le modèle actif doit être installé (fichier absent). */
 export function aiSetupNeeded(): Promise<boolean> {
   return invoke("ai_setup_needed");
@@ -161,6 +171,21 @@ export function saveNodeContent(nodeId: string, content: string): Promise<void> 
   return invoke("save_node_content", { nodeId, content });
 }
 
+/** Crée un nœud « note » (prise de note) rattaché à `parentId`. Renvoie le nœud créé. */
+export function createNoteNode(parentId: string, label: string): Promise<import("./types").BrainNode> {
+  return invoke("create_note_node", { parentId, label });
+}
+
+/** Déplace un nœud sous un nouveau parent (refuse les cycles). */
+export function setNodeParent(nodeId: string, parentId: string): Promise<void> {
+  return invoke("set_node_parent", { nodeId, parentId });
+}
+
+/** Renomme un nœud (change son label). */
+export function renameNode(nodeId: string, label: string): Promise<void> {
+  return invoke("rename_node", { nodeId, label });
+}
+
 /** Configure le vault Obsidian (chemin local). */
 export function obsidianSetVault(path: string): Promise<void> {
   return invoke("obsidian_set_vault", { path });
@@ -174,4 +199,59 @@ export function obsidianVaultPath(): Promise<string | null> {
 /** Déconnecte Obsidian (supprime la config locale). */
 export function obsidianDisconnect(): Promise<void> {
   return invoke("obsidian_disconnect");
+}
+
+/** Liste les snapshots disponibles (triés du plus récent au plus ancien). */
+export function listSnapshots(): Promise<import("./types").SnapshotInfo[]> {
+  return invoke("list_snapshots");
+}
+
+/** Restaure un snapshot par ID. Sauvegarde l'état courant avant de restaurer. */
+export function restoreSnapshot(snapshotId: string): Promise<BrainGraph> {
+  return invoke("restore_snapshot", { snapshotId });
+}
+
+/** Liste les versions d'un nœud spécifique (plus récent en premier). */
+export function listNodeSnapshots(nodeId: string): Promise<import("./types").NodeSnapshotInfo[]> {
+  return invoke("list_node_snapshots", { nodeId });
+}
+
+/** Récupère le contenu complet d'une version de nœud. */
+export function getNodeSnapshot(nodeId: string, snapshotId: string): Promise<string> {
+  return invoke("get_node_snapshot", { nodeId, snapshotId });
+}
+
+/** Liste les espaces (Lucid en premier, puis les espaces personnalisés). */
+export function listSpaces(): Promise<import("./types").Space[]> {
+  return invoke("list_spaces");
+}
+
+/** Crée un nouvel espace personnalisé. */
+export function createSpace(name: string): Promise<import("./types").Space> {
+  return invoke("create_space", { name });
+}
+
+/** Renomme un espace. */
+export function renameSpace(id: string, name: string): Promise<void> {
+  return invoke("rename_space", { id, name });
+}
+
+/** Supprime un espace (impossible pour "lucid"). */
+export function deleteSpace(id: string): Promise<void> {
+  return invoke("delete_space", { id });
+}
+
+/** Ajoute un nœud à un espace. */
+export function addNodeToSpace(spaceId: string, nodeId: string): Promise<void> {
+  return invoke("add_node_to_space", { spaceId, nodeId });
+}
+
+/** Retire un nœud d'un espace. */
+export function removeNodeFromSpace(spaceId: string, nodeId: string): Promise<void> {
+  return invoke("remove_node_from_space", { spaceId, nodeId });
+}
+
+/** Exporte un espace en markdown. */
+export function exportSpaceMd(spaceId: string): Promise<string> {
+  return invoke("export_space_md", { spaceId });
 }

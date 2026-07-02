@@ -9,6 +9,8 @@ import {
   ChevronLeft,
   ChevronRight,
   PanelLeft,
+  History,
+  RotateCcw,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { BrainMap } from "@/components/BrainMap";
@@ -28,8 +30,17 @@ import {
   notionSync,
   googleDriveSync,
   aiSetupNeeded,
+  listSnapshots,
+  restoreSnapshot,
+  listSpaces,
+  createSpace,
+  addNodeToSpace,
+  deleteSpace,
+  createNoteNode,
+  setNodeParent,
   type BrainProgress,
 } from "@/lib/api";
+import type { SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
 import type {
   BrainGraph,
@@ -39,6 +50,23 @@ import type {
 import { cn } from "@/lib/utils";
 
 type View = "map" | "folder" | "brain";
+
+function filterGraphBySpace(graph: BrainGraph, nodeIds: string[]): BrainGraph {
+  const idSet = new Set(nodeIds);
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  function addAncestors(id: string) {
+    const n = byId.get(id);
+    if (!n?.parent_id) return;
+    idSet.add(n.parent_id);
+    addAncestors(n.parent_id);
+  }
+  nodeIds.forEach((id) => addAncestors(id));
+  const filtered = new Set([...idSet]);
+  const nodes = graph.nodes.filter((n) => filtered.has(n.id));
+  const nodeSet = new Set(nodes.map((n) => n.id));
+  const edges = graph.edges.filter((e) => nodeSet.has(e.source) && nodeSet.has(e.target));
+  return { ...graph, nodes, edges };
+}
 
 function App() {
   const [view, setView]       = useState<View>("map");
@@ -58,11 +86,18 @@ function App() {
 
   const [selectedNode, setSelectedNode] = useState<BrainNode | null>(null);
   const [nodeExpanded, setNodeExpanded] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
+  const [restoring, setRestoring] = useState(false);
+
+  const [spaces, setSpaces] = useState<Space[]>([]);
+  const [activeSpaceId, setActiveSpaceId] = useState<string | null>(null);
 
   useEffect(() => {
     aiSetupNeeded().then(setNeedsSetup);
     readBrainGraph().then((g) => { if (g) { setGraph(g); setRevealKey((k) => k + 1); } });
     connectorsStatus().then(setConnectors);
+    listSpaces().then(setSpaces);
   }, []);
 
   useEffect(() => {
@@ -117,12 +152,79 @@ function App() {
     setNodeExpanded(false);
   }
 
+  async function handleOpenHistory() {
+    setHistoryOpen((o) => !o);
+    const list = await listSnapshots();
+    setSnapshots(list);
+  }
+
+  async function handleRestore(snapshotId: string) {
+    setRestoring(true);
+    try {
+      const g = await restoreSnapshot(snapshotId);
+      setGraph(g);
+      setRevealKey((k) => k + 1);
+      setHistoryOpen(false);
+    } finally {
+      setRestoring(false);
+    }
+  }
+
   function handleContentSaved(nodeId: string, content: string) {
     setGraph((prev) => {
       if (!prev) return prev;
       return { ...prev, nodes: prev.nodes.map((n) => n.id === nodeId ? { ...n, content } : n) };
     });
   }
+
+  function handleNodeRenamed(nodeId: string, label: string) {
+    setGraph((prev) => prev ? { ...prev, nodes: prev.nodes.map((n) => n.id === nodeId ? { ...n, label } : n) } : prev);
+    setSelectedNode((prev) => prev && prev.id === nodeId ? { ...prev, label } : prev);
+  }
+
+  async function handleSpaceCreate(name: string) {
+    const s = await createSpace(name);
+    setSpaces((prev) => [...prev, s]);
+  }
+
+  async function handleAddNodeToSpace(nodeId: string, spaceId: string) {
+    await addNodeToSpace(spaceId, nodeId);
+    // Optimistic update — pas d'aller-retour serveur
+    setSpaces((prev) =>
+      prev.map((s) =>
+        s.id === spaceId && s.node_ids !== null
+          ? { ...s, node_ids: [...new Set([...(s.node_ids ?? []), nodeId])] }
+          : s,
+      ),
+    );
+  }
+
+  async function refreshGraph() {
+    const g = await readBrainGraph();
+    if (g) { setGraph(g); setRevealKey((k) => k + 1); }
+  }
+
+  async function handleCreateNote(parentId: string, title: string) {
+    const n = await createNoteNode(parentId, title);
+    await refreshGraph();
+    setSelectedNode(n);
+  }
+
+  async function handleMoveNode(nodeId: string, parentId: string) {
+    await setNodeParent(nodeId, parentId);
+    await refreshGraph();
+  }
+
+  async function handleSpaceDelete(id: string) {
+    await deleteSpace(id);
+    setSpaces((prev) => prev.filter((s) => s.id !== id));
+    if (activeSpaceId === id) setActiveSpaceId(null);
+  }
+
+  const activeSpace = spaces.find((s) => s.id === activeSpaceId);
+  const displayGraph = graph && activeSpace?.node_ids
+    ? filterGraphBySpace(graph, activeSpace.node_ids)
+    : graph;
 
   const hasDetail = !!selectedNode;
 
@@ -140,18 +242,22 @@ function App() {
           {/* ── Canvas principal ── */}
           {view === "map" && (graph || generating) && (
             <BrainMap
-              graph={graph ?? { nodes: [], edges: [], markdown: "", report: "", generated_at: "" }}
+              graph={displayGraph ?? { nodes: [], edges: [], markdown: "", report: "", generated_at: "" }}
               onSelect={selectNode}
               selectedId={selectedNode?.id ?? null}
               query={query}
               revealKey={revealKey}
               streamLabels={generating ? streamLabels : []}
               streamTotal={streamTotal}
+              spaces={spaces}
+              onAddNodeToSpace={handleAddNodeToSpace}
+              onCreateNote={handleCreateNote}
+              onMoveNode={handleMoveNode}
             />
           )}
-          {view === "folder" && graph && (
+          {view === "folder" && displayGraph && (
             <FolderView
-              graph={graph}
+              graph={displayGraph}
               onSelect={selectNode}
               selectedId={selectedNode?.id ?? null}
               query={query}
@@ -178,6 +284,11 @@ function App() {
                 onRefresh={() => connectorsStatus().then(setConnectors)}
                 onSyncDone={handleGenerate}
                 onClose={() => setLeftOpen(false)}
+                spaces={spaces}
+                activeSpaceId={activeSpaceId}
+                onSpaceSelect={setActiveSpaceId}
+                onSpaceCreate={handleSpaceCreate}
+                onSpaceDelete={handleSpaceDelete}
               />
             </div>
           )}
@@ -250,6 +361,54 @@ function App() {
                     <RefreshCw className="size-4" />
                   </button>
                 )}
+                <div className="relative">
+                  <button
+                    onClick={handleOpenHistory}
+                    title="Historique des snapshots"
+                    className={cn(
+                      "rounded-lg p-1.5 transition-colors",
+                      historyOpen
+                        ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                        : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
+                    )}
+                  >
+                    <History className="size-4" />
+                  </button>
+                  {historyOpen && (
+                    <div className="absolute bottom-full right-0 mb-2 w-72 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] overflow-hidden">
+                      <div className="px-3 py-2 border-b border-[var(--color-border)] text-xs font-semibold text-[var(--color-muted)] uppercase tracking-wider">
+                        Snapshots
+                      </div>
+                      {snapshots.length === 0 ? (
+                        <p className="px-3 py-4 text-xs text-[var(--color-muted)] text-center">
+                          Aucun snapshot — régénère le graphe pour en créer un.
+                        </p>
+                      ) : (
+                        <ul className="max-h-64 overflow-y-auto">
+                          {snapshots.map((s) => (
+                            <li key={s.id} className="flex items-center justify-between gap-2 px-3 py-2 hover:bg-[var(--color-surface-2)] transition-colors">
+                              <div className="min-w-0">
+                                <p className="text-xs font-medium text-[var(--color-text)] truncate">
+                                  {relativeTime(s.created_at)}
+                                </p>
+                                <p className="text-[10px] text-[var(--color-muted)]">{s.node_count} nœuds</p>
+                              </div>
+                              <button
+                                onClick={() => handleRestore(s.id)}
+                                disabled={restoring}
+                                title="Restaurer ce snapshot"
+                                className="shrink-0 flex items-center gap-1 rounded-lg px-2 py-1 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] transition-colors disabled:opacity-40"
+                              >
+                                <RotateCcw className="size-3" />
+                                Restaurer
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                </div>
                 <ThemeToggle />
               </div>
             </div>
@@ -278,6 +437,8 @@ function App() {
                     expanded={false}
                     onExpand={() => setNodeExpanded(true)}
                     onContentSaved={handleContentSaved}
+                    onCreateNote={handleCreateNote}
+                    onNodeRenamed={handleNodeRenamed}
                   />
                 )}
               </div>
@@ -304,6 +465,8 @@ function App() {
                 expanded
                 onExpand={() => setNodeExpanded(false)}
                 onContentSaved={handleContentSaved}
+                onCreateNote={handleCreateNote}
+                onNodeRenamed={handleNodeRenamed}
               />
             </div>
           )}
@@ -311,6 +474,14 @@ function App() {
       )}
     </div>
   );
+}
+
+function relativeTime(ts: number): string {
+  const diff = Math.floor(Date.now() / 1000) - ts;
+  if (diff < 60)    return "il y a quelques secondes";
+  if (diff < 3600)  return `il y a ${Math.floor(diff / 60)} min`;
+  if (diff < 86400) return `il y a ${Math.floor(diff / 3600)} h`;
+  return `il y a ${Math.floor(diff / 86400)} j`;
 }
 
 function ViewBtn({

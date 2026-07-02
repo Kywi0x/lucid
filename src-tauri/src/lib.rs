@@ -6,7 +6,7 @@ mod connectors;
 mod models;
 
 use ai::{pipeline, LlamaEngine};
-use models::{BrainGraph, BrainNode, ConnectorStatus, Conversation, ConversationSummary};
+use models::{BrainEdge, BrainGraph, BrainNode, ConnectorStatus, Conversation, ConversationSummary};
 use tauri::Emitter;
 
 /// Accès public au scan (utilisé par les exemples / tests d'intégration).
@@ -346,6 +346,91 @@ Si l'information n'y figure pas, dis-le clairement.";
     .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
+/// Chat contextuel sur une page : contexte = contenu de la page (+ sous-pages si demandé).
+#[tauri::command]
+async fn ask_node(node_id: String, question: String, include_children: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+        let raw = std::fs::read_to_string(dir.join("brain.json"))
+            .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
+        let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let node = graph.nodes.iter().find(|n| n.id == node_id)
+            .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
+
+        let take = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+        let mut ctx = format!("# {}\n", node.label);
+        if !node.summary.is_empty() { ctx.push_str(&node.summary); ctx.push('\n'); }
+        if !node.content.is_empty() { ctx.push_str(&take(&node.content, 4000)); ctx.push('\n'); }
+
+        if include_children {
+            let kids: Vec<&BrainNode> = graph.nodes.iter()
+                .filter(|n| n.parent_id.as_deref() == Some(node_id.as_str()))
+                .collect();
+            if !kids.is_empty() {
+                ctx.push_str("\n# Sous-pages\n");
+                for k in kids {
+                    ctx.push_str(&format!("\n## {}\n", k.label));
+                    if !k.summary.is_empty() { ctx.push_str(&k.summary); ctx.push('\n'); }
+                    if !k.content.is_empty() { ctx.push_str(&take(&k.content, 1200)); ctx.push('\n'); }
+                    if ctx.len() > 9000 { ctx.push_str("\n[…contexte tronqué…]\n"); break; }
+                }
+            }
+        }
+
+        let engine = LlamaEngine::detect()?;
+        let system = "Tu es l'assistant de cette page du second cerveau. Réponds en français, \
+de façon concise et utile, en te basant sur le CONTEXTE fourni (la page courante et, si présentes, \
+ses sous-pages). Si l'information n'y figure pas, dis-le clairement plutôt que d'inventer.";
+        let user = format!("CONTEXTE :\n{ctx}\n\nQUESTION : {question}");
+        engine.complete(Some(system), &user, 512)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Génère du contenu markdown pour une page selon une consigne, contexte = page (+ sous-pages).
+#[tauri::command]
+async fn generate_content(node_id: String, instruction: String, include_children: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+        let raw = std::fs::read_to_string(dir.join("brain.json"))
+            .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
+        let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let node = graph.nodes.iter().find(|n| n.id == node_id)
+            .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
+
+        let take = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+        let mut ctx = format!("# {}\n", node.label);
+        if !node.summary.is_empty() { ctx.push_str(&node.summary); ctx.push('\n'); }
+        if !node.content.is_empty() { ctx.push_str(&take(&node.content, 4000)); ctx.push('\n'); }
+
+        if include_children {
+            let kids: Vec<&BrainNode> = graph.nodes.iter()
+                .filter(|n| n.parent_id.as_deref() == Some(node_id.as_str()))
+                .collect();
+            if !kids.is_empty() {
+                ctx.push_str("\n# Sous-pages\n");
+                for k in kids {
+                    ctx.push_str(&format!("\n## {}\n", k.label));
+                    if !k.summary.is_empty() { ctx.push_str(&k.summary); ctx.push('\n'); }
+                    if !k.content.is_empty() { ctx.push_str(&take(&k.content, 1200)); ctx.push('\n'); }
+                    if ctx.len() > 9000 { ctx.push_str("\n[…contexte tronqué…]\n"); break; }
+                }
+            }
+        }
+
+        let engine = LlamaEngine::detect()?;
+        let system = "Tu rédiges du contenu markdown pour cette page du second cerveau, selon la \
+CONSIGNE de l'utilisateur, en t'appuyant sur le CONTEXTE fourni (la page courante et, si présentes, \
+ses sous-pages). Réponds UNIQUEMENT avec le contenu markdown demandé — pas de préambule, pas de \
+phrase d'introduction, pas de bloc de code englobant.";
+        let user = format!("CONTEXTE :\n{ctx}\n\nCONSIGNE : {instruction}");
+        engine.complete(Some(system), &user, 1024)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
 /// Lit le graphe.
 /// Si `brain.md` est plus récent que `brain.json` (édition manuelle ou écriture LLM),
 /// on repparse brain.md et on met brain.json à jour avant de retourner le graphe.
@@ -445,16 +530,177 @@ fn load_node_content(node_id: String) -> Result<String, String> {
     }
 }
 
+// ── Historique par nœud ────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct NodeSnapshotInfo {
+    id: String,        // "content_<ts>" (sans .md)
+    created_at: u64,
+    preview: String,   // premiers 150 chars
+}
+
+fn node_history_dir(dir: &std::path::Path, node_id: &str) -> std::path::PathBuf {
+    dir.join("node_history").join(node_id)
+}
+
+fn save_node_content_history(dir: &std::path::Path, node_id: &str, old_content: &str) {
+    if old_content.trim().is_empty() { return; }
+    let hdir = node_history_dir(dir, node_id);
+    if std::fs::create_dir_all(&hdir).is_err() { return; }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(hdir.join(format!("content_{ts}.md")), old_content);
+    // Garder les 10 dernières versions
+    if let Ok(entries) = std::fs::read_dir(&hdir) {
+        let mut files: Vec<_> = entries.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("content_"))
+            .collect();
+        files.sort_by_key(|e| e.file_name());
+        files.reverse();
+        for old in files.into_iter().skip(10) { let _ = std::fs::remove_file(old.path()); }
+    }
+}
+
+#[tauri::command]
+fn list_node_snapshots(node_id: String) -> Vec<NodeSnapshotInfo> {
+    let Some(dir) = ai::llama::app_data_dir() else { return vec![]; };
+    let hdir = node_history_dir(&dir, &node_id);
+    let mut infos: Vec<NodeSnapshotInfo> = std::fs::read_dir(&hdir)
+        .into_iter().flatten().flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            if !s.starts_with("content_") || !s.ends_with(".md") { return None; }
+            let ts_str = s.strip_prefix("content_")?.strip_suffix(".md")?;
+            let created_at: u64 = ts_str.parse().ok()?;
+            let content = std::fs::read_to_string(e.path()).unwrap_or_default();
+            let preview: String = content.chars().take(150).collect();
+            Some(NodeSnapshotInfo { id: format!("content_{ts_str}"), created_at, preview })
+        })
+        .collect();
+    infos.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    infos
+}
+
+#[tauri::command]
+fn get_node_snapshot(node_id: String, snapshot_id: String) -> Result<String, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let path = node_history_dir(&dir, &node_id).join(format!("{snapshot_id}.md"));
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
 /// Sauvegarde le contenu markdown libre d'un nœud (jamais écrasé par l'IA).
 #[tauri::command]
 fn save_node_content(node_id: String, content: String) -> Result<(), String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
     let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
     let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    graph.nodes.iter_mut()
+    let node = graph.nodes.iter_mut()
         .find(|n| n.id == node_id)
-        .ok_or_else(|| format!("Nœud {node_id} introuvable."))?
-        .content = content;
+        .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
+    // Sauvegarde l'ancienne version avant d'écraser
+    save_node_content_history(&dir, &node_id, &node.content);
+    node.content = content;
+    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+/// Crée un nœud « note » (prise de note utilisateur) rattaché à `parent_id`.
+/// Persisté dans brain.json ; préservé lors des régénérations (kind == "note").
+#[tauri::command]
+fn create_note_node(parent_id: String, label: String) -> Result<BrainNode, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if !graph.nodes.iter().any(|n| n.id == parent_id) {
+        return Err(format!("Nœud parent {parent_id} introuvable."));
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!("note-{ts}");
+    let node = BrainNode {
+        id: id.clone(),
+        label: {
+            let l = label.trim();
+            if l.is_empty() { "Nouvelle note".into() } else { l.to_string() }
+        },
+        kind: "note".into(),
+        weight: 0,
+        summary: String::new(),
+        keywords: vec![],
+        decisions: vec![],
+        patterns: vec![],
+        community: 0,
+        parent_id: Some(parent_id.clone()),
+        synthesized_at: None,
+        content: String::new(),
+        connector: None,
+        source_id: None,
+        source_project: None,
+    };
+    graph.edges.push(BrainEdge {
+        source: parent_id, target: id, kind: "contains".into(), relation: "contains".into(),
+    });
+    graph.nodes.push(node.clone());
+    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(node)
+}
+
+/// Re-rattache `node_id` sous `parent_id` (déplacement/lien dans la mind map).
+/// Refuse un cycle (parent == descendant) qui figerait le layout.
+#[tauri::command]
+fn set_node_parent(node_id: String, parent_id: String) -> Result<(), String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    if node_id == parent_id {
+        return Err("Un nœud ne peut pas être son propre parent.".into());
+    }
+    if !graph.nodes.iter().any(|n| n.id == parent_id) {
+        return Err(format!("Nœud parent {parent_id} introuvable."));
+    }
+    // Garde anti-cycle : on remonte les parents depuis parent_id ; si on croise node_id, refus.
+    {
+        let parent_of: std::collections::HashMap<&str, &str> = graph.nodes.iter()
+            .filter_map(|n| n.parent_id.as_deref().map(|p| (n.id.as_str(), p)))
+            .collect();
+        let mut cur = Some(parent_id.as_str());
+        while let Some(c) = cur {
+            if c == node_id {
+                return Err("Déplacement impossible : créerait une boucle.".into());
+            }
+            cur = parent_of.get(c).copied();
+        }
+    }
+    let node = graph.nodes.iter_mut()
+        .find(|n| n.id == node_id)
+        .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
+    node.parent_id = Some(parent_id.clone());
+    // Maintient les arêtes de contenance cohérentes (utilisées par le filtrage par space).
+    graph.edges.retain(|e| !(e.target == node_id && e.kind == "contains"));
+    graph.edges.push(BrainEdge {
+        source: parent_id, target: node_id, kind: "contains".into(), relation: "contains".into(),
+    });
+    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+/// Renomme un nœud (change son `label`). Persisté dans brain.json.
+#[tauri::command]
+fn rename_node(node_id: String, label: String) -> Result<(), String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let node = graph.nodes.iter_mut()
+        .find(|n| n.id == node_id)
+        .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
+    let l = label.trim();
+    node.label = if l.is_empty() { "Sans titre".into() } else { l.to_string() };
     std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
 }
@@ -546,6 +792,189 @@ CONTENU :\n{ctx}\n\n\
     .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
+// ── Snapshots ──────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+struct SnapshotInfo {
+    id: String,
+    created_at: u64,
+    node_count: usize,
+}
+
+fn save_snapshot_in(dir: &std::path::Path) {
+    let brain_path = dir.join("brain.json");
+    if !brain_path.exists() { return; }
+    let snap_dir = dir.join("snapshots");
+    if std::fs::create_dir_all(&snap_dir).is_err() { return; }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::copy(&brain_path, snap_dir.join(format!("brain_{ts}.json")));
+    // Garder les 10 derniers
+    if let Ok(entries) = std::fs::read_dir(&snap_dir) {
+        let mut files: Vec<_> = entries.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("brain_"))
+            .collect();
+        files.sort_by_key(|e| e.file_name());
+        files.reverse();
+        for old in files.into_iter().skip(10) { let _ = std::fs::remove_file(old.path()); }
+    }
+}
+
+#[tauri::command]
+fn list_snapshots() -> Vec<SnapshotInfo> {
+    let Some(dir) = ai::llama::app_data_dir() else { return vec![]; };
+    let snap_dir = dir.join("snapshots");
+    let mut infos: Vec<SnapshotInfo> = std::fs::read_dir(&snap_dir)
+        .into_iter().flatten().flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            if !s.starts_with("brain_") || !s.ends_with(".json") { return None; }
+            let ts_str = s.strip_prefix("brain_")?.strip_suffix(".json")?;
+            let created_at: u64 = ts_str.parse().ok()?;
+            let node_count = std::fs::read_to_string(e.path()).ok()
+                .and_then(|r| serde_json::from_str::<BrainGraph>(&r).ok())
+                .map(|g| g.nodes.len()).unwrap_or(0);
+            Some(SnapshotInfo { id: format!("brain_{ts_str}"), created_at, node_count })
+        })
+        .collect();
+    infos.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    infos
+}
+
+#[tauri::command]
+fn restore_snapshot(snapshot_id: String) -> Result<BrainGraph, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let src = dir.join("snapshots").join(format!("{snapshot_id}.json"));
+    let dest = dir.join("brain.json");
+    save_snapshot_in(&dir); // snapshot de l'état actuel avant restauration
+    std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+    let raw = std::fs::read_to_string(&dest).map_err(|e| e.to_string())?;
+    serde_json::from_str(&raw).map_err(|e| e.to_string())
+}
+
+// ── Spaces ─────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct Space {
+    id: String,
+    name: String,
+    node_ids: Option<Vec<String>>,
+}
+
+fn load_spaces(dir: &std::path::Path) -> Vec<Space> {
+    std::fs::read_to_string(dir.join("spaces.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_spaces(dir: &std::path::Path, spaces: &[Space]) {
+    if let Ok(json) = serde_json::to_string_pretty(spaces) {
+        let _ = std::fs::write(dir.join("spaces.json"), json);
+    }
+}
+
+#[tauri::command]
+fn list_spaces() -> Vec<Space> {
+    let lucid = Space { id: "lucid".into(), name: "Lucid".into(), node_ids: None };
+    let mut spaces = vec![lucid];
+    if let Some(dir) = ai::llama::app_data_dir() {
+        spaces.extend(load_spaces(&dir));
+    }
+    spaces
+}
+
+#[tauri::command]
+fn create_space(name: String) -> Result<Space, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let space = Space { id: format!("space_{ts}"), name, node_ids: Some(vec![]) };
+    let mut spaces = load_spaces(&dir);
+    spaces.push(space.clone());
+    save_spaces(&dir, &spaces);
+    Ok(space)
+}
+
+#[tauri::command]
+fn rename_space(id: String, name: String) -> Result<(), String> {
+    if id == "lucid" { return Err("L'espace Lucid ne peut pas être renommé.".into()); }
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let mut spaces = load_spaces(&dir);
+    let space = spaces.iter_mut().find(|s| s.id == id).ok_or("Espace introuvable.")?;
+    space.name = name;
+    save_spaces(&dir, &spaces);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_space(id: String) -> Result<(), String> {
+    if id == "lucid" { return Err("L'espace Lucid ne peut pas être supprimé.".into()); }
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let mut spaces = load_spaces(&dir);
+    let len_before = spaces.len();
+    spaces.retain(|s| s.id != id);
+    if spaces.len() == len_before { return Err("Espace introuvable.".into()); }
+    save_spaces(&dir, &spaces);
+    Ok(())
+}
+
+#[tauri::command]
+fn add_node_to_space(space_id: String, node_id: String) -> Result<(), String> {
+    if space_id == "lucid" { return Err("L'espace Lucid est virtuel, pas de liste à modifier.".into()); }
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let mut spaces = load_spaces(&dir);
+    let space = spaces.iter_mut().find(|s| s.id == space_id).ok_or("Espace introuvable.")?;
+    let ids = space.node_ids.get_or_insert_with(Vec::new);
+    if !ids.contains(&node_id) { ids.push(node_id); }
+    save_spaces(&dir, &spaces);
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_node_from_space(space_id: String, node_id: String) -> Result<(), String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let mut spaces = load_spaces(&dir);
+    let space = spaces.iter_mut().find(|s| s.id == space_id).ok_or("Espace introuvable.")?;
+    if let Some(ids) = &mut space.node_ids { ids.retain(|id| id != &node_id); }
+    save_spaces(&dir, &spaces);
+    Ok(())
+}
+
+#[tauri::command]
+fn export_space_md(space_id: String) -> Result<String, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
+    let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+
+    let (space_name, node_ids): (String, Option<Vec<String>>) = if space_id == "lucid" {
+        ("Lucid".into(), None)
+    } else {
+        let spaces = load_spaces(&dir);
+        let s = spaces.into_iter().find(|s| s.id == space_id).ok_or("Espace introuvable.")?;
+        let ids = s.node_ids.clone();
+        (s.name, ids)
+    };
+
+    let nodes: Vec<&BrainNode> = match &node_ids {
+        None => graph.nodes.iter().collect(),
+        Some(ids) => graph.nodes.iter().filter(|n| ids.contains(&n.id)).collect(),
+    };
+
+    let mut md = format!("# {}\n\n", space_name);
+    for node in nodes {
+        md.push_str(&format!("## {}\n\n", node.label));
+        if !node.summary.is_empty() { md.push_str(&format!("{}\n\n", node.summary)); }
+        if !node.content.is_empty() { md.push_str(&format!("{}\n\n", node.content)); }
+    }
+    Ok(md)
+}
+
 /// Lance le pipeline IA : analyse toutes les conversations et construit le graphe.
 #[tauri::command]
 async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
@@ -556,8 +985,25 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
             return Err("Aucune conversation à analyser.".to_string());
         }
 
+        // Préserve l'état utilisateur avant que le pipeline écrase brain.json :
+        //  - contenu édité (tout nœud) ;
+        //  - nœuds « note » créés à la main (absents des conversations, sinon perdus).
+        let prev_graph = ai::llama::app_data_dir()
+            .and_then(|d| std::fs::read_to_string(d.join("brain.json")).ok())
+            .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).ok());
+        let saved_content: std::collections::HashMap<String, String> = prev_graph
+            .as_ref()
+            .map(|g| g.nodes.iter()
+                .filter(|n| !n.content.is_empty())
+                .map(|n| (n.id.clone(), n.content.clone()))
+                .collect())
+            .unwrap_or_default();
+        let user_notes: Vec<BrainNode> = prev_graph
+            .map(|g| g.nodes.into_iter().filter(|n| n.kind == "note").collect())
+            .unwrap_or_default();
+
         let cache_path = ai::llama::app_data_dir().map(|d| d.join("brain_cache.json"));
-        let graph = pipeline::generate_brain(
+        let mut graph = pipeline::generate_brain(
             &engine,
             &convs,
             cache_path.as_deref(),
@@ -579,8 +1025,34 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
             },
         )?;
 
+        // Réinjecte le contenu utilisateur sur les nœuds correspondants
+        for node in &mut graph.nodes {
+            if node.content.is_empty() {
+                if let Some(c) = saved_content.get(&node.id) {
+                    node.content = c.clone();
+                }
+            }
+        }
+
+        // Ré-ajoute les notes utilisateur ; réattache à la racine si leur parent a disparu.
+        let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone());
+        for mut note in user_notes {
+            if graph.nodes.iter().any(|n| n.id == note.id) { continue; }
+            let parent_ok = note.parent_id.as_ref()
+                .map(|p| graph.nodes.iter().any(|n| &n.id == p))
+                .unwrap_or(false);
+            if !parent_ok { note.parent_id = root_id.clone(); }
+            if let Some(p) = note.parent_id.clone() {
+                graph.edges.push(BrainEdge {
+                    source: p, target: note.id.clone(), kind: "contains".into(), relation: "contains".into(),
+                });
+            }
+            graph.nodes.push(note);
+        }
+
         if let Some(dir) = ai::llama::app_data_dir() {
             let _ = std::fs::create_dir_all(&dir);
+            save_snapshot_in(&dir); // snapshot avant écrasement
             let _ = std::fs::write(dir.join("brain.md"), &graph.markdown);
             let _ = std::fs::write(dir.join("brain_report.md"), &graph.report);
             if let Ok(json) = serde_json::to_string_pretty(&graph) {
@@ -667,6 +1139,8 @@ pub fn run() {
             notion_disconnect,
             notion_load_page,
             ask_brain,
+            ask_node,
+            generate_content,
             read_brain_graph,
             generate_brain,
             export_node_md,
@@ -678,9 +1152,23 @@ pub fn run() {
             synthesize_node,
             save_node_content,
             load_node_content,
+            create_note_node,
+            set_node_parent,
+            rename_node,
             obsidian_set_vault,
             obsidian_vault_path,
-            obsidian_disconnect
+            obsidian_disconnect,
+            list_snapshots,
+            restore_snapshot,
+            list_node_snapshots,
+            get_node_snapshot,
+            list_spaces,
+            create_space,
+            rename_space,
+            delete_space,
+            add_node_to_space,
+            remove_node_from_space,
+            export_space_md
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

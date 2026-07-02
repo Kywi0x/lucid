@@ -23,7 +23,7 @@ export interface Conversation extends ConversationSummary {
 }
 
 /** Graphe de connaissances généré par l'IA (mind map à bulles). */
-export type NodeKind = "root" | "container" | "leaf" | "group" | "espace" | "page" | "source";
+export type NodeKind = "root" | "container" | "leaf" | "group" | "espace" | "page" | "source" | "note";
 
 export interface BrainNode {
   id: string;
@@ -59,6 +59,18 @@ export interface BrainGraph {
   generated_at: string;
 }
 
+export interface SnapshotInfo {
+  id: string;
+  created_at: number; // unix seconds
+  node_count: number;
+}
+
+export interface NodeSnapshotInfo {
+  id: string;        // "content_<ts>"
+  created_at: number;
+  preview: string;   // premiers 150 chars
+}
+
 export interface ConnectorStatus {
   id: string;
   name: string;
@@ -66,4 +78,10 @@ export interface ConnectorStatus {
   last_sync: string | null;
   conversation_count: number;
   needs_setup?: boolean;
+}
+
+export interface Space {
+  id: string;
+  name: string;
+  node_ids: string[] | null; // null = "Lucid" (tous les nœuds)
 }

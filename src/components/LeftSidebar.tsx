@@ -13,6 +13,8 @@ import {
   Clock,
   FileText,
   Cpu,
+  Layers,
+  Plus,
 } from "lucide-react";
 import claudeLogo from "@/assets/claude-logo.png";
 import googleDriveLogo from "@/assets/google_drive.svg.png";
@@ -33,7 +35,7 @@ import {
   setActiveModel,
   type ModelInfo,
 } from "@/lib/api";
-import type { ConnectorStatus } from "@/lib/types";
+import type { ConnectorStatus, Space } from "@/lib/types";
 import { cn, relativeDate } from "@/lib/utils";
 
 interface Props {
@@ -41,9 +43,14 @@ interface Props {
   onRefresh: () => void;
   onSyncDone: () => void;
   onClose?: () => void;
+  spaces?: Space[];
+  activeSpaceId?: string | null;
+  onSpaceSelect?: (id: string | null) => void;
+  onSpaceCreate?: (name: string) => void;
+  onSpaceDelete?: (id: string) => void;
 }
 
-type Tab = "connectors" | "assistant";
+type Tab = "connectors" | "assistant" | "spaces";
 
 // ── Brand logos ───────────────────────────────────────────────────────────────
 
@@ -392,7 +399,7 @@ function ModelSection() {
 
 // ── ConnectorsTab ─────────────────────────────────────────────────────────────
 
-export function LeftSidebar({ connectors, onRefresh, onSyncDone, onClose }: Props) {
+export function LeftSidebar({ connectors, onRefresh, onSyncDone, onClose, spaces, activeSpaceId, onSpaceSelect, onSpaceCreate, onSpaceDelete }: Props) {
   const [tab, setTab] = useState<Tab>("connectors");
 
   return (
@@ -403,6 +410,9 @@ export function LeftSidebar({ connectors, onRefresh, onSyncDone, onClose }: Prop
         </TabBtn>
         <TabBtn active={tab === "assistant"} onClick={() => setTab("assistant")}>
           <MessageCircle className="size-4" /> Assistant
+        </TabBtn>
+        <TabBtn active={tab === "spaces"} onClick={() => setTab("spaces")}>
+          <Layers className="size-4" /> Spaces
         </TabBtn>
         {onClose && (
           <button
@@ -416,8 +426,16 @@ export function LeftSidebar({ connectors, onRefresh, onSyncDone, onClose }: Prop
 
       {tab === "connectors" ? (
         <ConnectorsTab connectors={connectors} onRefresh={onRefresh} onSyncDone={onSyncDone} />
-      ) : (
+      ) : tab === "assistant" ? (
         <AssistantTab />
+      ) : (
+        <SpacesTab
+          spaces={spaces}
+          activeSpaceId={activeSpaceId}
+          onSpaceSelect={onSpaceSelect}
+          onSpaceCreate={onSpaceCreate}
+          onSpaceDelete={onSpaceDelete}
+        />
       )}
     </div>
   );
@@ -627,6 +645,104 @@ function TabBtn({ active, onClick, children }: { active: boolean; onClick: () =>
     >
       {children}
     </button>
+  );
+}
+
+// ── SpacesTab ─────────────────────────────────────────────────────────────────
+
+const LUCID_SPACE: Space = { id: "lucid", name: "Lucid", node_ids: null };
+
+function SpacesTab({
+  spaces,
+  activeSpaceId,
+  onSpaceSelect,
+  onSpaceCreate,
+  onSpaceDelete,
+}: {
+  spaces?: Space[];
+  activeSpaceId?: string | null;
+  onSpaceSelect?: (id: string | null) => void;
+  onSpaceCreate?: (name: string) => void;
+  onSpaceDelete?: (id: string) => void;
+}) {
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+
+  const all = [LUCID_SPACE, ...(spaces ?? []).filter((s) => s.id !== "lucid")];
+
+  function handleCreate() {
+    const name = newName.trim();
+    if (!name) return;
+    onSpaceCreate?.(name);
+    setNewName("");
+    setCreating(false);
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col p-3 gap-1">
+      {all.map((s) => {
+        const isActive = s.id === "lucid" ? (activeSpaceId == null || activeSpaceId === "lucid") : activeSpaceId === s.id;
+        return (
+          <div
+            key={s.id}
+            className={cn(
+              "flex items-center gap-2 rounded-lg border px-2.5 py-2 cursor-pointer transition-colors",
+              isActive
+                ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                : "border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text)] hover:bg-[var(--color-surface-2)]",
+            )}
+            onClick={() => onSpaceSelect?.(s.id === "lucid" ? null : s.id)}
+          >
+            <span className="flex-1 text-xs font-medium truncate">{s.name}</span>
+            {s.id !== "lucid" && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onSpaceDelete?.(s.id); }}
+                className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-red-400 transition-colors"
+                title="Supprimer"
+              >
+                <X className="size-3.5" />
+              </button>
+            )}
+          </div>
+        );
+      })}
+
+      {creating ? (
+        <div className="mt-1 flex flex-col gap-1.5">
+          <input
+            autoFocus
+            type="text"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") handleCreate(); if (e.key === "Escape") { setCreating(false); setNewName(""); } }}
+            placeholder="Nom de l'espace…"
+            className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs outline-none placeholder:text-[var(--color-muted)] focus:border-[var(--color-accent)]"
+          />
+          <div className="flex gap-1">
+            <button
+              onClick={handleCreate}
+              disabled={!newName.trim()}
+              className="flex-1 rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 hover:bg-[var(--color-accent-hover)] transition-colors"
+            >
+              Créer
+            </button>
+            <button
+              onClick={() => { setCreating(false); setNewName(""); }}
+              className="rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-xs text-[var(--color-muted)] hover:text-[var(--color-text)] transition-colors"
+            >
+              Annuler
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setCreating(true)}
+          className="mt-1 flex items-center gap-1.5 rounded-lg border border-dashed border-[var(--color-border)] px-2.5 py-2 text-xs text-[var(--color-muted)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] transition-colors"
+        >
+          <Plus className="size-3.5" /> Nouvel espace
+        </button>
+      )}
+    </div>
   );
 }
 

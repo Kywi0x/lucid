@@ -2,11 +2,12 @@ import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import {
   X, FolderGit2, Brain, FileText,
   Download, RefreshCw, Sparkles, Loader2, ChevronRight, Maximize2, Minimize2, Check,
+  History, RotateCcw, Send, Sparkle,
 } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { BrainGraph, BrainNode } from "@/lib/types";
+import type { BrainGraph, BrainNode, NodeSnapshotInfo } from "@/lib/types";
 import { relativeDate, cn } from "@/lib/utils";
-import { exportNodeMd, synthesizeNode, saveNodeContent, loadNodeContent } from "@/lib/api";
+import { exportNodeMd, synthesizeNode, saveNodeContent, loadNodeContent, listNodeSnapshots, getNodeSnapshot, renameNode, askNode, generateContent } from "@/lib/api";
 import { MarkdownEditor } from "./MarkdownEditor";
 import claudeLogo from "@/assets/claude-logo.png";
 import driveLogo  from "@/assets/google_drive.svg.png";
@@ -20,6 +21,8 @@ interface Props {
   expanded?: boolean;
   onExpand?: () => void;
   onContentSaved?: (nodeId: string, content: string) => void;
+  onCreateNote?: (parentId: string, title: string) => void;
+  onNodeRenamed?: (nodeId: string, label: string) => void;
 }
 
 const ICON = {
@@ -73,14 +76,127 @@ function useAncestors(node: BrainNode, graph: BrainGraph | null): BrainNode[] {
   }, [node.id, graph]);
 }
 
-export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand, onContentSaved }: Props) {
+// ─── Panneau de discussion IA (mode plein écran) ────────────────────────────
+function NodeChat({ node, childCount }: { node: BrainNode; childCount: number }) {
+  const [msgs, setMsgs] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [withChildren, setWithChildren] = useState(childCount > 0);
+  const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, loading]);
+
+  async function send() {
+    const q = input.trim();
+    if (!q || loading) return;
+    setMsgs((m) => [...m, { role: "user", text: q }]);
+    setInput("");
+    setLoading(true);
+    try {
+      const a = await askNode(node.id, q, withChildren);
+      setMsgs((m) => [...m, { role: "assistant", text: a }]);
+    } catch (e) {
+      setMsgs((m) => [...m, { role: "assistant", text: "Erreur : " + String(e) }]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-2.5">
+        <Sparkle className="size-3.5 text-[var(--color-accent)]" />
+        <span className="flex-1 text-xs font-semibold text-[var(--color-text)]">Assistant</span>
+        <button
+          onClick={() => setWithChildren((v) => !v)}
+          disabled={childCount === 0}
+          title="Inclure le contenu des sous-pages dans le contexte"
+          className={cn(
+            "flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] transition-colors disabled:opacity-40",
+            withChildren
+              ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+              : "border-[var(--color-border)] text-[var(--color-muted)] hover:text-[var(--color-text)]",
+          )}
+        >
+          <span className={cn("size-1.5 rounded-full", withChildren ? "bg-[var(--color-accent)]" : "bg-[var(--color-muted)]")} />
+          Sous-pages{childCount > 0 ? ` (${childCount})` : ""}
+        </button>
+      </div>
+
+      <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
+        {msgs.length === 0 && (
+          <p className="mt-6 text-center text-xs leading-relaxed text-[var(--color-muted)]">
+            Pose une question sur cette page{withChildren && childCount > 0 ? " et ses sous-pages" : ""}.{"\n"}
+            Tout reste local.
+          </p>
+        )}
+        {msgs.map((m, i) => (
+          <div key={i} className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}>
+            <div className={cn(
+              "max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-2 text-xs leading-relaxed",
+              m.role === "user"
+                ? "bg-[var(--color-accent)] text-white"
+                : "border border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text)]",
+            )}>
+              {m.text}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div className="flex items-center gap-2 text-xs text-[var(--color-muted)]">
+            <Loader2 className="size-3.5 animate-spin" /> L'assistant réfléchit…
+          </div>
+        )}
+        <div ref={endRef} />
+      </div>
+
+      <div className="border-t border-[var(--color-border)] p-3">
+        <div className="flex items-end gap-2">
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+            placeholder="Poser une question…"
+            rows={1}
+            className="max-h-28 flex-1 resize-none rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-xs text-[var(--color-text)] outline-none"
+          />
+          <button
+            onClick={send}
+            disabled={loading || !input.trim()}
+            className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--color-accent)] text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+          >
+            <Send className="size-3.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand, onContentSaved, onCreateNote, onNodeRenamed }: Props) {
   const ancestors = useAncestors(node, graph);
   const Icon = ICON[node.kind as keyof typeof ICON] ?? FileText;
   const children = graph?.nodes.filter((n) => n.parent_id === node.id) ?? [];
 
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  function commitTitle() {
+    setEditingTitle(false);
+    const l = titleDraft.trim();
+    if (l && l !== node.label) renameNode(node.id, l).then(() => onNodeRenamed?.(node.id, l)).catch(console.error);
+  }
+  const slashPage = onCreateNote ? () => onCreateNote(node.id, "Nouvelle page") : undefined;
+  const generate = (instruction: string, includeChildren: boolean) => generateContent(node.id, instruction, includeChildren);
+
   const [synth, setSynth] = useState<Partial<BrainNode> | null>(null);
   const [synthesizing, setSynthesizing] = useState(false);
   const [synthError, setSynthError] = useState<string | null>(null);
+
+  const [localContent, setLocalContent] = useState<string | null>(null);
+  const [historyMode, setHistoryMode] = useState(false);
+  const [nodeSnapshots, setNodeSnapshots] = useState<NodeSnapshotInfo[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
   const display = synth ? { ...node, ...synth } : node;
   const synthTimestamp = synth?.synthesized_at ?? node.synthesized_at;
 
@@ -103,6 +219,10 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
 
   useEffect(() => {
     setSynth(null);
+    setLocalContent(null);
+    setHistoryMode(false);
+    setNodeSnapshots([]);
+    setEditingTitle(false);
     if (!node.connector) { setSourceText(null); return; }
     setSourceLoading(true);
     loadNodeContent(node.id)
@@ -111,7 +231,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
       .finally(() => setSourceLoading(false));
   }, [node.id]);
 
-  const editorContent = node.content || sourceText || "";
+  const editorContent = localContent ?? node.content ?? sourceText ?? "";
 
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -132,6 +252,32 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
     }, 800);
   }, [node.id, onContentSaved]);
 
+  async function openHistory() {
+    setHistoryMode(true);
+    setLoadingHistory(true);
+    try { setNodeSnapshots(await listNodeSnapshots(node.id)); }
+    finally { setLoadingHistory(false); }
+  }
+
+  async function handleRestoreNodeSnapshot(id: string) {
+    setRestoringId(id);
+    try {
+      const content = await getNodeSnapshot(node.id, id);
+      await saveNodeContent(node.id, content);
+      setLocalContent(content);
+      onContentSaved?.(node.id, content);
+      setHistoryMode(false);
+    } finally { setRestoringId(null); }
+  }
+
+  function nodeRelTime(ts: number) {
+    const d = Math.floor(Date.now() / 1000) - ts;
+    if (d < 60)    return "il y a quelques secondes";
+    if (d < 3600)  return `il y a ${Math.floor(d / 60)} min`;
+    if (d < 86400) return `il y a ${Math.floor(d / 3600)} h`;
+    return `il y a ${Math.floor(d / 86400)} j`;
+  }
+
   return (
     <div className="flex h-full w-full flex-col bg-[var(--color-surface)]">
 
@@ -139,7 +285,27 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
       <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-3 py-2.5">
         <Icon className="size-4 shrink-0 text-[var(--color-accent)]" />
         <div className="min-w-0 flex-1">
-          <h3 className="truncate text-sm font-semibold leading-tight">{node.label}</h3>
+          {editingTitle ? (
+            <input
+              autoFocus
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={commitTitle}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); commitTitle(); }
+                else if (e.key === "Escape") setEditingTitle(false);
+              }}
+              className="w-full rounded border border-[var(--color-accent)] bg-[var(--color-surface-2)] px-1 py-0.5 text-sm font-semibold leading-tight text-[var(--color-text)] outline-none"
+            />
+          ) : (
+            <h3
+              className={cn("truncate text-sm font-semibold leading-tight", node.kind !== "root" && "cursor-text hover:text-[var(--color-accent)]")}
+              title={node.kind !== "root" ? "Cliquer pour renommer" : undefined}
+              onClick={() => { if (node.kind !== "root") { setTitleDraft(node.label); setEditingTitle(true); } }}
+            >
+              {node.label}
+            </h3>
+          )}
           <p className="text-[10px] text-[var(--color-muted)]">
             {KIND_LABEL[node.kind as keyof typeof KIND_LABEL] ?? "Page"}
             {node.kind !== "root" && ` · poids ${node.weight}`}
@@ -184,6 +350,16 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
             >
               <Download className="size-3.5" />
             </button>
+            <button
+              onClick={historyMode ? () => setHistoryMode(false) : openHistory}
+              title={historyMode ? "Retour au contenu" : "Historique des versions"}
+              className={cn(
+                "rounded-md p-1 transition-colors hover:bg-[var(--color-surface-2)]",
+                historyMode ? "text-[var(--color-accent)]" : "text-[var(--color-muted)] hover:text-[var(--color-text)]",
+              )}
+            >
+              <History className="size-3.5" />
+            </button>
           </>
         )}
         {onExpand && (
@@ -223,7 +399,44 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
       )}
 
       {/* ── Corps ── */}
-      {expanded ? (
+      {historyMode ? (
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          {loadingHistory ? (
+            <div className="flex items-center gap-2 py-6 text-xs text-[var(--color-muted)]">
+              <Loader2 className="size-3.5 animate-spin" /> Chargement…
+            </div>
+          ) : nodeSnapshots.length === 0 ? (
+            <p className="py-8 text-center text-xs text-[var(--color-muted)]">
+              Aucune version sauvegardée.{"\n"}Les versions sont créées automatiquement à chaque modification.
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {nodeSnapshots.map((s) => (
+                <li key={s.id} className="rounded-lg border border-[var(--color-border)] p-3">
+                  <div className="mb-1.5 flex items-start justify-between gap-2">
+                    <span className="text-xs font-medium text-[var(--color-text)]">{nodeRelTime(s.created_at)}</span>
+                    <button
+                      onClick={() => handleRestoreNodeSnapshot(s.id)}
+                      disabled={restoringId === s.id}
+                      className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium text-[var(--color-accent)] transition-colors hover:bg-[var(--color-accent-soft)] disabled:opacity-40"
+                    >
+                      {restoringId === s.id
+                        ? <Loader2 className="size-3 animate-spin" />
+                        : <RotateCcw className="size-3" />}
+                      Restaurer
+                    </button>
+                  </div>
+                  {s.preview && (
+                    <p className="line-clamp-3 text-[11px] leading-relaxed text-[var(--color-muted)]">
+                      {s.preview}{s.preview.length >= 150 ? "…" : ""}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : expanded ? (
         // Mode étendu : deux colonnes
         <div className="flex flex-1 overflow-hidden">
           {/* Colonne gauche — métadonnées (non éditables) */}
@@ -300,11 +513,18 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                     <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
                   </div>
                 ) : (
-                  <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" />
+                  <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} />
                 )
               )}
             </div>
           </div>
+
+          {/* Colonne droite — discussion IA */}
+          {node.kind !== "root" && (
+            <div className="flex w-[360px] shrink-0 flex-col border-l border-[var(--color-border)]">
+              <NodeChat key={node.id} node={node} childCount={children.length} />
+            </div>
+          )}
         </div>
       ) : (
         // Mode panneau : colonne unique
@@ -337,7 +557,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                 <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
               </div>
             ) : (
-              <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" />
+              <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} />
             )
           )}
           {(display.decisions ?? []).length > 0 && (
