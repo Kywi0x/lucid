@@ -1,42 +1,75 @@
 @import "tailwindcss";
 @import "@xyflow/react/dist/style.css";
 
-/* ─── Thème (clair par défaut, sombre via OS ou [data-theme="dark"]) ───────── */
+/* ─── Thème (clair par défaut, sombre via OS ou [data-theme="dark"]) ─────────
+   Gris biaisés bleu (jamais neutres purs). Les tokens --canvas-* sont lus par
+   BrainMap via getComputedStyle : le canvas suit le thème. */
 :root {
-  --color-bg: #ffffff;
-  --color-surface: #fbfbfb;
-  --color-surface-2: #eeeff1;
-  --color-border: #e6e7ea;
-  --color-text: #1e1e1e;
-  --color-muted: #8d8d8d;
-  --color-accent: #7c5cff;
-  --color-accent-hover: #6a47f5;
-  --color-accent-soft: rgba(124, 92, 255, 0.12);
-  --shadow-float: 0 8px 30px rgba(0, 0, 0, 0.12);
+  --color-bg: #f5f7fb;
+  --color-surface: #ffffff;
+  --color-surface-2: #e9edf4;
+  --color-border: rgba(40, 60, 100, 0.13);
+  --color-text: #1b2130;
+  --color-muted: #5c6577;
+  --color-accent: #6a52e8;
+  --color-accent-hover: #5b44d6;
+  --color-accent-soft: rgba(106, 82, 232, 0.1);
+  --shadow-float: 0 10px 32px rgba(30, 40, 80, 0.14);
+  --color-ok: #2f9e6e;
+  --color-warn: #b0851f;
+  --color-err: #c25454;
+  --canvas-bg: #edf0f6;
+  --canvas-dot: rgba(70, 90, 130, 0.13);
+  --canvas-wire: rgba(60, 80, 120, 0.18);
+  --canvas-label: rgba(55, 65, 90, 0.85);
+  --canvas-label-dim: rgba(55, 65, 90, 0.45);
+  --canvas-sel: rgba(27, 33, 48, 0.85);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --color-bg: #1b1d21;
-    --color-surface: #232529;
-    --color-surface-2: #313337;
-    --color-border: #31333a;
-    --color-text: #ffffff;
-    --color-muted: #8d8d8d;
-    --color-accent-soft: rgba(124, 92, 255, 0.2);
-    --shadow-float: 0 8px 30px rgba(0, 0, 0, 0.45);
+    --color-bg: #0a0d13;
+    --color-surface: #10131b;
+    --color-surface-2: #1a1e28;
+    --color-border: rgba(163, 178, 210, 0.13);
+    --color-text: #e7ecf4;
+    --color-muted: #8a93a6;
+    --color-accent: #9d8cff;
+    --color-accent-hover: #8b78f5;
+    --color-accent-soft: rgba(157, 140, 255, 0.14);
+    --shadow-float: 0 10px 32px rgba(0, 0, 0, 0.45);
+    --color-ok: #5fb39a;
+    --color-warn: #c9a86a;
+    --color-err: #d08a84;
+    --canvas-bg: #07090d;
+    --canvas-dot: rgba(205, 216, 235, 0.07);
+    --canvas-wire: rgba(163, 178, 210, 0.16);
+    --canvas-label: rgba(212, 218, 230, 0.72);
+    --canvas-label-dim: rgba(212, 218, 230, 0.38);
+    --canvas-sel: rgba(255, 255, 255, 0.85);
   }
 }
 
 :root[data-theme="dark"] {
-  --color-bg: #1b1d21;
-  --color-surface: #232529;
-  --color-surface-2: #313337;
-  --color-border: #31333a;
-  --color-text: #ffffff;
-  --color-muted: #8d8d8d;
-  --color-accent-soft: rgba(124, 92, 255, 0.2);
-  --shadow-float: 0 8px 30px rgba(0, 0, 0, 0.45);
+  --color-bg: #0a0d13;
+  --color-surface: #10131b;
+  --color-surface-2: #1a1e28;
+  --color-border: rgba(163, 178, 210, 0.13);
+  --color-text: #e7ecf4;
+  --color-muted: #8a93a6;
+  --color-accent: #9d8cff;
+  --color-accent-hover: #8b78f5;
+  --color-accent-soft: rgba(157, 140, 255, 0.14);
+  --shadow-float: 0 10px 32px rgba(0, 0, 0, 0.45);
+  --color-ok: #5fb39a;
+  --color-warn: #c9a86a;
+  --color-err: #d08a84;
+  --canvas-bg: #07090d;
+  --canvas-dot: rgba(205, 216, 235, 0.07);
+  --canvas-wire: rgba(163, 178, 210, 0.16);
+  --canvas-label: rgba(212, 218, 230, 0.72);
+  --canvas-label-dim: rgba(212, 218, 230, 0.38);
+  --canvas-sel: rgba(255, 255, 255, 0.85);
 }
 
 * {
@@ -77,39 +110,13 @@ body {
   background: transparent;
 }
 
-/* ── Liquid glass ─────────────────────────────────────────────────────────── */
-.glass {
-  background: rgba(255, 255, 255, 0.55);
-  backdrop-filter: blur(28px) saturate(180%) brightness(1.06);
-  -webkit-backdrop-filter: blur(28px) saturate(180%) brightness(1.06);
-  border: 1px solid rgba(255, 255, 255, 0.6);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.8),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.04),
-    0 8px 32px rgba(0, 0, 0, 0.1),
-    0 2px 8px rgba(0, 0, 0, 0.06);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .glass {
-    background: rgba(28, 30, 36, 0.6);
-    border-color: rgba(255, 255, 255, 0.1);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.08),
-      inset 0 -1px 0 rgba(0, 0, 0, 0.2),
-      0 8px 32px rgba(0, 0, 0, 0.4),
-      0 2px 8px rgba(0, 0, 0, 0.2);
-  }
-}
-
-:root[data-theme="dark"] .glass {
-  background: rgba(28, 30, 36, 0.6);
-  border-color: rgba(255, 255, 255, 0.1);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.2),
-    0 8px 32px rgba(0, 0, 0, 0.4),
-    0 2px 8px rgba(0, 0, 0, 0.2);
+/* ── Panel : la matière unique du chrome flottant (theme-aware via tokens) ── */
+.panel {
+  background: color-mix(in srgb, var(--color-surface) 85%, transparent);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-float);
 }
 
 /* Bulle : animation de survol */

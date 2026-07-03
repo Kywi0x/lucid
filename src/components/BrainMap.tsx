@@ -15,8 +15,14 @@ interface Props {
   streamTotal?: number;
   spaces?: Space[];
   onAddNodeToSpace?: (nodeId: string, spaceId: string) => void;
-  onCreateNote?: (parentId: string, title: string) => void;
   onMoveNode?: (nodeId: string, parentId: string) => void;
+  /** Clic net sur le vide du canvas (ferme le panneau détail). */
+  onBackgroundClick?: () => void;
+  /** Largeur (px) occupée à droite par le panneau détail : le centre de la
+   *  caméra se décale pour garder le graphe centré dans l'espace restant. */
+  panelOffset?: number;
+  /** Centre la caméra sur ce nœud (k force le re-déclenchement). */
+  focus?: { id: string; k: number } | null;
 }
 
 interface NodeInfo {
@@ -28,16 +34,51 @@ interface NodeInfo {
   parentId: string | null;
 }
 
-// ─── Palette (couleurs de l'app : clusters + racine accent + notes ambre) ───────
+// ─── Palette clusters : désaturée en sombre, assombrie en clair ─────────────────
 
-const PALETTE = [
-  "#7b6fe0", "#3ea882", "#c97c4a", "#c95c88",
-  "#4a8dcc", "#b08a28", "#8752ba", "#38a09a",
-  "#b84c44", "#5060c0",
+const PALETTE_DARK = [
+  "#8f86e8", "#5fb39a", "#c2906b", "#c77e9e",
+  "#6e9fcc", "#b8a05c", "#9a7cc4", "#62aba6",
+  "#c07a72", "#7580c8",
 ];
-const ACCENT_FALLBACK = "#7c5cff";
-const VOID_BG = "#0a0c10";
-const LEAF_ZOOM = 0.5; // les feuilles n'apparaissent qu'au-delà de ce zoom
+const PALETTE_LIGHT = [
+  "#6a5fd1", "#3c8f76", "#a96f44", "#b25e85",
+  "#4b7fb0", "#8f7a35", "#7d5ba6", "#3f8a85",
+  "#a55a50", "#5563af",
+];
+const LEAF_ZOOM = 0.5; // seuil d'apparition des feuilles…
+const LEAF_FADE = 0.2; // …avec fondu sur cette plage de zoom
+
+// Couleurs du canvas lues depuis les tokens CSS (--canvas-*) : le canvas suit le thème.
+interface CanvasTheme {
+  dark: boolean;
+  bg: string;
+  dot: string;
+  wire: string;
+  label: string;
+  labelDim: string;
+  sel: string;
+  accent: string;
+  palette: string[];
+}
+
+function readTheme(): CanvasTheme {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (name: string, fb: string) => cs.getPropertyValue(name).trim() || fb;
+  const attr = document.documentElement.getAttribute("data-theme");
+  const dark = attr ? attr === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  return {
+    dark,
+    bg: v("--canvas-bg", "#07090d"),
+    dot: v("--canvas-dot", "rgba(205,216,235,0.07)"),
+    wire: v("--canvas-wire", "rgba(163,178,210,0.16)"),
+    label: v("--canvas-label", "rgba(212,218,230,0.72)"),
+    labelDim: v("--canvas-label-dim", "rgba(212,218,230,0.38)"),
+    sel: v("--canvas-sel", "rgba(255,255,255,0.85)"),
+    accent: v("--color-accent", "#9d8cff"),
+    palette: dark ? PALETTE_DARK : PALETTE_LIGHT,
+  };
+}
 
 function radiusOf(n: BrainNode): number {
   if (n.kind === "root")                             return 20;
@@ -47,12 +88,42 @@ function radiusOf(n: BrainNode): number {
   return 4; // leaf, page, concept, source
 }
 
-function isLeafKind(kind: string): boolean {
+export function isLeafKind(kind: string): boolean {
   return kind === "leaf" || kind === "page" || kind === "concept" || kind === "source";
 }
 
-function matches(n: BrainNode, q: string): boolean {
+export function matches(n: BrainNode, q: string): boolean {
   return [n.label, n.summary, ...n.keywords].join(" ").toLowerCase().includes(q);
+}
+
+const CLUSTER_FALLBACK = "#7f8aa8";
+
+/** Couleur de cluster par nœud : DFS pré-ordre depuis la racine, chaque `group`
+ *  prend la couleur suivante de la palette, ses descendants héritent.
+ *  Partagé entre le canvas et la palette de commande (mêmes couleurs partout). */
+export function buildClusterColors(graph: BrainGraph, palette: string[]): Map<string, string> {
+  const childrenByParent = new Map<string, BrainNode[]>();
+  for (const n of graph.nodes) {
+    if (!n.parent_id) continue;
+    if (!childrenByParent.has(n.parent_id)) childrenByParent.set(n.parent_id, []);
+    childrenByParent.get(n.parent_id)!.push(n);
+  }
+  const colors = new Map<string, string>();
+  const root = graph.nodes.find((n) => n.kind === "root");
+  if (!root) return colors;
+  let gci = 0;
+  const walk = (n: BrainNode, inherited: string) => {
+    const c = n.kind === "group" ? palette[gci++ % palette.length] : inherited;
+    colors.set(n.id, c);
+    for (const kid of childrenByParent.get(n.id) ?? []) walk(kid, c);
+  };
+  walk(root, CLUSTER_FALLBACK);
+  return colors;
+}
+
+/** Couleurs de clusters pour le thème courant. */
+export function clusterColors(graph: BrainGraph): Map<string, string> {
+  return buildClusterColors(graph, readTheme().palette);
 }
 
 function orbitR(N: number, maxR: number, gap: number, minR: number): number {
@@ -197,35 +268,19 @@ function hexA(hex: string, a: number): string {
   return `rgba(${r},${g},${b},${a})`;
 }
 
-/** Trace la membrane ondulante (soma) d'un nœud. */
-function neuronPath(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, phase: number, time: number) {
-  ctx.beginPath();
-  const seg = r > 16 ? 40 : 24;
-  for (let i = 0; i <= seg; i++) {
-    const a = (i / seg) * Math.PI * 2;
-    const wob = 1 + 0.10 * Math.sin(a * 3 + phase + time * 0.6) + 0.06 * Math.sin(a * 5 - phase * 1.3 + time * 0.4);
-    const rr = r * wob;
-    const nx = x + Math.cos(a) * rr, ny = y + Math.sin(a) * rr;
-    i === 0 ? ctx.moveTo(nx, ny) : ctx.lineTo(nx, ny);
-  }
-  ctx.closePath();
-}
-
-// ─── BrainMap (rendu canvas neuronal) ───────────────────────────────────────────
+// ─── BrainMap (rendu canvas constellation) ──────────────────────────────────────
 
 export function BrainMap({
   graph, onSelect, selectedId, query,
   revealKey = 0, streamLabels = [], streamTotal = 0,
-  spaces, onAddNodeToSpace, onCreateNote, onMoveNode,
+  spaces, onAddNodeToSpace, onMoveNode,
+  onBackgroundClick, panelOffset = 0, focus = null,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const [ctxMenu, setCtxMenu] = useState<{ nodeId: string; x: number; y: number } | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [newTitle, setNewTitle] = useState("");
-  const [newParent, setNewParent] = useState("");
-  const [accent, setAccent] = useState(ACCENT_FALLBACK);
+  const [theme, setTheme] = useState<CanvasTheme>(readTheme);
 
   const isGenesis = streamLabels.length > 0;
   const q = query.trim().toLowerCase();
@@ -238,26 +293,12 @@ export function BrainMap({
 
   const { infos, childrenOf } = useMemo(() => buildLayout(graph), [graph]);
 
-  // Couleur par nœud : racine = accent, note = ambre, sinon couleur du cluster.
+  // Couleur par nœud : racine = accent du thème, sinon couleur du cluster.
   const { colorOf, neighbors, maxR } = useMemo(() => {
-    const groupColor = new Map<string, string>();
-    let gci = 0;
+    const colorOf = buildClusterColors(graph, theme.palette);
     for (const info of infos.values()) {
-      if (info.node.kind === "group") groupColor.set(info.id, PALETTE[gci++ % PALETTE.length]);
-    }
-    const clusterColor = (info: NodeInfo): string => {
-      let cur: NodeInfo | undefined = info;
-      while (cur) {
-        const c = groupColor.get(cur.id);
-        if (c) return c;
-        cur = cur.parentId ? infos.get(cur.parentId) : undefined;
-      }
-      return "#7f8aa8";
-    };
-    const colorOf = new Map<string, string>();
-    for (const info of infos.values()) {
-      if (info.node.kind === "root") colorOf.set(info.id, accent);
-      else colorOf.set(info.id, clusterColor(info)); // notes incluses : couleur du cluster, pas d'orange
+      if (info.node.kind === "root") colorOf.set(info.id, theme.accent);
+      else if (!colorOf.has(info.id)) colorOf.set(info.id, CLUSTER_FALLBACK);
     }
     const neighbors = new Map<string, Set<string>>();
     const add = (a: string, b: string) => {
@@ -270,17 +311,22 @@ export function BrainMap({
     let maxR = 1;
     for (const info of infos.values()) maxR = Math.max(maxR, Math.hypot(info.finalX, info.finalY) + info.r);
     return { colorOf, neighbors, maxR: maxR + 30 };
-  }, [infos, accent]);
+  }, [graph, infos, theme]);
 
-  // Lit la couleur d'accent réelle du thème.
+  // Recharge les couleurs du canvas quand le thème change (toggle in-app ou OS).
   useEffect(() => {
-    const v = getComputedStyle(document.documentElement).getPropertyValue("--color-accent").trim();
-    if (v) setAccent(v);
+    const update = () => setTheme(readTheme());
+    const mo = new MutationObserver(update);
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    const mq = matchMedia("(prefers-color-scheme: dark)");
+    mq.addEventListener("change", update);
+    return () => { mo.disconnect(); mq.removeEventListener("change", update); };
   }, []);
 
   // Refs partagés avec la boucle de rendu / les handlers (évite les closures périmées).
   const cam = useRef({ x: 0, y: 0, zoom: 1 });
   const camTarget = useRef({ x: 0, y: 0, zoom: 1 });
+  const panelOff = useRef({ cur: 0, target: 0 });
   const needsFit = useRef(true);
   const dragOffsets = useRef(new Map<string, { dx: number; dy: number }>());
   const hovered = useRef<string | null>(null);
@@ -288,8 +334,8 @@ export function BrainMap({
 
   const S = useRef<any>(null);
   S.current = {
-    infos, childrenOf, colorOf, neighbors, q, selectedId, accent,
-    onSelect, onMoveNode, isGenesis, streamLabels, streamTotal, rootId,
+    infos, childrenOf, colorOf, neighbors, q, selectedId, theme,
+    onSelect, onMoveNode, onBackgroundClick, isGenesis, streamLabels, streamTotal, rootId,
   };
 
   // Refit caméra au chargement / à chaque régénération.
@@ -297,6 +343,24 @@ export function BrainMap({
     dragOffsets.current.clear();
     needsFit.current = true;
   }, [revealKey, maxR]);
+
+  // Décalage caméra quand le panneau détail est ouvert (lerpé dans draw()).
+  useEffect(() => {
+    panelOff.current.target = panelOffset;
+  }, [panelOffset]);
+
+  // Centrage animé sur un nœud (sélection depuis la palette ⌘K).
+  useEffect(() => {
+    if (!focus) return;
+    const info = infos.get(focus.id);
+    if (!info) return;
+    const o = dragOffsets.current.get(focus.id) ?? { dx: 0, dy: 0 };
+    camTarget.current = {
+      x: info.finalX + o.dx,
+      y: info.finalY + o.dy,
+      zoom: Math.max(1, cam.current.zoom),
+    };
+  }, [focus, infos]);
 
   // ── Boucle de rendu ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -325,8 +389,13 @@ export function BrainMap({
       const time = reduce ? 0 : ts / 1000;
       const c = cam.current, ct = camTarget.current;
 
+      // Décalage du centre quand le panneau détail est ouvert (suit le slide)
+      const po = panelOff.current;
+      po.cur += (po.target - po.cur) * 0.14;
+      const CX = (W - po.cur) / 2;
+
       if (needsFit.current && W > 0) {
-        const fit = Math.min(1, (Math.min(W, H) / 2 * 0.88) / maxR);
+        const fit = Math.min(1, (Math.min(W - po.target, H) / 2 * 0.88) / maxR);
         c.x = 0; c.y = 0; c.zoom = fit;
         ct.x = 0; ct.y = 0; ct.zoom = fit;
         needsFit.current = false;
@@ -334,44 +403,50 @@ export function BrainMap({
       // lerp caméra (pour le focus animé)
       c.x += (ct.x - c.x) * 0.14; c.y += (ct.y - c.y) * 0.14; c.zoom += (ct.zoom - c.zoom) * 0.14;
 
-      const sx = (wx: number) => W / 2 + (wx - c.x) * c.zoom;
+      const sx = (wx: number) => CX + (wx - c.x) * c.zoom;
       const sy = (wy: number) => H / 2 + (wy - c.y) * c.zoom;
-      const showLeaves = c.zoom >= LEAF_ZOOM;
+      const t = s.theme as CanvasTheme;
+      // Fondu des feuilles autour du seuil de zoom (plus de pop)
+      const leafA = Math.max(0, Math.min(1, (c.zoom - (LEAF_ZOOM - LEAF_FADE / 2)) / LEAF_FADE));
 
       // Fond
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.globalCompositeOperation = "source-over";
-      ctx.fillStyle = VOID_BG; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = t.bg; ctx.fillRect(0, 0, W, H);
       const ox = sx(0), oy = sy(0);
       let g = ctx.createRadialGradient(ox, oy, 0, ox, oy, Math.max(W, H) * 0.72);
-      g.addColorStop(0, "rgba(34,40,52,0.30)"); g.addColorStop(0.55, "rgba(16,20,28,0.14)"); g.addColorStop(1, "rgba(6,8,12,0)");
+      if (t.dark) { g.addColorStop(0, "rgba(34,40,58,0.5)"); g.addColorStop(1, "rgba(34,40,58,0)"); }
+      else        { g.addColorStop(0, "rgba(255,255,255,0.85)"); g.addColorStop(1, "rgba(255,255,255,0)"); }
       ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
       // grille de points
       const gap = 30, gox = ((ox % gap) + gap) % gap, goy = ((oy % gap) + gap) % gap;
-      ctx.fillStyle = "rgba(205,216,235,0.06)";
+      ctx.fillStyle = t.dot;
       for (let x = gox; x < W; x += gap) for (let y = goy; y < H; y += gap) { ctx.beginPath(); ctx.arc(x, y, 0.9, 0, Math.PI * 2); ctx.fill(); }
 
       // ── Genèse (pendant la génération) ──
       if (s.isGenesis) {
-        ctx.globalCompositeOperation = "lighter";
+        const lighter = t.dark ? "lighter" : "source-over";
+        ctx.globalCompositeOperation = lighter;
         const G = Math.max(s.streamTotal, s.streamLabels.length, 1);
         // orbe racine
         const rr = 34 + Math.sin(time * 1.6) * 3;
         let rg = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, rr * 3);
-        rg.addColorStop(0, "rgba(255,255,255,0.9)"); rg.addColorStop(0.3, hexA(s.accent, 0.7)); rg.addColorStop(1, hexA(s.accent, 0));
+        rg.addColorStop(0, t.dark ? "rgba(255,255,255,0.9)" : hexA(t.accent, 0.55));
+        rg.addColorStop(0.3, hexA(t.accent, 0.7)); rg.addColorStop(1, hexA(t.accent, 0));
         ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(W / 2, H / 2, rr * 3, 0, Math.PI * 2); ctx.fill();
         const R = Math.min(W, H) * 0.32;
         s.streamLabels.forEach((label: string, i: number) => {
           const a = (i / G) * Math.PI * 2 - Math.PI / 2;
           const nx = W / 2 + Math.cos(a) * R, ny = H / 2 + Math.sin(a) * R;
-          const col = PALETTE[i % PALETTE.length];
+          const col = t.palette[i % t.palette.length];
           let ng = ctx.createRadialGradient(nx, ny, 0, nx, ny, 40);
-          ng.addColorStop(0, hexA("#ffffff", 0.7)); ng.addColorStop(0.4, hexA(col, 0.5)); ng.addColorStop(1, hexA(col, 0));
+          ng.addColorStop(0, t.dark ? hexA("#ffffff", 0.7) : hexA(col, 0.55));
+          ng.addColorStop(0.4, hexA(col, 0.5)); ng.addColorStop(1, hexA(col, 0));
           ctx.fillStyle = ng; ctx.beginPath(); ctx.arc(nx, ny, 40, 0, Math.PI * 2); ctx.fill();
           ctx.globalCompositeOperation = "source-over";
-          ctx.font = "600 11px ui-sans-serif, system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-          ctx.fillStyle = "rgba(212,218,226,0.75)"; ctx.fillText(label, nx, ny + 26);
-          ctx.globalCompositeOperation = "lighter";
+          ctx.font = "500 11px ui-monospace, SFMono-Regular, Menlo, monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillStyle = t.label; ctx.fillText(label, nx, ny + 26);
+          ctx.globalCompositeOperation = lighter;
         });
         raf = requestAnimationFrame(draw);
         return;
@@ -379,98 +454,108 @@ export function BrainMap({
 
       const hv = hovered.current;
       const near = hv ? (id: string) => id === hv || (s.neighbors.get(hv)?.has(id) ?? false) : null;
-      const visible = (info: NodeInfo) => (isLeafKind(info.node.kind) ? showLeaves : true);
+      const visible = (info: NodeInfo) => (isLeafKind(info.node.kind) ? leafA > 0.02 : true);
 
-      ctx.globalCompositeOperation = "lighter";
-      ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(c.zoom, c.zoom); ctx.translate(-c.x, -c.y);
+      ctx.save(); ctx.translate(CX, H / 2); ctx.scale(c.zoom, c.zoom); ctx.translate(-c.x, -c.y);
 
-      // ── Filaments ──
+      // ── Filaments (hairlines droites, 1px écran) ──
+      ctx.lineCap = "round";
       for (const info of s.infos.values()) {
         const parent = info.parentId ? s.infos.get(info.parentId) : null;
         if (!parent) continue;
         if (!visible(info) || !visible(parent)) continue;
         const a = pos(parent), b = pos(info);
         const conn = !!hv && (info.id === hv || info.parentId === hv);
-        const k = hv ? (conn ? 1.9 : 0.15) : 1;
-        const ca = s.colorOf.get(parent.id)!, cb = s.colorOf.get(info.id)!;
-        const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
-        grad.addColorStop(0, hexA(ca, 0.26)); grad.addColorStop(0.5, "rgba(120,132,150,0.07)"); grad.addColorStop(1, hexA(cb, 0.26));
-        for (const [w, alpha] of [[3, 0.03], [1.4, 0.06], [0.7, 0.18]] as const) {
-          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-          ctx.strokeStyle = grad; ctx.globalAlpha = Math.min(1, alpha * k); ctx.lineWidth = conn ? w * 1.4 : w; ctx.lineCap = "round"; ctx.stroke();
-        }
-        ctx.globalAlpha = 1;
+        const fade = isLeafKind(info.node.kind) ? leafA : 1;
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+        ctx.globalAlpha = (hv ? (conn ? 1 : 0.15) : 1) * fade;
+        ctx.strokeStyle = conn ? hexA(s.colorOf.get(info.id)!, 0.7) : t.wire;
+        ctx.lineWidth = (conn ? 1.6 : 1) / c.zoom;
+        ctx.stroke();
       }
+      ctx.globalAlpha = 1;
 
-      // ── Nœuds ──
+      // ── Nœuds (constellation : point net + anneau fin) ──
       for (const info of s.infos.values()) {
         if (!visible(info)) continue;
         const p = pos(info);
-        const kind = info.node.kind;
-        const isRoot = kind === "root";
+        const isRoot = info.node.kind === "root";
         const color = s.colorOf.get(info.id)!;
         const isSel = info.id === s.selectedId;
         const dim = s.q && !matches(info.node, s.q) ? 0.12 : 1;
-        const vis = (hv && near ? (near(info.id) ? 1 : 0.24) : 1) * dim;
-        const boost = (info.id === hv ? 0.4 : 0) + (isSel ? 0.35 : 0);
+        const fade = isLeafKind(info.node.kind) ? leafA : 1;
+        const vis = (hv && near ? (near(info.id) ? 1 : 0.24) : 1) * dim * fade;
+        const boost = (info.id === hv ? 0.5 : 0) + (isSel ? 0.3 : 0);
         const phase = stableHash(info.id) * 6.28;
-        const pulse = 0.5 + 0.35 * Math.sin(time * (isRoot ? 1.4 : 0.9) + phase);
+        const pulse = 0.5 + 0.5 * Math.sin(time * (isRoot ? 1.2 : 0.8) + phase);
         const r = info.r;
         ctx.globalAlpha = vis;
 
-        // halo
-        const haloR = r * (isRoot ? 4 : 2.8) * (1 + boost * 0.25);
-        let hg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, haloR);
-        hg.addColorStop(0, hexA(color, (isRoot ? 0.24 : 0.15) + boost * 0.3));
-        hg.addColorStop(0.4, hexA(color, 0.05 + boost * 0.1)); hg.addColorStop(1, hexA(color, 0));
-        ctx.fillStyle = hg; ctx.beginPath(); ctx.arc(p.x, p.y, haloR, 0, Math.PI * 2); ctx.fill();
+        // halo très léger (racine et survol/sélection seulement)
+        if (isRoot || boost > 0) {
+          const haloR = r * 2.6;
+          const hg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, haloR);
+          hg.addColorStop(0, hexA(color, 0.10 + boost * 0.14));
+          hg.addColorStop(1, hexA(color, 0));
+          ctx.fillStyle = hg; ctx.beginPath(); ctx.arc(p.x, p.y, haloR, 0, Math.PI * 2); ctx.fill();
+        }
 
-        // membrane
-        neuronPath(ctx, p.x, p.y, r * (1 + boost * 0.06), phase, time);
-        let mg = ctx.createRadialGradient(p.x - r * 0.3, p.y - r * 0.3, 0, p.x, p.y, r * 1.3);
-        mg.addColorStop(0, hexA("#eef3f9", 0.4 + boost * 0.25)); mg.addColorStop(0.5, hexA(color, 0.3 + boost * 0.18)); mg.addColorStop(1, hexA(color, 0.04));
-        ctx.fillStyle = mg; ctx.fill();
-        ctx.lineWidth = 1; ctx.strokeStyle = hexA("#e6eefa", 0.16 + boost * 0.4); ctx.stroke();
+        // anneau fin (1px écran)
+        ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+        ctx.strokeStyle = hexA(color, 0.35 + boost * 0.4 + (isRoot ? 0.1 + 0.06 * pulse : 0));
+        ctx.lineWidth = 1 / c.zoom;
+        ctx.stroke();
+        if (isRoot) {
+          ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.5, 0, Math.PI * 2);
+          ctx.strokeStyle = hexA(color, 0.12 + 0.05 * pulse);
+          ctx.stroke();
+        }
+
+        // point
+        const dotR = Math.max(1.6, r * 0.5);
+        ctx.beginPath(); ctx.arc(p.x, p.y, dotR, 0, Math.PI * 2);
+        ctx.fillStyle = color; ctx.fill();
+        if (boost > 0) {
+          ctx.beginPath(); ctx.arc(p.x, p.y, dotR * 0.6, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(255,255,255,${Math.min(1, 0.3 + boost * 0.5)})`; ctx.fill();
+        }
 
         // sélection : anneau net
         if (isSel) {
-          ctx.lineWidth = 1.5; ctx.strokeStyle = hexA("#ffffff", 0.85);
-          ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.9, 0, Math.PI * 2); ctx.stroke();
+          ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.7, 0, Math.PI * 2);
+          ctx.strokeStyle = t.sel; ctx.lineWidth = 1.5 / c.zoom; ctx.stroke();
         }
-
-        // cœur
-        const coreR = r * (0.3 + 0.1 * pulse) * (1 + boost * 0.8);
-        const cg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, coreR * 2.4);
-        const hot = 0.3 + 0.24 * pulse + boost * 0.7;
-        cg.addColorStop(0, `rgba(255,255,255,${Math.min(1, hot)})`); cg.addColorStop(0.4, hexA("#eef3f9", Math.min(1, hot * 0.6))); cg.addColorStop(1, hexA(color, 0));
-        ctx.fillStyle = cg; ctx.beginPath(); ctx.arc(p.x, p.y, coreR * 2.4, 0, Math.PI * 2); ctx.fill();
       }
       ctx.globalAlpha = 1;
       ctx.restore();
 
-      // ── Labels (espace écran) ──
-      ctx.globalCompositeOperation = "source-over";
+      // ── Labels (espace écran, monospace, taille constante) ──
       for (const info of s.infos.values()) {
         if (!visible(info)) continue;
         const kind = info.node.kind;
         const isRoot = kind === "root";
-        const isContainer = !isLeafKind(kind) && !isRoot;
+        const isLeaf = isLeafKind(kind);
+        const isContainer = !isLeaf && !isRoot;
         const isHover = info.id === hv;
         const always = isRoot || (isContainer && kind === "group");
         const show = always || isHover || (!!hv && near!(info.id)) || info.id === s.selectedId;
         if (!show) continue;
         const p = pos(info);
         const px = sx(p.x), py = sy(p.y);
-        const fs = isRoot ? 14 : isContainer ? 11 : 10;
-        ctx.font = `${isRoot ? 700 : 600} ${fs}px ui-sans-serif, system-ui, sans-serif`;
+        const fs = isRoot ? 12 : isContainer ? 10.5 : 9.5;
+        ctx.font = `500 ${fs}px ui-monospace, SFMono-Regular, Menlo, monospace`;
         ctx.textAlign = "center"; ctx.textBaseline = "middle";
-        const ly = py + info.r * c.zoom + (isRoot ? 20 : 11);
-        const alpha = isHover ? 1 : (isRoot ? 0.9 : 0.55);
-        ctx.shadowColor = "rgba(0,0,0,0.85)"; ctx.shadowBlur = 6;
-        ctx.fillStyle = isHover ? "#ffffff" : hexA("#d4dae2", alpha);
-        ctx.fillText(info.node.label, px, ly);
+        const ly = py + info.r * c.zoom + (isRoot ? 18 : 12);
+        ctx.globalAlpha = isLeaf ? leafA : 1;
+        ctx.shadowColor = t.dark ? "rgba(0,0,0,0.7)" : "rgba(245,247,251,0.9)";
+        ctx.shadowBlur = 4;
+        ctx.fillStyle = isHover || info.id === s.selectedId ? t.sel : isLeaf ? t.labelDim : t.label;
+        (ctx as any).letterSpacing = isRoot ? "1.5px" : "0.4px";
+        ctx.fillText(isRoot ? info.node.label.toUpperCase() : info.node.label, px, ly);
         ctx.shadowBlur = 0;
       }
+      ctx.globalAlpha = 1;
+      (ctx as any).letterSpacing = "0px";
 
       raf = requestAnimationFrame(draw);
     };
@@ -478,9 +563,10 @@ export function BrainMap({
 
     // ── Interaction ──
     const rect = () => canvas.getBoundingClientRect();
+    const centerX = () => (canvas.clientWidth - panelOff.current.cur) / 2;
     const toWorld = (cx: number, cy: number) => {
       const c = cam.current, r = rect();
-      return { x: c.x + (cx - r.left - canvas.clientWidth / 2) / c.zoom, y: c.y + (cy - r.top - canvas.clientHeight / 2) / c.zoom };
+      return { x: c.x + (cx - r.left - centerX()) / c.zoom, y: c.y + (cy - r.top - canvas.clientHeight / 2) / c.zoom };
     };
     const showLeavesNow = () => cam.current.zoom >= LEAF_ZOOM;
     const nodeAt = (cx: number, cy: number): NodeInfo | null => {
@@ -539,6 +625,11 @@ export function BrainMap({
         if (info) S.current.onSelect(info.node);
         return;
       }
+      // Clic net sur le vide → fermeture du panneau détail.
+      if (d.moved < 4 && !d.id) {
+        S.current.onBackgroundClick?.();
+        return;
+      }
       // Déplacement d'un nœud lâché sur un autre → reparentage.
       if (d.mode === "node" && d.moved >= 4 && S.current.onMoveNode) {
         const info = S.current.infos.get(d.id!);
@@ -553,7 +644,7 @@ export function BrainMap({
       const f = Math.exp(-e.deltaY * 0.0015);
       const nz = Math.max(0.12, Math.min(4, c.zoom * f));
       c.zoom = nz; ct.zoom = nz;
-      c.x = w.x - (e.clientX - r.left - canvas.clientWidth / 2) / nz;
+      c.x = w.x - (e.clientX - r.left - centerX()) / nz;
       c.y = w.y - (e.clientY - r.top - canvas.clientHeight / 2) / nz;
       ct.x = c.x; ct.y = c.y;
     };
@@ -591,7 +682,7 @@ export function BrainMap({
 
   // ── Rendu React (canvas + overlays) ──────────────────────────────────────────
   return (
-    <div ref={wrapRef} style={{ width: "100%", height: "100%", position: "relative", overflow: "hidden", background: VOID_BG }}>
+    <div ref={wrapRef} style={{ width: "100%", height: "100%", position: "relative", overflow: "hidden", background: "var(--canvas-bg)" }}>
       <canvas ref={canvasRef} style={{ display: "block", position: "absolute", inset: 0 }} />
 
       {ctxMenu && (onMoveNode || (spaces && onAddNodeToSpace)) && (
@@ -648,44 +739,6 @@ export function BrainMap({
         </div>
       )}
 
-      {onCreateNote && !isGenesis && (
-        <button
-          onClick={() => { setNewTitle(""); setNewParent(rootId); setCreating(true); }}
-          title="Créer une note"
-          className="absolute bottom-5 right-5 z-20 h-11 w-11 rounded-full bg-[var(--color-accent,#7c5cff)] text-white text-2xl leading-none shadow-[var(--shadow-float)] hover:opacity-90 transition"
-        >
-          +
-        </button>
-      )}
-
-      {creating && onCreateNote && (
-        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/40" onClick={() => setCreating(false)}>
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="w-[340px] rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-4 shadow-[var(--shadow-float)]"
-          >
-            <p className="mb-3 text-sm font-semibold text-[var(--color-text)]">Nouvelle note</p>
-            <input
-              autoFocus value={newTitle} onChange={(e) => setNewTitle(e.target.value)}
-              placeholder="Titre de la note"
-              className="mb-3 w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-sm text-[var(--color-text)] outline-none"
-            />
-            <label className="mb-1 block text-[11px] uppercase tracking-wide text-[var(--color-muted)]">Rattacher à</label>
-            <select
-              value={newParent} onChange={(e) => setNewParent(e.target.value)}
-              className="mb-4 w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-sm text-[var(--color-text)] outline-none"
-            >
-              {parentCandidates.map(n => (
-                <option key={n.id} value={n.id}>{n.kind === "root" ? "Lucid (racine)" : n.label}</option>
-              ))}
-            </select>
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setCreating(false)} className="rounded-lg px-3 py-1.5 text-sm text-[var(--color-muted)] hover:bg-[var(--color-surface-2)]">Annuler</button>
-              <button onClick={() => { onCreateNote(newParent || rootId, newTitle); setCreating(false); }} className="rounded-lg bg-[var(--color-accent,#7c5cff)] px-3 py-1.5 text-sm text-white hover:opacity-90">Créer</button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

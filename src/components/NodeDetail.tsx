@@ -324,7 +324,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
             "flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] transition-all",
             saveStatus === "saving"
               ? "text-[var(--color-muted)]"
-              : "text-emerald-500",
+              : "text-[var(--color-ok)]",
           )}>
             {saveStatus === "saving"
               ? <Loader2 className="size-2.5 animate-spin" />
@@ -442,7 +442,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
           {/* Colonne gauche — métadonnées (non éditables) */}
           <div className="w-80 shrink-0 overflow-y-auto border-r border-[var(--color-border)] px-5 py-5 space-y-5">
             {synthError && (
-              <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+              <div className="rounded-lg border border-[var(--color-err)]/30 bg-[var(--color-err)]/10 px-3 py-2 text-xs text-[var(--color-err)]">
                 {synthError}
               </div>
             )}
@@ -489,12 +489,12 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
           <div className="flex-1 overflow-y-auto px-8 py-6">
             <div className="mx-auto max-w-2xl space-y-4">
               {display.summary && (
-                <div className="flex gap-2.5 rounded-lg border-l-2 border-purple-400/60 bg-purple-500/5 px-3 py-2.5">
-                  <Sparkles className="mt-0.5 size-3 shrink-0 text-purple-400" />
+                <div className="flex gap-2.5 rounded-lg border-l-2 border-[var(--color-accent)]/60 bg-[var(--color-accent-soft)] px-3 py-2.5">
+                  <Sparkles className="mt-0.5 size-3 shrink-0 text-[var(--color-accent)]" />
                   <div className="min-w-0">
-                    <span className="text-[10px] font-semibold uppercase tracking-wide text-purple-400">
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-accent)]">
                       Synthèse IA
-                      {synthTimestamp && <span className="ml-1.5 font-normal normal-case text-purple-400/60">· {relativeDate(synthTimestamp)}</span>}
+                      {synthTimestamp && <span className="ml-1.5 font-normal normal-case text-[var(--color-accent)]/60">· {relativeDate(synthTimestamp)}</span>}
                     </span>
                     <p className="mt-0.5 text-sm leading-relaxed text-[var(--color-text)]">{display.summary}</p>
                   </div>
@@ -530,15 +530,15 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
         // Mode panneau : colonne unique
         <div className="flex-1 overflow-y-auto px-5 py-4">
           {synthError && (
-            <div className="mb-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">{synthError}</div>
+            <div className="mb-3 rounded-lg border border-[var(--color-err)]/30 bg-[var(--color-err)]/10 px-3 py-2 text-xs text-[var(--color-err)]">{synthError}</div>
           )}
           {display.summary && (
-            <div className="mb-4 flex gap-2.5 rounded-lg border-l-2 border-purple-400/60 bg-purple-500/5 px-3 py-2.5">
-              <Sparkles className="mt-0.5 size-3 shrink-0 text-purple-400" />
+            <div className="mb-4 flex gap-2.5 rounded-lg border-l-2 border-[var(--color-accent)]/60 bg-[var(--color-accent-soft)] px-3 py-2.5">
+              <Sparkles className="mt-0.5 size-3 shrink-0 text-[var(--color-accent)]" />
               <div className="min-w-0">
-                <span className="text-[10px] font-semibold uppercase tracking-wide text-purple-400">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-accent)]">
                   Synthèse IA
-                  {synthTimestamp && <span className="ml-1.5 font-normal normal-case text-purple-400/60">· {relativeDate(synthTimestamp)}</span>}
+                  {synthTimestamp && <span className="ml-1.5 font-normal normal-case text-[var(--color-accent)]/60">· {relativeDate(synthTimestamp)}</span>}
                 </span>
                 <p className="mt-0.5 text-sm leading-relaxed text-[var(--color-text)]">{display.summary}</p>
               </div>

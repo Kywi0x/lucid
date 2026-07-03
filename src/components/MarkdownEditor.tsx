@@ -338,7 +338,7 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
             rows={2}
             className="mb-2 w-full resize-none rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] px-2.5 py-1.5 text-xs text-[var(--color-text)] outline-none"
           />
-          {promptError && <p className="mb-2 text-[11px] text-red-400">{promptError}</p>}
+          {promptError && <p className="mb-2 text-[11px] text-[var(--color-err)]">{promptError}</p>}
           <div className="flex items-center justify-between gap-2">
             <button
               type="button"

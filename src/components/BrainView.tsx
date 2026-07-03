@@ -25,7 +25,7 @@ export function GenerateEmpty({
         </p>
       </div>
       {error && (
-        <div className="flex items-center gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+        <div className="flex items-center gap-2 rounded-md border border-[var(--color-err)]/40 bg-[var(--color-err)]/10 px-3 py-2 text-sm text-[var(--color-err)]">
           <AlertTriangle className="size-4 shrink-0" />
           {error}
         </div>
