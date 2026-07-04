@@ -486,6 +486,94 @@ body {
 .prose-lucid ul { list-style: disc; padding-left: 1.25em; margin: 0.4em 0; }
 .prose-lucid ol { list-style: decimal; padding-left: 1.25em; margin: 0.4em 0; }
 .prose-lucid li { margin: 0.15em 0; line-height: 1.5; }
+
+/* Listes de tâches (GFM - [ ] / - [x]) : checkboxes cliquables façon Notion */
+.prose-lucid ul[data-type="taskList"] { list-style: none; padding-left: 0.25em; }
+.prose-lucid ul[data-type="taskList"] li { display: flex; gap: 0.5em; align-items: flex-start; }
+.prose-lucid ul[data-type="taskList"] li > label { flex: none; margin-top: 0.22em; }
+.prose-lucid ul[data-type="taskList"] li > div { flex: 1; min-width: 0; }
+.prose-lucid ul[data-type="taskList"] input[type="checkbox"] {
+  appearance: none; width: 0.95em; height: 0.95em; cursor: pointer;
+  border: 1.5px solid var(--color-muted); border-radius: 4px;
+  background: transparent; display: grid; place-content: center;
+  transition: background 0.12s, border-color 0.12s;
+}
+.prose-lucid ul[data-type="taskList"] input[type="checkbox"]:checked {
+  background: var(--color-accent); border-color: var(--color-accent);
+}
+.prose-lucid ul[data-type="taskList"] input[type="checkbox"]:checked::after {
+  content: ""; width: 0.5em; height: 0.28em;
+  border-left: 2px solid #fff; border-bottom: 2px solid #fff;
+  transform: rotate(-45deg) translate(1px, -1px);
+}
+.prose-lucid ul[data-type="taskList"] li[data-checked="true"] > div {
+  color: var(--color-muted); text-decoration: line-through;
+  text-decoration-color: var(--color-border);
+}
+/* Tâches imbriquées */
+.prose-lucid ul[data-type="taskList"] ul[data-type="taskList"] { margin: 0.15em 0 0; padding-left: 1.4em; }
+
+/* ─── Wikilinks [[Page]] : chip cliquable, texte stocké intact ─── */
+.prose-lucid .wikilink {
+  color: var(--color-accent);
+  background: var(--color-accent-soft);
+  border-radius: 4px;
+  padding: 0.05em 0.25em;
+  cursor: pointer;
+  transition: filter 0.12s;
+}
+.prose-lucid .wikilink:hover { filter: brightness(1.15); text-decoration: underline; }
+
+/* ─── Callouts Obsidian (> [!info] …) : blockquote coloré + badge ─── */
+.prose-lucid blockquote.callout {
+  border-radius: 8px;
+  padding: 0.6em 0.85em;
+  margin: 0.6em 0;
+  border-left-width: 3px;
+  border-left-style: solid;
+}
+.prose-lucid .callout .callout-marker {
+  font-family: ui-monospace, monospace;
+  font-size: 0.7em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-radius: 4px;
+  padding: 0.15em 0.4em;
+  margin-right: 0.4em;
+}
+.prose-lucid .callout-info     { border-left-color: #4c9aff; background: color-mix(in srgb, #4c9aff 9%, transparent); }
+.prose-lucid .callout-info .callout-marker     { background: color-mix(in srgb, #4c9aff 22%, transparent); color: #4c9aff; }
+.prose-lucid .callout-tip      { border-left-color: #3fb96b; background: color-mix(in srgb, #3fb96b 9%, transparent); }
+.prose-lucid .callout-tip .callout-marker      { background: color-mix(in srgb, #3fb96b 22%, transparent); color: #3fb96b; }
+.prose-lucid .callout-warning  { border-left-color: #e0a33c; background: color-mix(in srgb, #e0a33c 10%, transparent); }
+.prose-lucid .callout-warning .callout-marker  { background: color-mix(in srgb, #e0a33c 24%, transparent); color: #e0a33c; }
+.prose-lucid .callout-danger   { border-left-color: #e5484d; background: color-mix(in srgb, #e5484d 9%, transparent); }
+.prose-lucid .callout-danger .callout-marker   { background: color-mix(in srgb, #e5484d 22%, transparent); color: #e5484d; }
+.prose-lucid .callout-question { border-left-color: #9d7cd8; background: color-mix(in srgb, #9d7cd8 9%, transparent); }
+.prose-lucid .callout-question .callout-marker { background: color-mix(in srgb, #9d7cd8 22%, transparent); color: #9d7cd8; }
+.prose-lucid blockquote.callout { color: var(--color-text); }
+
+/* ─── Coloration syntaxique (lowlight/hljs) — palette sur variables du thème ─── */
+.prose-lucid pre {
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 0.75em 1em;
+  margin: 0.6em 0;
+  overflow-x: auto;
+}
+.prose-lucid pre code { background: none; padding: 0; font-size: 0.8rem; line-height: 1.55; }
+.prose-lucid .hljs-comment, .prose-lucid .hljs-quote { color: var(--color-muted); font-style: italic; }
+.prose-lucid .hljs-keyword, .prose-lucid .hljs-selector-tag, .prose-lucid .hljs-meta { color: #9d7cd8; }
+.prose-lucid .hljs-string, .prose-lucid .hljs-regexp, .prose-lucid .hljs-addition { color: #3fb96b; }
+.prose-lucid .hljs-number, .prose-lucid .hljs-literal, .prose-lucid .hljs-built_in { color: #e0a33c; }
+.prose-lucid .hljs-title, .prose-lucid .hljs-function, .prose-lucid .hljs-section { color: #4c9aff; }
+.prose-lucid .hljs-attr, .prose-lucid .hljs-attribute, .prose-lucid .hljs-variable, .prose-lucid .hljs-template-variable { color: #e5707a; }
+.prose-lucid .hljs-type, .prose-lucid .hljs-class .hljs-title { color: #56b6c2; }
+.prose-lucid .hljs-deletion { color: #e5484d; }
+.prose-lucid .hljs-emphasis { font-style: italic; }
+.prose-lucid .hljs-strong { font-weight: 700; }
 .prose-lucid code { font-family: monospace; font-size: 0.8em; background: var(--color-surface-2); border-radius: 3px; padding: 0.1em 0.35em; }
 .prose-lucid blockquote { border-left: 3px solid var(--color-accent); padding-left: 0.75em; color: var(--color-muted); margin: 0.5em 0; }
 .prose-lucid hr { border: none; border-top: 1px solid var(--color-border); margin: 0.75em 0; }
@@ -500,9 +588,44 @@ body {
 }
 
 /* Tables TipTap — même style que les tables de l'app */
-.prose-lucid table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin: 0.5em 0; }
-.prose-lucid th { background: var(--color-surface-2); color: var(--color-text); font-weight: 600; text-align: left; padding: 0.4em 0.6em; border: 1px solid var(--color-border); }
-.prose-lucid td { padding: 0.35em 0.6em; border: 1px solid var(--color-border); vertical-align: top; }
+/* Tableaux : coins arrondis, en-tête teinté, lignes zébrées douces, survol */
+.prose-lucid table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.8rem;
+  margin: 0.6em 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.prose-lucid th {
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  font-weight: 600;
+  text-align: left;
+  padding: 0.45em 0.7em;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-muted);
+}
+.prose-lucid td { padding: 0.4em 0.7em; vertical-align: top; }
+.prose-lucid th + th, .prose-lucid td + td { border-left: 1px solid var(--color-border); }
+.prose-lucid tr + tr td { border-top: 1px solid var(--color-border); }
+.prose-lucid tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--color-surface-2) 35%, transparent); }
+.prose-lucid tbody tr:hover td { background: color-mix(in srgb, var(--color-accent-soft) 60%, transparent); }
+.prose-lucid .selectedCell { background: var(--color-accent-soft) !important; }
+
+/* Images collées : responsives, arrondies, dans le thème */
+.prose-lucid img {
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  margin: 0.5em 0;
+  display: block;
+}
+.prose-lucid img.ProseMirror-selectednode { outline: 2px solid var(--color-accent); }
 .prose-lucid tr:nth-child(even) td { background: var(--color-surface); }
 .prose-lucid .selectedCell { background: var(--color-accent-soft) !important; }
 

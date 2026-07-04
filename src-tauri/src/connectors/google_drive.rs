@@ -464,7 +464,7 @@ fn which_bin(name: &str) -> Option<String> {
 
 /// pdftotext (poppler) en premier ; fallback OCR (pdftoppm + tesseract) pour les PDFs scannés.
 /// `brew install poppler tesseract tesseract-lang`
-fn pdf_to_markdown(path: &std::path::Path, name: &str) -> Option<String> {
+pub fn pdf_to_markdown(path: &std::path::Path, name: &str) -> Option<String> {
     eprintln!("🔍 Extraction PDF : {name}");
     if let Some(text) = run_pdftotext(path) {
         eprintln!("✅ pdftotext OK ({} chars)", text.len());

@@ -2,6 +2,8 @@ import {
   useMemo, useState, useEffect, useRef,
 } from "react";
 import type { BrainGraph, BrainNode, Space } from "@/lib/types";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { NodePicker } from "@/components/NodePicker";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -16,6 +18,8 @@ interface Props {
   spaces?: Space[];
   onAddNodeToSpace?: (nodeId: string, spaceId: string) => void;
   onMoveNode?: (nodeId: string, parentId: string) => void;
+  /** Fichiers déposés sur le canvas (drag & drop OS) → import sous `parentId`. */
+  onImportFiles?: (paths: string[], parentId: string) => void;
   /** Clic net sur le vide du canvas (ferme le panneau détail). */
   onBackgroundClick?: () => void;
   /** Largeur (px) occupée à droite par le panneau détail : le centre de la
@@ -84,6 +88,7 @@ function radiusOf(n: BrainNode): number {
   if (n.kind === "root")                             return 20;
   if (n.kind === "group")                            return 10;
   if (n.kind === "note")                             return 6;
+  if (n.kind === "pending")                          return 7; // proposition MCP (fantôme)
   if (n.kind === "espace" || n.kind === "container") return 6;
   return 4; // leaf, page, concept, source
 }
@@ -273,13 +278,14 @@ function hexA(hex: string, a: number): string {
 export function BrainMap({
   graph, onSelect, selectedId, query,
   revealKey = 0, streamLabels = [], streamTotal = 0,
-  spaces, onAddNodeToSpace, onMoveNode,
+  spaces, onAddNodeToSpace, onMoveNode, onImportFiles,
   onBackgroundClick, panelOffset = 0, focus = null,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const [ctxMenu, setCtxMenu] = useState<{ nodeId: string; x: number; y: number } | null>(null);
+  const [movePicker, setMovePicker] = useState<string | null>(null); // nodeId à déplacer
   const [theme, setTheme] = useState<CanvasTheme>(readTheme);
 
   const isGenesis = streamLabels.length > 0;
@@ -287,9 +293,11 @@ export function BrainMap({
 
   const rootId = useMemo(() => graph.nodes.find((n) => n.kind === "root")?.id ?? "", [graph]);
   const parentCandidates = useMemo(
-    () => graph.nodes.filter((n) => !isLeafKind(n.kind)),
+    () => graph.nodes.filter((n) => !isLeafKind(n.kind) && n.kind !== "pending"),
     [graph],
   );
+  // Ponts wikilinks ([[Page]] dans les contenus, calculés par App).
+  const linkEdges = useMemo(() => graph.edges.filter((e) => e.kind === "link"), [graph]);
 
   const { infos, childrenOf } = useMemo(() => buildLayout(graph), [graph]);
 
@@ -330,12 +338,15 @@ export function BrainMap({
   const needsFit = useRef(true);
   const dragOffsets = useRef(new Map<string, { dx: number; dy: number }>());
   const hovered = useRef<string | null>(null);
+  // Naissance des nouvelles bulles : id → timestamp de spawn (cascade).
+  const spawnAt = useRef(new Map<string, number>());
+  const prevIds = useRef<Set<string> | null>(null);
   const drag = useRef<{ mode: "node" | "pan"; id?: string; ids?: string[]; moved: number; sx: number; sy: number } | null>(null);
 
   const S = useRef<any>(null);
   S.current = {
-    infos, childrenOf, colorOf, neighbors, q, selectedId, theme,
-    onSelect, onMoveNode, onBackgroundClick, isGenesis, streamLabels, streamTotal, rootId,
+    infos, childrenOf, colorOf, neighbors, q, selectedId, theme, linkEdges,
+    onSelect, onMoveNode, onImportFiles, onBackgroundClick, isGenesis, streamLabels, streamTotal, rootId,
   };
 
   // Refit caméra au chargement / à chaque régénération.
@@ -343,6 +354,23 @@ export function BrainMap({
     dragOffsets.current.clear();
     needsFit.current = true;
   }, [revealKey, maxR]);
+
+  // Détecte les nœuds fraîchement apparus (proposition MCP, import, note…) et
+  // programme leur « pop » en cascade depuis leur parent. Ignoré au premier
+  // rendu, lors d'une régénération complète (genesis) et si l'OS demande
+  // moins d'animations.
+  useEffect(() => {
+    const ids = new Set(graph.nodes.map((n) => n.id));
+    const prev = prevIds.current;
+    prevIds.current = ids;
+    if (!prev || prev.size === 0) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const fresh = [...ids].filter((id) => !prev.has(id));
+    // Ajout incrémental seulement (une régénération remplace tout → genesis gère).
+    if (fresh.length === 0 || fresh.length > 80) return;
+    const now = performance.now();
+    fresh.forEach((id, i) => spawnAt.current.set(id, now + i * 90));
+  }, [graph]);
 
   // Décalage caméra quand le panneau détail est ouvert (lerpé dans draw()).
   useEffect(() => {
@@ -379,9 +407,30 @@ export function BrainMap({
     });
     ro.observe(wrapRef.current!);
 
-    const pos = (info: NodeInfo) => {
+    // Progression de naissance d'un nœud : 1 = né, 0 = pas encore, entre = en vol.
+    const spawnK = (id: string): number => {
+      const sp = spawnAt.current.get(id);
+      if (sp === undefined) return 1;
+      const el = (performance.now() - sp) / 650;
+      if (el >= 1) { spawnAt.current.delete(id); return 1; }
+      return Math.max(0, el);
+    };
+
+    const pos = (info: NodeInfo): { x: number; y: number } => {
       const o = dragOffsets.current.get(info.id) ?? { dx: 0, dy: 0 };
-      return { x: info.finalX + o.dx, y: info.finalY + o.dy };
+      let x = info.finalX + o.dx, y = info.finalY + o.dy;
+      const k = spawnK(info.id);
+      if (k < 1) {
+        // Naît depuis son parent (lui-même possiblement en vol → chaînes fluides).
+        const par = info.parentId ? S.current.infos.get(info.parentId) as NodeInfo | undefined : undefined;
+        if (par) {
+          const pp = pos(par);
+          const e = 1 - Math.pow(1 - k, 3); // easeOutCubic
+          x = pp.x + (x - pp.x) * e;
+          y = pp.y + (y - pp.y) * e;
+        }
+      }
+      return { x, y };
     };
 
     const draw = (ts: number) => {
@@ -475,12 +524,37 @@ export function BrainMap({
       }
       ctx.globalAlpha = 1;
 
+      // ── Ponts wikilinks : arcs pointillés entre pages liées par [[…]] ──
+      for (const e of s.linkEdges as { source: string; target: string }[]) {
+        const ia = s.infos.get(e.source), ib = s.infos.get(e.target);
+        if (!ia || !ib || !visible(ia) || !visible(ib)) continue;
+        const a = pos(ia), b = pos(ib);
+        const conn = !!hv && (e.source === hv || e.target === hv);
+        // Arc perpendiculaire léger pour se distinguer des filaments de l'arbre.
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const bow = Math.min(d * 0.18, 60);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.quadraticCurveTo(mx - (dy / d) * bow, my + (dx / d) * bow, b.x, b.y);
+        ctx.setLineDash([5 / c.zoom, 4 / c.zoom]);
+        ctx.globalAlpha = hv ? (conn ? 0.95 : 0.1) : 0.4;
+        ctx.strokeStyle = hexA(s.colorOf.get(e.source) ?? "#7f8aa8", conn ? 0.9 : 0.5);
+        ctx.lineWidth = (conn ? 1.6 : 1) / c.zoom;
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.globalAlpha = 1;
+
       // ── Nœuds (constellation : point net + anneau fin) ──
       for (const info of s.infos.values()) {
         if (!visible(info)) continue;
         const p = pos(info);
         const isRoot = info.node.kind === "root";
-        const color = s.colorOf.get(info.id)!;
+        const isPending = info.node.kind === "pending";
+        // Ambre fixe pour les propositions MCP : lisible dans les deux thèmes.
+        const color = isPending ? "#e0a33c" : s.colorOf.get(info.id)!;
         const isSel = info.id === s.selectedId;
         const dim = s.q && !matches(info.node, s.q) ? 0.12 : 1;
         const fade = isLeafKind(info.node.kind) ? leafA : 1;
@@ -488,8 +562,17 @@ export function BrainMap({
         const boost = (info.id === hv ? 0.5 : 0) + (isSel ? 0.3 : 0);
         const phase = stableHash(info.id) * 6.28;
         const pulse = 0.5 + 0.5 * Math.sin(time * (isRoot ? 1.2 : 0.8) + phase);
-        const r = info.r;
-        ctx.globalAlpha = vis;
+        // Pop de naissance : overshoot élastique + fondu.
+        const sk = spawnK(info.id);
+        if (sk <= 0) continue; // pas encore né
+        let rScale = 1, spawnAlpha = 1;
+        if (sk < 1) {
+          const c1 = 1.70158, c3 = c1 + 1;
+          rScale = 1 + c3 * Math.pow(sk - 1, 3) + c1 * Math.pow(sk - 1, 2);
+          spawnAlpha = Math.min(1, sk * 2.5);
+        }
+        const r = info.r * rScale;
+        ctx.globalAlpha = vis * spawnAlpha;
 
         // halo très léger (racine et survol/sélection seulement)
         if (isRoot || boost > 0) {
@@ -509,6 +592,15 @@ export function BrainMap({
           ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.5, 0, Math.PI * 2);
           ctx.strokeStyle = hexA(color, 0.12 + 0.05 * pulse);
           ctx.stroke();
+        }
+        // Proposition MCP : anneau pointillé pulsant (« fantôme » à valider)
+        if (isPending) {
+          ctx.setLineDash([4 / c.zoom, 3 / c.zoom]);
+          ctx.beginPath(); ctx.arc(p.x, p.y, r + 2 + pulse * 2, 0, Math.PI * 2);
+          ctx.strokeStyle = hexA(color, 0.35 + 0.4 * pulse);
+          ctx.lineWidth = 1.2 / c.zoom;
+          ctx.stroke();
+          ctx.setLineDash([]);
         }
 
         // point
@@ -532,12 +624,13 @@ export function BrainMap({
       // ── Labels (espace écran, monospace, taille constante) ──
       for (const info of s.infos.values()) {
         if (!visible(info)) continue;
+        if (spawnK(info.id) < 0.6) continue; // label après le pop de la bulle
         const kind = info.node.kind;
         const isRoot = kind === "root";
         const isLeaf = isLeafKind(kind);
         const isContainer = !isLeaf && !isRoot;
         const isHover = info.id === hv;
-        const always = isRoot || (isContainer && kind === "group");
+        const always = isRoot || (isContainer && kind === "group") || kind === "pending";
         const show = always || isHover || (!!hv && near!(info.id)) || info.id === s.selectedId;
         if (!show) continue;
         const p = pos(info);
@@ -594,7 +687,7 @@ export function BrainMap({
       if (e.button !== 0) return;
       setCtxMenu(null);
       const n = nodeAt(e.clientX, e.clientY);
-      const canDrag = !!n && n.node.kind !== "root" && !isLeafKind(n.node.kind);
+      const canDrag = !!n && n.node.kind !== "root" && !isLeafKind(n.node.kind) && n.node.kind !== "pending";
       // On garde toujours l'id du nœud sous le curseur → clic (sans déplacement) = sélection,
       // même pour une feuille/page non déplaçable (qui, elle, laisse le pan agir).
       drag.current = canDrag
@@ -657,7 +750,7 @@ export function BrainMap({
     const onCtx = (e: MouseEvent) => {
       e.preventDefault();
       const n = nodeAt(e.clientX, e.clientY);
-      if (n) setCtxMenu({ nodeId: n.id, x: e.clientX, y: e.clientY });
+      if (n && n.node.kind !== "pending") setCtxMenu({ nodeId: n.id, x: e.clientX, y: e.clientY });
       else setCtxMenu(null);
     };
 
@@ -668,6 +761,30 @@ export function BrainMap({
     canvas.addEventListener("dblclick", onDbl);
     canvas.addEventListener("contextmenu", onCtx);
 
+    // ── Drag & drop de fichiers OS (Tauri) : cible = bulle survolée (ou son
+    // parent si feuille), sinon la racine. Le ring de survol sert de feedback.
+    const fileDropTarget = (cx: number, cy: number): string => {
+      const n = nodeAt(cx, cy);
+      if (!n) return S.current.rootId;
+      if (n.node.kind === "pending") return n.parentId ?? S.current.rootId; // fantôme : pas encore réel
+      return isLeafKind(n.node.kind) ? (n.parentId ?? S.current.rootId) : n.id;
+    };
+    let unlistenDrop: (() => void) | undefined;
+    let dropDisposed = false;
+    getCurrentWebview().onDragDropEvent((ev) => {
+      if (!S.current.onImportFiles) return;
+      const dpr = window.devicePixelRatio || 1;
+      if (ev.payload.type === "over") {
+        hovered.current = fileDropTarget(ev.payload.position.x / dpr, ev.payload.position.y / dpr);
+      } else if (ev.payload.type === "drop") {
+        const target = fileDropTarget(ev.payload.position.x / dpr, ev.payload.position.y / dpr);
+        hovered.current = null;
+        S.current.onImportFiles(ev.payload.paths, target);
+      } else if (ev.payload.type === "leave") {
+        hovered.current = null;
+      }
+    }).then((un) => { if (dropDisposed) un(); else unlistenDrop = un; });
+
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
@@ -677,6 +794,8 @@ export function BrainMap({
       canvas.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("dblclick", onDbl);
       canvas.removeEventListener("contextmenu", onCtx);
+      dropDisposed = true;
+      unlistenDrop?.();
     };
   }, [maxR]); // relance si le graphe (donc maxR) change
 
@@ -687,57 +806,64 @@ export function BrainMap({
 
       {ctxMenu && (onMoveNode || (spaces && onAddNodeToSpace)) && (
         <div
-          style={{ position: "fixed", left: ctxMenu.x, top: ctxMenu.y, zIndex: 100 }}
-          className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] py-1 min-w-[180px]"
+          style={{
+            position: "fixed",
+            left: Math.min(ctxMenu.x, window.innerWidth - 220),
+            top: Math.min(ctxMenu.y, window.innerHeight - 200),
+            zIndex: 100,
+          }}
+          className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] py-1 min-w-[200px]"
         >
-          {onMoveNode && (() => {
-            const banned = new Set([ctxMenu.nodeId, ...getDescendants(ctxMenu.nodeId, childrenOf)]);
-            const curParent = infos.get(ctxMenu.nodeId)?.parentId ?? null;
-            const targets = parentCandidates.filter(n => !banned.has(n.id) && n.id !== curParent);
-            return (
-              <>
-                <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-                  Déplacer vers
-                </p>
-                <div className="max-h-52 overflow-auto">
-                  {targets.map(t => (
-                    <button key={t.id}
-                      onClick={() => { onMoveNode(ctxMenu.nodeId, t.id); setCtxMenu(null); }}
-                      className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] transition-colors truncate"
-                    >
-                      {t.label}
-                    </button>
-                  ))}
-                  {targets.length === 0 && (
-                    <p className="px-3 py-1.5 text-xs text-[var(--color-muted)]">Aucune destination</p>
-                  )}
-                </div>
-              </>
-            );
-          })()}
-          {onMoveNode && spaces && onAddNodeToSpace && (
-            <div className="my-1 border-t border-[var(--color-border)]" />
+          <p className="max-w-[240px] truncate px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+            {infos.get(ctxMenu.nodeId)?.node.label ?? ""}
+          </p>
+          <div className="my-1 border-t border-[var(--color-border)]" />
+          {onMoveNode && (
+            <button
+              onClick={() => { setMovePicker(ctxMenu.nodeId); setCtxMenu(null); }}
+              className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] transition-colors"
+            >
+              Déplacer vers…
+            </button>
           )}
           {spaces && onAddNodeToSpace && (
             <>
+              <div className="my-1 border-t border-[var(--color-border)]" />
               <p className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
                 Ajouter à la space
               </p>
-              {spaces.filter(s => s.id !== "lucid").map(s => (
-                <button key={s.id}
-                  onClick={() => { onAddNodeToSpace(ctxMenu.nodeId, s.id); setCtxMenu(null); }}
-                  className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] transition-colors"
-                >
-                  {s.name}
-                </button>
-              ))}
-              {spaces.filter(s => s.id !== "lucid").length === 0 && (
-                <p className="px-3 py-1.5 text-xs text-[var(--color-muted)]">Crée une space d&apos;abord</p>
-              )}
+              <div className="max-h-40 overflow-auto">
+                {spaces.filter(s => s.id !== "lucid").map(s => (
+                  <button key={s.id}
+                    onClick={() => { onAddNodeToSpace(ctxMenu.nodeId, s.id); setCtxMenu(null); }}
+                    className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] transition-colors truncate"
+                  >
+                    {s.name}
+                  </button>
+                ))}
+                {spaces.filter(s => s.id !== "lucid").length === 0 && (
+                  <p className="px-3 py-1.5 text-xs text-[var(--color-muted)]">Crée une space d&apos;abord</p>
+                )}
+              </div>
             </>
           )}
         </div>
       )}
+
+      {movePicker && onMoveNode && (() => {
+        const banned = new Set([movePicker, ...getDescendants(movePicker, childrenOf)]);
+        const curParent = infos.get(movePicker)?.parentId ?? null;
+        const targets = parentCandidates.filter(n => !banned.has(n.id) && n.id !== curParent);
+        return (
+          <NodePicker
+            title="Déplacer vers"
+            candidates={targets}
+            graph={graph}
+            onPick={(n) => { onMoveNode(movePicker, n.id); setMovePicker(null); }}
+            onClose={() => setMovePicker(null)}
+          />
+        );
+      })()}
 
     </div>
   );

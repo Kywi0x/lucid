@@ -171,9 +171,55 @@ export function saveNodeContent(nodeId: string, content: string): Promise<void> 
   return invoke("save_node_content", { nodeId, content });
 }
 
+/** Crée une arborescence de pages depuis une consigne (IA locale).
+ *  Les nœuds créés sont ajoutés à `spaceId` s'il est fourni (visibilité dans
+ *  la vue filtrée). Renvoie [label racine, nombre de nœuds créés]. */
+export function createStructure(instruction: string, parentId?: string, spaceId?: string | null): Promise<[string, number]> {
+  return invoke("create_structure", { instruction, parentId: parentId ?? null, spaceId: spaceId ?? null });
+}
+
 /** Crée un nœud « note » (prise de note) rattaché à `parentId`. Renvoie le nœud créé. */
 export function createNoteNode(parentId: string, label: string): Promise<import("./types").BrainNode> {
   return invoke("create_note_node", { parentId, label });
+}
+
+/** Importe un fichier local (PDF, DOC/DOCX/RTF, TXT/MD, CSV) converti en markdown,
+ *  créé comme nœud note sous `parentId`. Renvoie le nœud créé. */
+export function importFile(path: string, parentId: string): Promise<import("./types").BrainNode> {
+  return invoke("import_file", { path, parentId });
+}
+
+/** Statut des clients IA installés (Claude Desktop/Code, Cursor) vis-à-vis du MCP Lucid. */
+export function aiClientsStatus(): Promise<import("./types").AiClientStatus[]> {
+  return invoke("ai_clients_status");
+}
+
+/** Connecte le serveur MCP Lucid au client (écrit sa config, backup préalable).
+ *  Renvoie un message d'instruction (ex. « redémarre Claude Desktop »). */
+export function connectAiClient(id: string): Promise<string> {
+  return invoke("connect_ai_client", { id });
+}
+
+/** Retire le MCP Lucid de la config du client. */
+export function disconnectAiClient(id: string): Promise<void> {
+  return invoke("disconnect_ai_client", { id });
+}
+
+/** Sauvegarde une image collée (éditeur) dans le dossier de données ; renvoie
+ *  le chemin relatif `assets/img-….ext` à mettre dans le markdown. */
+export function savePastedImage(bytes: Uint8Array, ext: string): Promise<string> {
+  return invoke("save_pasted_image", { bytes: Array.from(bytes), ext });
+}
+
+/** Liste les propositions de création déposées par le serveur MCP (en attente). */
+export function listMcpProposals(): Promise<import("./types").McpProposal[]> {
+  return invoke("list_mcp_proposals");
+}
+
+/** Accepte (insère, ancêtres d'abord) ou refuse (supprime, descendants compris)
+ *  une proposition MCP. Renvoie le nombre de propositions traitées. */
+export function resolveMcpProposal(id: string, accept: boolean): Promise<number> {
+  return invoke("resolve_mcp_proposal", { id, accept });
 }
 
 /** Déplace un nœud sous un nouveau parent (refuse les cycles). */

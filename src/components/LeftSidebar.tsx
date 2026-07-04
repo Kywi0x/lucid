@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Layers, MessageCircle, Send, Loader2, X } from "lucide-react";
-import { askBrain } from "@/lib/api";
+import { askBrain, createStructure } from "@/lib/api";
 import type { Space } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -77,7 +77,10 @@ export function SpacesPanel({
 
 interface ChatMsg { role: "user" | "assistant"; text: string; }
 
-export function AssistantPanel({ onClose }: { onClose?: () => void }) {
+// ponytail: détection d'intention par regex, un classifieur LLM si trop de faux positifs
+const CREATE_INTENT = /\b(cr[ée]{2}r?|g[ée]n[èe]re|ajoute|construis|fais(?:-moi)?)\b.*\b(structure|arborescence|pages?|nœuds?|noeuds?)\b/i;
+
+export function AssistantPanel({ onClose, onGraphChange, activeSpaceId }: { onClose?: () => void; onGraphChange?: () => void; activeSpaceId?: string | null }) {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -89,8 +92,14 @@ export function AssistantPanel({ onClose }: { onClose?: () => void }) {
     setMessages((m) => [...m, { role: "user", text: q }]);
     setLoading(true);
     try {
-      const answer = await askBrain(q);
-      setMessages((m) => [...m, { role: "assistant", text: answer }]);
+      if (CREATE_INTENT.test(q)) {
+        const [label, count] = await createStructure(q, undefined, activeSpaceId);
+        setMessages((m) => [...m, { role: "assistant", text: `✅ Structure « ${label} » créée (${count} page${count > 1 ? "s" : ""}).` }]);
+        onGraphChange?.();
+      } else {
+        const answer = await askBrain(q);
+        setMessages((m) => [...m, { role: "assistant", text: answer }]);
+      }
     } catch (e) {
       setMessages((m) => [...m, { role: "assistant", text: `⚠️ ${e}` }]);
     } finally { setLoading(false); }
@@ -103,7 +112,8 @@ export function AssistantPanel({ onClose }: { onClose?: () => void }) {
         {messages.length === 0 && (
           <p className="px-1 pt-2 text-xs leading-relaxed text-[var(--color-muted)]">
             Pose une question sur ton second cerveau — l'IA locale répond à partir
-            de ton <code>brain.md</code>.
+            de ton <code>brain.md</code>. Tu peux aussi lui demander de créer des
+            pages : « crée une structure pour gérer un projet web ».
           </p>
         )}
         {messages.map((m, i) => (

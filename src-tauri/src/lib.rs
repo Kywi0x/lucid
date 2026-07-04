@@ -3,6 +3,7 @@
 
 mod ai;
 mod connectors;
+mod mcp_clients;
 mod models;
 
 use ai::{pipeline, LlamaEngine};
@@ -611,17 +612,32 @@ fn save_node_content(node_id: String, content: String) -> Result<(), String> {
 /// Persisté dans brain.json ; préservé lors des régénérations (kind == "note").
 #[tauri::command]
 fn create_note_node(parent_id: String, label: String) -> Result<BrainNode, String> {
+    insert_note_node(parent_id, label, String::new())
+}
+
+/// Insère un nœud note (avec contenu markdown éventuel) dans brain.json.
+/// Cœur partagé entre `create_note_node` et `import_file`.
+fn insert_note_node(parent_id: String, label: String, content: String) -> Result<BrainNode, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    insert_note_node_in(&dir, format!("note-{ts}"), parent_id, label, content)
+}
+
+/// Variante injectable (id + dossier de données explicites) — testable, et
+/// utilisée par l'acceptation des propositions MCP (l'id de la proposition
+/// devient l'id du nœud, ce qui garde valides les références parent en chaîne).
+fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, label: String, content: String) -> Result<BrainNode, String> {
     let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
     let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if !graph.nodes.iter().any(|n| n.id == parent_id) {
         return Err(format!("Nœud parent {parent_id} introuvable."));
     }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let id = format!("note-{ts}");
+    if graph.nodes.iter().any(|n| n.id == id) {
+        return Err(format!("Nœud {id} déjà présent."));
+    }
     let node = BrainNode {
         id: id.clone(),
         label: {
@@ -637,7 +653,7 @@ fn create_note_node(parent_id: String, label: String) -> Result<BrainNode, Strin
         community: 0,
         parent_id: Some(parent_id.clone()),
         synthesized_at: None,
-        content: String::new(),
+        content,
         connector: None,
         source_id: None,
         source_project: None,
@@ -649,6 +665,405 @@ fn create_note_node(parent_id: String, label: String) -> Result<BrainNode, Strin
     std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     Ok(node)
+}
+
+/// Importe un fichier local (PDF, DOC/DOCX/RTF, TXT/MD, CSV) : conversion en
+/// markdown puis création d'un nœud note sous `parent_id`.
+#[tauri::command]
+fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
+    let p = std::path::Path::new(&path);
+    let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Fichier importé").to_string();
+    let ext = p.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
+    let content = match ext.as_str() {
+        "pdf" => connectors::google_drive::pdf_to_markdown(p, &label)
+            .ok_or("Extraction PDF impossible (pdftotext/tesseract requis — brew install poppler tesseract).")?,
+        "doc" | "docx" | "rtf" => textutil_to_text(p)?,
+        "txt" | "md" | "markdown" => read_lossy(p)?,
+        "csv" => csv_to_markdown(&read_lossy(p)?),
+        other => return Err(format!("Format non supporté : .{other}")),
+    };
+    if content.trim().is_empty() {
+        return Err("Le fichier ne contient aucun texte exploitable.".into());
+    }
+    insert_note_node(parent_id, label, content)
+}
+
+// ─── Propositions MCP (écriture validée par l'utilisateur) ─────────────────────
+//
+// Le serveur MCP (`lucid_mcp`) ne touche jamais brain.json : il dépose une
+// proposition par fichier dans `mcp_pending/`. L'app les affiche (bulles
+// fantômes + panneau) ; seule l'acceptation écrit dans brain.json — un seul
+// écrivain, pas de course. L'id de la proposition devient l'id du nœud accepté,
+// ce qui permet à l'IA de construire des arbres (parent_id = id d'une
+// proposition précédente).
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct McpProposal {
+    id: String,
+    parent_id: String,
+    label: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    created_at: String,
+}
+
+fn mcp_pending_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("mcp_pending")
+}
+
+fn load_proposals_in(dir: &std::path::Path) -> Vec<McpProposal> {
+    let mut out: Vec<McpProposal> = std::fs::read_dir(mcp_pending_dir(dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok())
+        .collect();
+    out.sort_by(|a: &McpProposal, b: &McpProposal| a.id.cmp(&b.id));
+    out
+}
+
+/// Accepte (insère dans brain.json, ancêtres pending d'abord) ou refuse
+/// (supprime, descendants compris) une proposition. Renvoie le nombre de
+/// propositions traitées.
+fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<usize, String> {
+    let props = load_proposals_in(dir);
+    let target = props.iter().find(|p| p.id == id)
+        .ok_or_else(|| format!("Proposition {id} introuvable."))?;
+
+    if accept {
+        // Chaîne d'ancêtres encore pending (accepter un enfant accepte ses parents).
+        let mut chain = vec![target.clone()];
+        let mut cur_parent = target.parent_id.clone();
+        while let Some(p) = props.iter().find(|p| p.id == cur_parent) {
+            chain.push(p.clone());
+            cur_parent = p.parent_id.clone();
+        }
+        chain.reverse();
+        for p in &chain {
+            insert_note_node_in(dir, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone())?;
+            std::fs::remove_file(mcp_pending_dir(dir).join(format!("{}.json", p.id)))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(chain.len())
+    } else {
+        // Refus récursif : les descendants pending tombent avec le parent.
+        let mut doomed = vec![id.to_string()];
+        let mut i = 0;
+        while i < doomed.len() {
+            for p in &props {
+                if p.parent_id == doomed[i] && !doomed.contains(&p.id) {
+                    doomed.push(p.id.clone());
+                }
+            }
+            i += 1;
+        }
+        for rid in &doomed {
+            let _ = std::fs::remove_file(mcp_pending_dir(dir).join(format!("{rid}.json")));
+        }
+        Ok(doomed.len())
+    }
+}
+
+/// Liste les propositions en attente déposées par le serveur MCP.
+#[tauri::command]
+fn list_mcp_proposals() -> Result<Vec<McpProposal>, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    Ok(load_proposals_in(&dir))
+}
+
+/// Accepte ou refuse une proposition MCP.
+#[tauri::command]
+fn resolve_mcp_proposal(id: String, accept: bool) -> Result<usize, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    resolve_proposal_in(&dir, &id, accept)
+}
+
+/// Statut des clients IA (Claude Desktop/Code, Cursor) : installés ? connectés au MCP Lucid ?
+#[tauri::command]
+fn ai_clients_status() -> Vec<mcp_clients::AiClientStatus> {
+    mcp_clients::status()
+}
+
+/// Connexion one-click : écrit `mcpServers.lucid` dans la config du client (avec backup).
+#[tauri::command]
+fn connect_ai_client(id: String) -> Result<String, String> {
+    mcp_clients::connect(&id)
+}
+
+/// Retire l'entrée MCP Lucid de la config du client.
+#[tauri::command]
+fn disconnect_ai_client(id: String) -> Result<(), String> {
+    mcp_clients::disconnect(&id)
+}
+
+/// Sauvegarde une image collée dans l'éditeur → `assets/img-{ts}.{ext}`.
+/// Le markdown stocke le chemin relatif (`![](assets/…)`), l'affichage passe
+/// par le protocole asset de Tauri.
+#[tauri::command]
+fn save_pasted_image(bytes: Vec<u8>, ext: String) -> Result<String, String> {
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        return Err(format!("Format d'image non supporté : {ext}"));
+    }
+    if bytes.is_empty() { return Err("Image vide.".into()); }
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let assets = dir.join("assets");
+    std::fs::create_dir_all(&assets).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("img-{ts}.{ext}");
+    std::fs::write(assets.join(&name), &bytes).map_err(|e| e.to_string())?;
+    Ok(format!("assets/{name}"))
+}
+
+/// Lecture tolérante aux encodages non-UTF-8 (latin-1…).
+fn read_lossy(p: &std::path::Path) -> Result<String, String> {
+    std::fs::read(p)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .map_err(|e| e.to_string())
+}
+
+// ponytail: textutil = natif macOS ; passer à une crate docx le jour du port Windows.
+fn textutil_to_text(p: &std::path::Path) -> Result<String, String> {
+    let out = std::process::Command::new("textutil")
+        .args(["-convert", "txt", "-stdout"])
+        .arg(p)
+        .output()
+        .map_err(|e| format!("textutil : {e}"))?;
+    if !out.status.success() {
+        return Err(format!("textutil a échoué : {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod mcp_proposal_tests {
+    use super::*;
+
+    fn setup(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("brainlink_test_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(mcp_pending_dir(&dir)).unwrap();
+        let graph = serde_json::json!({
+            "nodes": [{ "id": "root", "label": "Lucid", "kind": "root", "weight": 0,
+                        "summary": "", "keywords": [], "decisions": [], "patterns": [],
+                        "community": 0, "parent_id": null, "synthesized_at": null,
+                        "content": "", "connector": null, "source_id": null, "source_project": null }],
+            "edges": [], "markdown": "", "report": "", "generated_at": ""
+        });
+        std::fs::write(dir.join("brain.json"), graph.to_string()).unwrap();
+        dir
+    }
+
+    fn propose(dir: &std::path::Path, id: &str, parent: &str, label: &str) {
+        let p = McpProposal { id: id.into(), parent_id: parent.into(), label: label.into(),
+                              content: String::new(), created_at: String::new() };
+        std::fs::write(mcp_pending_dir(dir).join(format!("{id}.json")),
+                       serde_json::to_string(&p).unwrap()).unwrap();
+    }
+
+    fn graph_ids(dir: &std::path::Path) -> Vec<String> {
+        let g: BrainGraph = serde_json::from_str(&std::fs::read_to_string(dir.join("brain.json")).unwrap()).unwrap();
+        g.nodes.iter().map(|n| n.id.clone()).collect()
+    }
+
+    #[test]
+    fn accepter_un_enfant_accepte_ses_ancetres_dans_l_ordre() {
+        let dir = setup("chain");
+        propose(&dir, "mcp-1", "root", "Parent");
+        propose(&dir, "mcp-2", "mcp-1", "Enfant");
+        propose(&dir, "mcp-3", "mcp-2", "Petit-enfant");
+        // Accepter le petit-enfant doit insérer les 3, parents d'abord.
+        assert_eq!(resolve_proposal_in(&dir, "mcp-3", true).unwrap(), 3);
+        let ids = graph_ids(&dir);
+        assert!(ids.contains(&"mcp-1".into()) && ids.contains(&"mcp-3".into()));
+        assert!(load_proposals_in(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuser_un_parent_supprime_ses_descendants() {
+        let dir = setup("reject");
+        propose(&dir, "mcp-1", "root", "Parent");
+        propose(&dir, "mcp-2", "mcp-1", "Enfant");
+        propose(&dir, "mcp-9", "root", "Autre");
+        assert_eq!(resolve_proposal_in(&dir, "mcp-1", false).unwrap(), 2);
+        let rest = load_proposals_in(&dir);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, "mcp-9");
+        assert_eq!(graph_ids(&dir).len(), 1); // rien inséré
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::csv_to_markdown;
+
+    #[test]
+    fn csv_virgule() {
+        let md = csv_to_markdown("nom,age\nAlice,30\nBob,25");
+        assert!(md.starts_with("| nom | age |\n| --- | --- |\n"));
+        assert!(md.contains("| Alice | 30 |"));
+    }
+
+    #[test]
+    fn csv_point_virgule_et_pipe() {
+        let md = csv_to_markdown("a;b\nx|y;\"z\"");
+        assert!(md.contains("| a | b |"));
+        assert!(md.contains("| x\\|y | z |")); // pipe échappé, quotes retirées
+    }
+
+    #[test]
+    fn docx_via_textutil() {
+        // Round-trip : txt → docx (textutil) → notre extraction. macOS only.
+        let dir = std::env::temp_dir().join("brainlink_test_import");
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("essai.txt");
+        std::fs::write(&txt, "Bonjour LucidFlow").unwrap();
+        let ok = std::process::Command::new("textutil")
+            .args(["-convert", "docx", "-output"])
+            .arg(dir.join("essai.docx"))
+            .arg(&txt)
+            .status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok, "textutil indisponible");
+        let out = super::textutil_to_text(&dir.join("essai.docx")).unwrap();
+        assert!(out.contains("Bonjour LucidFlow"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn csv_tronque_a_200_lignes() {
+        let raw = std::iter::once("col".to_string())
+            .chain((0..300).map(|i| i.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let md = csv_to_markdown(&raw);
+        assert!(md.contains("tronqué"));
+        assert!(!md.contains("| 250 |"));
+    }
+}
+
+/// CSV → tableau markdown. Délimiteur `,` ou `;` auto-détecté, 200 lignes max.
+// ponytail: split naïf — les champs quotés contenant le délimiteur seront mal découpés.
+fn csv_to_markdown(raw: &str) -> String {
+    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+    let Some(header) = lines.next() else { return String::new() };
+    let delim = if header.matches(';').count() > header.matches(',').count() { ';' } else { ',' };
+    let cells = |l: &str| l.split(delim)
+        .map(|c| c.trim().trim_matches('"').replace('|', "\\|"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let cols = header.split(delim).count();
+    let mut md = format!("| {} |\n|{}\n", cells(header), " --- |".repeat(cols));
+    let mut truncated = false;
+    for (i, l) in lines.enumerate() {
+        if i >= 200 { truncated = true; break; }
+        md.push_str(&format!("| {} |\n", cells(l)));
+    }
+    if truncated { md.push_str("\n*… tronqué à 200 lignes.*\n"); }
+    md
+}
+
+/// Crée une arborescence de pages à partir d'une consigne en langage naturel
+/// (ex. « une structure pour gérer un projet web »). Gemma propose l'arbre en JSON,
+/// les nœuds sont créés en `kind: "note"` → préservés lors des régénérations.
+/// Si `space_id` est fourni, les nœuds créés sont ajoutés à cet espace (sinon
+/// ils seraient invisibles dans la vue filtrée). Retourne (label racine, nb créés).
+#[tauri::command]
+async fn create_structure(instruction: String, parent_id: Option<String>, space_id: Option<String>) -> Result<(String, usize), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let engine = LlamaEngine::detect()?;
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+        let raw = std::fs::read_to_string(dir.join("brain.json"))
+            .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
+        let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+
+        let parent = match parent_id {
+            Some(p) if graph.nodes.iter().any(|n| n.id == p) => p,
+            Some(p) => return Err(format!("Nœud parent {p} introuvable.")),
+            None => graph.nodes.iter().find(|n| n.kind == "root")
+                .map(|n| n.id.clone())
+                .ok_or("Nœud racine introuvable.")?,
+        };
+
+        // Même technique que synthesize_node : le prompt se termine par l'ouverture
+        // du JSON, le modèle ne peut que le compléter.
+        let prompt = format!(
+            "Tu organises un second cerveau. L'utilisateur demande :\n« {instruction} »\n\n\
+Propose une arborescence de pages pour organiser ça. Format : un objet JSON avec \
+\"label\" (titre court en français), \"summary\" (une phrase, optionnelle), \
+\"content\" (corps markdown template de la page : 2 à 3 titres ## avec listes à puces, \
+concis) et \"children\" (liste de sous-pages, même format, 2 niveaux maximum, \
+4 à 6 pages par niveau).\n\n\
+{{\"label\": \""
+        );
+        let completion = engine.complete(
+            Some("Complete the JSON. Output only the JSON continuation, no other text."),
+            &prompt,
+            3000,
+        )?;
+        // Gemma continue parfois le préfixe, parfois régénère le JSON complet :
+        // on tente les deux interprétations.
+        let spec = ai::pipeline::parse_structure(&format!("{{\"label\": \"{completion}"))
+            .or_else(|| ai::pipeline::parse_structure(&completion))
+            .ok_or_else(|| format!("Réponse IA invalide : {completion}"))?;
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut counter = 0usize;
+        fn insert(graph: &mut BrainGraph, parent: &str, spec: &ai::pipeline::StructureSpec, ts: u128, counter: &mut usize) {
+            *counter += 1;
+            let id = format!("note-{ts}-{counter}");
+            graph.nodes.push(BrainNode {
+                id: id.clone(),
+                label: spec.label.clone(),
+                kind: "note".into(),
+                weight: 0,
+                summary: spec.summary.clone(),
+                keywords: vec![],
+                decisions: vec![],
+                patterns: vec![],
+                community: 0,
+                parent_id: Some(parent.to_string()),
+                synthesized_at: None,
+                content: spec.content.clone(),
+                connector: None,
+                source_id: None,
+                source_project: None,
+            });
+            graph.edges.push(BrainEdge {
+                source: parent.to_string(), target: id.clone(),
+                kind: "contains".into(), relation: "contains".into(),
+            });
+            for child in &spec.children {
+                insert(graph, &id, child, ts, counter);
+            }
+        }
+        insert(&mut graph, &parent, &spec, ts, &mut counter);
+
+        std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+
+        // Rend les nœuds visibles dans l'espace actif (les ids sont déterministes :
+        // note-{ts}-{1..=counter}).
+        if let Some(sid) = space_id.filter(|s| s != "lucid") {
+            let mut spaces = load_spaces(&dir);
+            if let Some(space) = spaces.iter_mut().find(|s| s.id == sid) {
+                let ids = space.node_ids.get_or_insert_with(Vec::new);
+                ids.extend((1..=counter).map(|i| format!("note-{ts}-{i}")));
+                save_spaces(&dir, &spaces);
+            }
+        }
+        Ok((spec.label.clone(), counter))
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
 /// Re-rattache `node_id` sous `parent_id` (déplacement/lien dans la mind map).
@@ -1153,6 +1568,14 @@ pub fn run() {
             save_node_content,
             load_node_content,
             create_note_node,
+            create_structure,
+            import_file,
+            list_mcp_proposals,
+            resolve_mcp_proposal,
+            save_pasted_image,
+            ai_clients_status,
+            connect_ai_client,
+            disconnect_ai_client,
             set_node_parent,
             rename_node,
             obsidian_set_vault,

@@ -2,14 +2,21 @@ import { useEffect, useRef, useState } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import { BubbleMenu, FloatingMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
+import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { Table } from "@tiptap/extension-table";
 import TableRow from "@tiptap/extension-table-row";
 import TableHeader from "@tiptap/extension-table-header";
 import TableCell from "@tiptap/extension-table-cell";
 import Placeholder from "@tiptap/extension-placeholder";
 import { Markdown } from "tiptap-markdown";
+import CodeBlockLowlight from "@tiptap/extension-code-block-lowlight";
+import { common, createLowlight } from "lowlight";
+import { MdDecorations, LucidImage } from "@/lib/editorEnhancements";
+import { savePastedImage } from "@/lib/api";
+
+const lowlight = createLowlight(common);
 import {
-  Bold, Italic, Heading2, Heading3, List, ListOrdered,
+  Bold, Italic, Heading2, Heading3, List, ListOrdered, CheckSquare,
   Code, Table as TableIcon, RowsIcon, Columns3, Trash2, Plus, FileText, Sparkles, Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -23,6 +30,10 @@ interface Props {
   onSlashPage?: () => void;
   /** Génère du contenu markdown selon une consigne (contexte : page + sous-pages si demandé). */
   onGenerate?: (instruction: string, includeChildren: boolean) => Promise<string>;
+  /** Labels des pages du cerveau (autocomplétion des wikilinks [[…]]). */
+  linkTargets?: string[];
+  /** Clic sur un wikilink [[label]] → navigation vers la page. */
+  onNavigate?: (label: string) => void;
 }
 
 type SlashItem = { key: string; label: string; hint: string; action: "page" | "ia" };
@@ -65,7 +76,7 @@ const SLASH_ITEMS: SlashItem[] = [
   { key: "ia",   label: "IA — rédiger", hint: "Générer du contenu avec l'IA", action: "ia" },
 ];
 
-export function MarkdownEditor({ content, onChange, placeholder = "Écris quelque chose…", onSlashPage, onGenerate }: Props) {
+export function MarkdownEditor({ content, onChange, placeholder = "Écris quelque chose…", onSlashPage, onGenerate, linkTargets, onNavigate }: Props) {
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
@@ -77,9 +88,50 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
   // Menu slash (/page, /ia)
   const edRef = useRef<import("@tiptap/core").Editor | null>(null);
   const slashRef = useRef<{ len: number; items: SlashItem[]; index: number } | null>(null);
-  const cbRef = useRef({ onSlashPage, onGenerate });
-  cbRef.current = { onSlashPage, onGenerate };
+  const cbRef = useRef({ onSlashPage, onGenerate, onNavigate, linkTargets });
+  cbRef.current = { onSlashPage, onGenerate, onNavigate, linkTargets };
   const [slash, setSlash] = useState<{ left: number; top: number; items: SlashItem[]; index: number } | null>(null);
+
+  // Autocomplétion wikilink ([[…)
+  const wikiRef = useRef<{ len: number; items: string[]; index: number } | null>(null);
+  const [wiki, setWiki] = useState<{ left: number; top: number; items: string[]; index: number } | null>(null);
+  function closeWiki() { wikiRef.current = null; setWiki(null); }
+
+  function selectWiki(index?: number) {
+    const ed = edRef.current, w = wikiRef.current;
+    if (!ed || !w) return;
+    const label = w.items[index ?? w.index];
+    if (!label) return;
+    const to = ed.state.selection.from, from = to - w.len;
+    closeWiki();
+    ed.chain().focus().deleteRange({ from, to }).insertContent(`[[${label}]] `).run();
+  }
+
+  function moveWiki(delta: number) {
+    const w = wikiRef.current;
+    if (!w) return;
+    const index = (w.index + delta + w.items.length) % w.items.length;
+    w.index = index;
+    setWiki((v) => v ? { ...v, index } : v);
+  }
+
+  function detectWiki(ed: import("@tiptap/core").Editor) {
+    const targets = cbRef.current.linkTargets;
+    const sel = ed.state.selection;
+    const wrap = wrapRef.current;
+    if (!targets?.length || !sel.empty || !wrap) { closeWiki(); return; }
+    const start = sel.$from.start();
+    const before = ed.state.doc.textBetween(start, sel.from, "\n", "￼");
+    const m = /\[\[([^[\]\n]*)$/.exec(before);
+    if (!m) { closeWiki(); return; }
+    const query = m[1].toLowerCase();
+    const items = targets.filter((t) => t.toLowerCase().includes(query)).slice(0, 8);
+    if (items.length === 0) { closeWiki(); return; }
+    wikiRef.current = { len: m[0].length, items, index: 0 };
+    const c = ed.view.coordsAtPos(sel.from);
+    const wr = wrap.getBoundingClientRect();
+    setWiki({ left: c.left - wr.left, top: c.bottom - wr.top + 4, items, index: 0 });
+  }
 
   // Popover de consigne pour /ia
   const [prompt, setPrompt] = useState<{ left: number; top: number; pos: number } | null>(null);
@@ -154,11 +206,20 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
 
   const editor = useEditor({
     extensions: [
-      StarterKit.configure({ codeBlock: { languageClassPrefix: "language-" } }),
+      StarterKit.configure({ codeBlock: false }),
+      // Blocs de code avec coloration syntaxique (```lang — GFM standard)
+      CodeBlockLowlight.configure({ lowlight, languageClassPrefix: "language-" }),
+      // Wikilinks [[…]] + callouts [!info] : décorations pures, le .md reste intact
+      MdDecorations.configure({ onNavigate: (label: string) => cbRef.current.onNavigate?.(label) }),
+      // Images collées : stockées en local (assets/), markdown standard ![](…)
+      LucidImage,
       Table.configure({ resizable: true }),
       TableRow,
       TableHeader,
       TableCell,
+      // Cases à cocher : rendu interactif, sérialisé en GFM standard (- [ ] / - [x])
+      TaskList,
+      TaskItem.configure({ nested: true }),
       Placeholder.configure({ placeholder }),
       Markdown.configure({ html: false, transformPastedText: true }),
       AiDraft,
@@ -168,7 +229,30 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
       attributes: {
         class: "editor-content prose-lucid focus:outline-none min-h-[100px] px-1 py-2",
       },
+      handlePaste(_view, event) {
+        const items = event.clipboardData?.items;
+        if (!items) return false;
+        for (const it of items) {
+          if (!it.type.startsWith("image/")) continue;
+          const file = it.getAsFile();
+          if (!file) continue;
+          event.preventDefault();
+          file.arrayBuffer().then(async (buf) => {
+            const ext = (it.type.split("/")[1] || "png").replace("jpeg", "jpg").replace(/\+.*$/, "");
+            const rel = await savePastedImage(new Uint8Array(buf), ext);
+            edRef.current?.chain().focus().setImage({ src: rel }).run();
+          }).catch(console.error);
+          return true;
+        }
+        return false;
+      },
       handleKeyDown(_view, event) {
+        if (wikiRef.current) {
+          if (event.key === "Escape") { closeWiki(); return true; }
+          if (event.key === "Enter" || event.key === "Tab") { selectWiki(); return true; }
+          if (event.key === "ArrowDown") { moveWiki(1); return true; }
+          if (event.key === "ArrowUp") { moveWiki(-1); return true; }
+        }
         if (!slashRef.current) return false;
         if (event.key === "Escape") { closeSlash(); return true; }
         if (event.key === "Enter") { selectSlash(); return true; }
@@ -181,8 +265,9 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
       // @ts-expect-error tiptap-markdown storage type
       onChangeRef.current(editor.storage.markdown.getMarkdown());
       detectSlash(editor);
+      detectWiki(editor);
     },
-    onSelectionUpdate({ editor }) { detectSlash(editor); },
+    onSelectionUpdate({ editor }) { detectSlash(editor); detectWiki(editor); },
   });
   edRef.current = editor;
 
@@ -265,8 +350,8 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
         )}
       </BubbleMenu>
 
-      {/* Menu flottant sur ligne vide */}
-      <FloatingMenu editor={editor} className={FLOAT_CLASS}>
+      {/* Menu flottant sur ligne vide — au-dessus du curseur */}
+      <FloatingMenu editor={editor} className={FLOAT_CLASS} options={{ placement: "top-start" }}>
         <Btn active={editor.isActive("heading", { level: 2 })} onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()} title="Titre H2">
           <Heading2 className="size-3.5" />
         </Btn>
@@ -280,6 +365,9 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
         <Btn active={editor.isActive("orderedList")} onClick={() => editor.chain().focus().toggleOrderedList().run()} title="Liste numérotée">
           <ListOrdered className="size-3.5" />
         </Btn>
+        <Btn active={editor.isActive("taskList")} onClick={() => editor.chain().focus().toggleTaskList().run()} title="Liste de tâches">
+          <CheckSquare className="size-3.5" />
+        </Btn>
         <span className="mx-0.5 h-4 w-px bg-[var(--color-border)]" />
         <Btn active={false} onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()} title="Insérer un tableau">
           <TableIcon className="size-3.5" />
@@ -287,6 +375,29 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
       </FloatingMenu>
 
       <EditorContent editor={editor} className="text-sm" />
+
+      {/* Autocomplétion wikilink [[… */}
+      {wiki && (
+        <div
+          style={{ position: "absolute", left: wiki.left, top: wiki.top, zIndex: 40 }}
+          className="min-w-[220px] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] p-1"
+        >
+          {wiki.items.map((label, i) => (
+            <button
+              key={label}
+              type="button"
+              onMouseDown={(e) => { e.preventDefault(); selectWiki(i); }}
+              className={cn(
+                "flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm text-[var(--color-text)] transition-colors",
+                i === wiki.index ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]",
+              )}
+            >
+              <span className="text-[var(--color-accent)]">[[</span>
+              <span className="min-w-0 flex-1 truncate">{label}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Menu slash (/page, /ia) */}
       {slash && (

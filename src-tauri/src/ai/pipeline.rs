@@ -668,6 +668,39 @@ fn emit_recursive(
     }
 }
 
+// ── Création de structure par l'assistant (arborescence de pages) ────────────
+
+/// Arbre de pages proposé par le modèle pour `create_structure`.
+#[derive(serde::Deserialize, Debug)]
+pub struct StructureSpec {
+    pub label: String,
+    #[serde(default)]
+    pub summary: String,
+    /// Corps markdown template de la page (optionnel).
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub children: Vec<StructureSpec>,
+}
+
+/// Parse la sortie (bruitée) du modèle en arbre de pages. Borne la taille :
+/// profondeur ≤ 3, ≤ 30 nœuds au total (garde-fou contre un modèle qui divague).
+pub fn parse_structure(raw: &str) -> Option<StructureSpec> {
+    let mut spec: StructureSpec = serde_json::from_str(extract_json(raw)?).ok()?;
+    fn clamp(node: &mut StructureSpec, depth: usize, budget: &mut usize) {
+        node.label = node.label.trim().to_string();
+        if depth >= 3 { node.children.clear(); }
+        node.children.retain(|c| !c.label.trim().is_empty());
+        node.children.truncate(*budget);
+        *budget = budget.saturating_sub(node.children.len());
+        for c in &mut node.children { clamp(c, depth + 1, budget); }
+    }
+    let mut budget = 29usize; // 30 nœuds max, racine comprise
+    clamp(&mut spec, 1, &mut budget);
+    if spec.label.is_empty() { return None; }
+    Some(spec)
+}
+
 fn dedup_pairs(items: &[(String, String)]) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     items.iter()
@@ -700,6 +733,37 @@ mod tests {
     fn bad_output_yields_default() {
         let ex = parse_extraction("désolé, pas de json ici");
         assert!(ex.summary.is_empty() && ex.concepts.is_empty());
+    }
+
+    #[test]
+    fn parses_structure_tree_from_noisy_output() {
+        let s = "voilà : {\"label\": \"Projet web\", \"children\": [\
+{\"label\": \"Page client\", \"summary\": \"Espace client\"}, \
+{\"label\": \"Mentions légales\", \"children\": [{\"label\": \"RGPD\"}]}]} fin";
+        let spec = parse_structure(s).unwrap();
+        assert_eq!(spec.label, "Projet web");
+        assert_eq!(spec.children.len(), 2);
+        assert_eq!(spec.children[1].children[0].label, "RGPD");
+    }
+
+    #[test]
+    fn structure_restarted_json_fails_prefixed_but_parses_raw() {
+        // Gemma régénère parfois le JSON complet au lieu de continuer le préfixe.
+        let completion = "{\n  \"label\": \"Projet Web\",\n  \"children\": [{\"label\": \"Design\"}]\n}";
+        // Re-préfixé → JSON cassé → doit échouer (pas de faux positif)
+        assert!(parse_structure(&format!("{{\"label\": \"{completion}")).is_none());
+        // Brut → doit parser
+        let spec = parse_structure(completion).unwrap();
+        assert_eq!(spec.label, "Projet Web");
+    }
+
+    #[test]
+    fn structure_rejects_garbage_and_clamps_depth() {
+        assert!(parse_structure("pas de json").is_none());
+        // profondeur 4 → coupée à 3
+        let s = "{\"label\":\"a\",\"children\":[{\"label\":\"b\",\"children\":[{\"label\":\"c\",\"children\":[{\"label\":\"d\"}]}]}]}";
+        let spec = parse_structure(s).unwrap();
+        assert!(spec.children[0].children[0].children.is_empty());
     }
 
     #[test]

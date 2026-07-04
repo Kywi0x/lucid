@@ -3,6 +3,7 @@ import {
   X, FolderGit2, Brain, FileText,
   Download, RefreshCw, Sparkles, Loader2, ChevronRight, Maximize2, Minimize2, Check,
   History, RotateCcw, Send, Sparkle,
+  PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
 } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import type { BrainGraph, BrainNode, NodeSnapshotInfo } from "@/lib/types";
@@ -52,6 +53,87 @@ function ConnectorLogo({ connector }: { connector: string }) {
   return <FileText className="size-3.5 shrink-0 text-[var(--color-accent)]" />;
 }
 
+/** Arborescence du projet (depuis le plus haut parent hors racine) : branches
+ *  repliables, chemin vers la page courante déplié, page courante surlignée. */
+function ProjectTree({ node, graph, ancestors, onSelect }: {
+  node: BrainNode;
+  graph: BrainGraph;
+  ancestors: BrainNode[];
+  onSelect: (n: BrainNode) => void;
+}) {
+  const childrenOf = useMemo(() => {
+    const m = new Map<string, BrainNode[]>();
+    for (const n of graph.nodes) {
+      if (!n.parent_id || n.kind === "pending") continue;
+      if (!m.has(n.parent_id)) m.set(n.parent_id, []);
+      m.get(n.parent_id)!.push(n);
+    }
+    return m;
+  }, [graph]);
+
+  const top = ancestors[0] ?? node;
+  const pathIds = useMemo(
+    () => new Set([...ancestors.map((a) => a.id), node.id]),
+    [ancestors, node.id],
+  );
+  const [open, setOpen] = useState<Set<string>>(() => new Set(pathIds));
+  useEffect(() => { setOpen((prev) => new Set([...prev, ...pathIds])); }, [pathIds]);
+
+  function Row({ n, depth }: { n: BrainNode; depth: number }) {
+    const kids = childrenOf.get(n.id) ?? [];
+    const isOpen = open.has(n.id);
+    const isCurrent = n.id === node.id;
+    if (depth > 8) return null;
+    return (
+      <li>
+        <div
+          className={cn(
+            "flex items-center gap-0.5 rounded-md py-0.5 pr-1 transition-colors",
+            isCurrent ? "bg-[var(--color-accent-soft)]" : "hover:bg-[var(--color-surface-2)]",
+          )}
+          style={{ paddingLeft: depth * 12 }}
+        >
+          {kids.length > 0 ? (
+            <button
+              onClick={() => setOpen((prev) => {
+                const s = new Set(prev);
+                if (s.has(n.id)) s.delete(n.id); else s.add(n.id);
+                return s;
+              })}
+              className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-text)]"
+            >
+              <ChevronRight className={cn("size-3 transition-transform", isOpen && "rotate-90")} />
+            </button>
+          ) : (
+            <span className="w-4 shrink-0" />
+          )}
+          <button
+            onClick={() => onSelect(n)}
+            className={cn(
+              "min-w-0 flex-1 truncate text-left text-xs transition-colors",
+              isCurrent ? "font-medium text-[var(--color-text)]" : "text-[var(--color-muted)] hover:text-[var(--color-text)]",
+            )}
+          >
+            {n.label}
+          </button>
+        </div>
+        {isOpen && kids.length > 0 && (
+          <ul>{kids.map((k) => <Row key={k.id} n={k} depth={depth + 1} />)}</ul>
+        )}
+      </li>
+    );
+  }
+
+  return (
+    <div>
+      <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+        Arborescence
+      </p>
+      <ul><Row n={top} depth={0} /></ul>
+    </div>
+  );
+}
+
 async function downloadNode(node: BrainNode) {
   const path = await save({
     defaultPath: `${node.label}.md`,
@@ -77,7 +159,7 @@ function useAncestors(node: BrainNode, graph: BrainGraph | null): BrainNode[] {
 }
 
 // ─── Panneau de discussion IA (mode plein écran) ────────────────────────────
-function NodeChat({ node, childCount }: { node: BrainNode; childCount: number }) {
+function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCount: number; onCollapse?: () => void }) {
   const [msgs, setMsgs] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -107,6 +189,12 @@ function NodeChat({ node, childCount }: { node: BrainNode; childCount: number })
       <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-2.5">
         <Sparkle className="size-3.5 text-[var(--color-accent)]" />
         <span className="flex-1 text-xs font-semibold text-[var(--color-text)]">Assistant</span>
+        {onCollapse && (
+          <button onClick={onCollapse} title="Replier l'assistant"
+            className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
+            <PanelRightClose className="size-3.5" />
+          </button>
+        )}
         <button
           onClick={() => setWithChildren((v) => !v)}
           disabled={childCount === 0}
@@ -188,6 +276,25 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
   const slashPage = onCreateNote ? () => onCreateNote(node.id, "Nouvelle page") : undefined;
   const generate = (instruction: string, includeChildren: boolean) => generateContent(node.id, instruction, includeChildren);
 
+  // Wikilinks : cibles d'autocomplétion (toutes les pages) + navigation par label.
+  const linkTargets = useMemo(
+    () => (graph?.nodes ?? []).filter((n) => n.kind !== "root" && n.kind !== "pending").map((n) => n.label),
+    [graph],
+  );
+  const navigateToLabel = useCallback((label: string) => {
+    const target = graph?.nodes.find((n) => n.label.toLowerCase() === label.toLowerCase() && n.kind !== "pending");
+    if (target) onSelect(target);
+  }, [graph, onSelect]);
+
+  // Dérivés du markdown (UI pure, rien de stocké) : progression des tâches + sommaire.
+  const contentColRef = useRef<HTMLDivElement>(null);
+
+  // Panneaux repliables du mode étendu (préférence conservée entre sessions).
+  const [leftOpen, setLeftOpen] = useState(() => localStorage.getItem("lucid.detail.left") !== "0");
+  const [chatOpen, setChatOpen] = useState(() => localStorage.getItem("lucid.detail.chat") !== "0");
+  function toggleLeft() { setLeftOpen((v) => { localStorage.setItem("lucid.detail.left", v ? "0" : "1"); return !v; }); }
+  function toggleChat() { setChatOpen((v) => { localStorage.setItem("lucid.detail.chat", v ? "0" : "1"); return !v; }); }
+
   const [synth, setSynth] = useState<Partial<BrainNode> | null>(null);
   const [synthesizing, setSynthesizing] = useState(false);
   const [synthError, setSynthError] = useState<string | null>(null);
@@ -232,6 +339,24 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
   }, [node.id]);
 
   const editorContent = localContent ?? node.content ?? sourceText ?? "";
+
+  const taskStats = useMemo(() => {
+    const all = editorContent.match(/^\s*[-*] \[[ xX]\]/gm) ?? [];
+    const done = editorContent.match(/^\s*[-*] \[[xX]\]/gm) ?? [];
+    return { total: all.length, done: done.length };
+  }, [editorContent]);
+
+  const headings = useMemo(() => {
+    return [...editorContent.matchAll(/^(#{1,3}) (.+)$/gm)]
+      .map((m) => ({ level: m[1].length, text: m[2].trim() }));
+  }, [editorContent]);
+
+  function scrollToHeading(text: string) {
+    const root: ParentNode = contentColRef.current ?? document;
+    for (const el of root.querySelectorAll(".editor-content h1, .editor-content h2, .editor-content h3")) {
+      if (el.textContent?.trim() === text) { el.scrollIntoView({ behavior: "smooth", block: "start" }); return; }
+    }
+  }
 
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -398,6 +523,21 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
         </div>
       )}
 
+      {/* ── Progression des tâches (dérivée des - [ ] du markdown) ── */}
+      {taskStats.total > 0 && (
+        <div className="flex items-center gap-2.5 border-b border-[var(--color-border)] px-4 py-1.5">
+          <div className="h-1 flex-1 overflow-hidden rounded-full bg-[var(--color-surface-2)]">
+            <div
+              className="h-full rounded-full bg-[var(--color-accent)] transition-all duration-300"
+              style={{ width: `${Math.round((taskStats.done / taskStats.total) * 100)}%` }}
+            />
+          </div>
+          <span className="shrink-0 font-mono text-[10px] text-[var(--color-muted)]">
+            {taskStats.done}/{taskStats.total} ✓
+          </span>
+        </div>
+      )}
+
       {/* ── Corps ── */}
       {historyMode ? (
         <div className="flex-1 overflow-y-auto px-5 py-4">
@@ -439,8 +579,41 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
       ) : expanded ? (
         // Mode étendu : deux colonnes
         <div className="flex flex-1 overflow-hidden">
-          {/* Colonne gauche — métadonnées (non éditables) */}
-          <div className="w-80 shrink-0 overflow-y-auto border-r border-[var(--color-border)] px-5 py-5 space-y-5">
+          {/* Colonne gauche — arborescence + métadonnées (repliable) */}
+          {!leftOpen ? (
+            <div className="flex w-9 shrink-0 justify-center border-r border-[var(--color-border)] pt-3">
+              <button onClick={toggleLeft} title="Afficher l'arborescence"
+                className="h-fit rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
+                <PanelLeftOpen className="size-4" />
+              </button>
+            </div>
+          ) : (
+          <div className="relative w-80 shrink-0 overflow-y-auto border-r border-[var(--color-border)] px-5 py-5 space-y-5">
+            <button onClick={toggleLeft} title="Replier l'arborescence"
+              className="absolute right-2 top-2 rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
+              <PanelLeftClose className="size-3.5" />
+            </button>
+            {graph && node.kind !== "root" && (
+              <ProjectTree node={node} graph={graph} ancestors={ancestors} onSelect={onSelect} />
+            )}
+            {headings.length >= 3 && (
+              <div>
+                <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">Sommaire</p>
+                <ul className="space-y-0.5">
+                  {headings.map((h, i) => (
+                    <li key={i}>
+                      <button
+                        onClick={() => scrollToHeading(h.text)}
+                        style={{ paddingLeft: (h.level - 1) * 10 }}
+                        className="w-full truncate text-left text-xs text-[var(--color-muted)] transition-colors hover:text-[var(--color-text)]"
+                      >
+                        {h.text}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {synthError && (
               <div className="rounded-lg border border-[var(--color-err)]/30 bg-[var(--color-err)]/10 px-3 py-2 text-xs text-[var(--color-err)]">
                 {synthError}
@@ -466,27 +639,12 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                 </ul>
               </div>
             )}
-            {children.length > 0 && (
-              <div>
-                <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">Pages enfants ({children.length})</p>
-                <ul className="space-y-0.5">
-                  {children.map((child) => (
-                    <li key={child.id} className="flex items-center gap-1 rounded-md px-1.5 py-1.5 hover:bg-[var(--color-surface-2)] transition-colors">
-                      <button onClick={() => onSelect(child)} className="min-w-0 flex-1 truncate text-left text-xs text-[var(--color-text)] hover:text-[var(--color-accent)] transition-colors">
-                        {child.label}
-                      </button>
-                      <button onClick={() => downloadNode(child)} title={`Exporter ${child.label}`} className="shrink-0 rounded p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
-                        <Download className="size-3" />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            {/* (Pages enfants supprimé en mode étendu : l'arborescence couvre la navigation) */}
           </div>
+          )}
 
           {/* Colonne droite — synthèse + contenu éditable */}
-          <div className="flex-1 overflow-y-auto px-8 py-6">
+          <div ref={contentColRef} className="flex-1 overflow-y-auto px-8 py-6">
             <div className="mx-auto max-w-2xl space-y-4">
               {display.summary && (
                 <div className="flex gap-2.5 rounded-lg border-l-2 border-[var(--color-accent)]/60 bg-[var(--color-accent-soft)] px-3 py-2.5">
@@ -513,17 +671,26 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                     <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
                   </div>
                 ) : (
-                  <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} />
+                  <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
                 )
               )}
             </div>
           </div>
 
-          {/* Colonne droite — discussion IA */}
+          {/* Colonne droite — discussion IA (repliable) */}
           {node.kind !== "root" && (
-            <div className="flex w-[360px] shrink-0 flex-col border-l border-[var(--color-border)]">
-              <NodeChat key={node.id} node={node} childCount={children.length} />
-            </div>
+            !chatOpen ? (
+              <div className="flex w-9 shrink-0 justify-center border-l border-[var(--color-border)] pt-3">
+                <button onClick={toggleChat} title="Afficher l'assistant"
+                  className="h-fit rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
+                  <PanelRightOpen className="size-4" />
+                </button>
+              </div>
+            ) : (
+              <div className="flex w-[360px] shrink-0 flex-col border-l border-[var(--color-border)]">
+                <NodeChat key={node.id} node={node} childCount={children.length} onCollapse={toggleChat} />
+              </div>
+            )
           )}
         </div>
       ) : (
@@ -557,7 +724,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                 <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
               </div>
             ) : (
-              <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} />
+              <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
             )
           )}
           {(display.decisions ?? []).length > 0 && (

@@ -22,8 +22,26 @@ export interface Conversation extends ConversationSummary {
   messages: Message[];
 }
 
-/** Graphe de connaissances généré par l'IA (mind map à bulles). */
-export type NodeKind = "root" | "container" | "leaf" | "group" | "espace" | "page" | "source" | "note";
+/** Graphe de connaissances généré par l'IA (mind map à bulles).
+ *  `pending` = proposition MCP pas encore validée (bulle fantôme, jamais persistée). */
+export type NodeKind = "root" | "container" | "leaf" | "group" | "espace" | "page" | "source" | "note" | "pending";
+
+/** Client IA local (Claude Desktop/Code, Cursor…) connectable au MCP Lucid. */
+export interface AiClientStatus {
+  id: string;
+  name: string;
+  installed: boolean;
+  connected: boolean;
+}
+
+/** Proposition de création déposée par le serveur MCP, en attente de validation. */
+export interface McpProposal {
+  id: string;
+  parent_id: string;
+  label: string;
+  content: string;
+  created_at: string;
+}
 
 export interface BrainNode {
   id: string;

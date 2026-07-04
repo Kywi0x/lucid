@@ -15,9 +15,12 @@ import {
   Pencil,
   Trash2,
   Plus,
+  Bot,
 } from "lucide-react";
 import claudeLogo from "@/assets/claude-logo.png";
 import googleDriveLogo from "@/assets/google_drive.svg.png";
+import cursorLogo from "@/assets/cursor.svg";
+import openaiLogo from "@/assets/openai.svg";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   googleDriveConnect,
@@ -32,8 +35,12 @@ import {
   obsidianDisconnect,
   listModels,
   setActiveModel,
+  aiClientsStatus,
+  connectAiClient,
+  disconnectAiClient,
   type ModelInfo,
 } from "@/lib/api";
+import type { AiClientStatus } from "@/lib/types";
 import type { ConnectorStatus, Space } from "@/lib/types";
 import { cn, relativeDate } from "@/lib/utils";
 
@@ -699,7 +706,103 @@ function ModelSection() {
 
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
-type Section = "connectors" | "spaces" | "model";
+type Section = "connectors" | "ai-clients" | "spaces" | "model";
+
+// ── Section « Mes IA » : connexion one-click du serveur MCP Lucid ────────────
+
+function AiClientLogo({ id }: { id: string }) {
+  switch (id) {
+    case "claude-desktop": return <LogoImg src={claudeLogo} alt="Claude Desktop" bg="bg-[#1a1a1a]" />;
+    case "claude-code":    return <LogoClaudeCode />;
+    case "cursor":         return <LogoImg src={cursorLogo} alt="Cursor" />;
+    case "codex":          return <LogoImg src={openaiLogo} alt="Codex (OpenAI)" />;
+    default:               return <LogoImg src={claudeLogo} alt={id} />;
+  }
+}
+
+function AiClientsSection() {
+  const [clients, setClients] = useState<AiClientStatus[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msgs, setMsgs] = useState<Record<string, string>>({});
+
+  const refresh = () => aiClientsStatus().then(setClients).catch(console.error);
+  useEffect(() => { refresh(); }, []);
+
+  async function handle(id: string, connect: boolean) {
+    setBusy(id);
+    try {
+      if (connect) {
+        const m = await connectAiClient(id);
+        setMsgs((s) => ({ ...s, [id]: m }));
+      } else {
+        await disconnectAiClient(id);
+        setMsgs((s) => ({ ...s, [id]: "Déconnecté." }));
+      }
+      await refresh();
+    } catch (e) {
+      setMsgs((s) => ({ ...s, [id]: String(e) }));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="h-full overflow-y-auto p-5">
+      <p className="mb-1 text-sm font-semibold text-[var(--color-text)]">Connecter mes IA</p>
+      <p className="mb-4 text-xs leading-relaxed text-[var(--color-muted)]">
+        Branche ton second cerveau à tes IA en un clic : elles pourront le consulter
+        (recherche, lecture) et proposer des pages — que tu valides dans Lucid.
+        100 % local, aucune donnée n'est envoyée en ligne.
+      </p>
+      <div className="space-y-2">
+        {clients.map((c) => (
+          <div key={c.id} className={cn(
+            "rounded-xl border border-[var(--color-border)] px-4 py-3 transition-opacity",
+            !c.installed && "opacity-50",
+          )}>
+            <div className="flex items-center gap-3">
+              <AiClientLogo id={c.id} />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-[var(--color-text)]">{c.name}</p>
+                <p className="flex items-center gap-1.5 text-[11px] text-[var(--color-muted)]">
+                  <span className={
+                    "size-1.5 shrink-0 rounded-full " +
+                    (c.connected ? "bg-[var(--color-ok)]" : c.installed ? "bg-[#e0a33c]" : "bg-[var(--color-border)]")
+                  } />
+                  {c.connected ? "Connecté au cerveau Lucid" : c.installed ? "Détecté — pas encore connecté" : "Non détecté sur ce Mac"}
+                </p>
+              </div>
+              {c.connected ? (
+                <button
+                  onClick={() => handle(c.id, false)}
+                  disabled={busy === c.id}
+                  className="rounded-lg px-3 py-1.5 text-xs text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] disabled:opacity-40"
+                >
+                  {busy === c.id ? <Loader2 className="size-3.5 animate-spin" /> : "Déconnecter"}
+                </button>
+              ) : (
+                <button
+                  onClick={() => handle(c.id, true)}
+                  disabled={busy === c.id || !c.installed}
+                  className="rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-xs text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-40"
+                >
+                  {busy === c.id ? <Loader2 className="size-3.5 animate-spin" /> : "Connecter"}
+                </button>
+              )}
+            </div>
+            {msgs[c.id] && (
+              <p className="mt-2 text-[11px] text-[var(--color-muted)]">{msgs[c.id]}</p>
+            )}
+          </div>
+        ))}
+      </div>
+      <p className="mt-4 text-[11px] leading-relaxed text-[var(--color-muted)]">
+        Après connexion, demande par exemple : « Qu'est-ce qu'il y a dans mon second
+        cerveau sur … ? » ou « Crée-moi une structure de révision dans Lucid ».
+      </p>
+    </div>
+  );
+}
 
 interface Props {
   connectors: ConnectorStatus[];
@@ -718,10 +821,11 @@ export function SettingsModal({
 }: Props) {
   const [section, setSection] = useState<Section>("connectors");
 
-  const NAV: { id: Section; label: string; icon: React.ReactNode }[] = [
-    { id: "connectors", label: "Connecteurs", icon: <Plug className="size-3.5" /> },
-    { id: "spaces",     label: "Spaces",      icon: <Layers className="size-3.5" /> },
-    { id: "model",      label: "Modèle IA",   icon: <Cpu className="size-3.5" /> },
+  const NAV: { id: Section; label: string; desc: string; icon: React.ReactNode }[] = [
+    { id: "connectors", label: "Sources",  desc: "D'où vient ton savoir",     icon: <Plug className="size-3.5" /> },
+    { id: "ai-clients", label: "Mes IA",   desc: "Qui consulte ton cerveau",  icon: <Bot className="size-3.5" /> },
+    { id: "spaces",     label: "Spaces",   desc: "Tes vues du graphe",        icon: <Layers className="size-3.5" /> },
+    { id: "model",      label: "IA locale", desc: "Le moteur d'analyse",      icon: <Cpu className="size-3.5" /> },
   ];
 
   return (
@@ -740,13 +844,24 @@ export function SettingsModal({
               key={n.id}
               onClick={() => setSection(n.id)}
               className={cn(
-                "flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition-colors",
+                "flex items-start gap-2 rounded-lg px-2.5 py-2 text-left transition-colors",
                 section === n.id
-                  ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                  : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
+                  ? "bg-[var(--color-accent-soft)]"
+                  : "hover:bg-[var(--color-surface-2)]",
               )}
             >
-              {n.icon} {n.label}
+              <span className={cn("mt-0.5", section === n.id ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]")}>
+                {n.icon}
+              </span>
+              <span className="min-w-0">
+                <span className={cn(
+                  "block text-xs font-medium",
+                  section === n.id ? "text-[var(--color-accent)]" : "text-[var(--color-text)]",
+                )}>
+                  {n.label}
+                </span>
+                <span className="block text-[10px] leading-tight text-[var(--color-muted)]">{n.desc}</span>
+              </span>
             </button>
           ))}
           <button
@@ -762,6 +877,7 @@ export function SettingsModal({
           {section === "connectors" && (
             <ConnectorsSection connectors={connectors} onRefresh={onRefresh} onSyncDone={onSyncDone} />
           )}
+          {section === "ai-clients" && <AiClientsSection />}
           {section === "spaces" && (
             <SpacesSection spaces={spaces} onCreate={onSpaceCreate} onRename={onSpaceRename} onDelete={onSpaceDelete} />
           )}
