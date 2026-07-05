@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["dmg", "app"],
+    "externalBin": [
+      "binaries/llama-completion",
+      "binaries/lucid_mcp",
+      "binaries/pdftotext",
+      "binaries/pdftoppm",
+      "binaries/tesseract"
+    ],
+    "resources": {
+      "resources/libs/": "libs/",
+      "resources/tessdata/": "tessdata/"
+    }
+  }
+}

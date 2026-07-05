@@ -26,6 +26,8 @@ import {
 } from "@/components/BrainView";
 import { NodeDetail } from "@/components/NodeDetail";
 import { NodePicker } from "@/components/NodePicker";
+import { StarterChecklist, type ChecklistItem } from "@/components/StarterChecklist";
+import { Onboarding } from "@/components/Onboarding";
 import {
   generateBrain,
   readBrainGraph,
@@ -40,6 +42,7 @@ import {
   addNodeToSpace,
   deleteSpace,
   renameSpace,
+  aiClientsStatus,
   createNoteNode,
   importFile,
   listMcpProposals,
@@ -113,6 +116,40 @@ function App() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [proposals, setProposals] = useState<McpProposal[]>([]);
 
+  // ── Checklist « Bien démarrer » : flags persistés + statut IA ──
+  const [uxFlags, setUxFlags] = useState(() => ({
+    openedPage: localStorage.getItem("lucid.flag.openedPage") === "1",
+    importedFile: localStorage.getItem("lucid.flag.importedFile") === "1",
+  }));
+  function setUxFlag(k: keyof typeof uxFlags) {
+    localStorage.setItem(`lucid.flag.${k}`, "1");
+    setUxFlags((f) => (f[k] ? f : { ...f, [k]: true }));
+  }
+  const [checklistDismissed, setChecklistDismissed] = useState(
+    () => localStorage.getItem("lucid.checklist.dismissed") === "1",
+  );
+
+  // ── Onboarding premier lancement : sources → génération → brancher son IA ──
+  const [booted, setBooted] = useState(false); // évite le flash avant le chargement initial
+  const [onboarding, setOnboarding] = useState<null | "sources" | "waiting" | "connect">(
+    () => (localStorage.getItem("lucid.onboarded") === "1" ? null : "sources"),
+  );
+  function finishOnboarding() {
+    localStorage.setItem("lucid.onboarded", "1");
+    setOnboarding(null);
+  }
+  // Utilisateur existant (cerveau déjà généré) : pas d'onboarding, sortie silencieuse.
+  useEffect(() => {
+    if (graph && onboarding === "sources") finishOnboarding();
+    if (graph && onboarding === "waiting") setOnboarding("connect");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph]);
+  const [aiConnected, setAiConnected] = useState(false);
+  useEffect(() => {
+    if (needsSetup) return;
+    aiClientsStatus().then((cs) => setAiConnected(cs.some((c) => c.connected))).catch(() => {});
+  }, [needsSetup, settingsOpen]); // re-check quand on ferme les Settings
+
   const rootId = useMemo(() => graph?.nodes.find((n) => n.kind === "root")?.id ?? "", [graph]);
   const noteParents = useMemo(
     () => graph?.nodes.filter((n) => !isLeafKind(n.kind)) ?? [],
@@ -125,7 +162,10 @@ function App() {
 
   useEffect(() => {
     aiSetupNeeded().then(setNeedsSetup);
-    readBrainGraph().then((g) => { if (g) { setGraph(g); setRevealKey((k) => k + 1); } });
+    readBrainGraph().then((g) => {
+      if (g) { setGraph(g); setRevealKey((k) => k + 1); }
+      setBooted(true); // graphe initial chargé (ou absent) → l'onboarding peut se prononcer
+    });
     connectorsStatus().then(setConnectors);
     listSpaces().then(setSpaces);
   }, []);
@@ -174,6 +214,7 @@ function App() {
 
   function selectNode(n: BrainNode) {
     setSelectedNode(n);
+    setUxFlag("openedPage");
   }
   function closeDetail() {
     setSelectedNode(null);
@@ -326,7 +367,7 @@ function App() {
       try { last = await importFile(p, parentId); } catch (e) { errs.push(String(e)); }
     }
     await refreshGraph();
-    if (last) setSelectedNode(last);
+    if (last) { setSelectedNode(last); setUxFlag("importedFile"); }
     showToast(errs.length
       ? `${ok.length - errs.length} importé(s) · échec : ${errs[0]}`
       : `${ok.length} fichier${ok.length > 1 ? "s importés" : " importé"} ✓`);
@@ -344,6 +385,7 @@ function App() {
       const n = await importFile(path, parentId);
       await refreshGraph();
       setSelectedNode(n);
+      setUxFlag("importedFile");
       setNoteOpen(false);
     } catch (e) {
       setImportError(String(e));
@@ -362,6 +404,36 @@ function App() {
     setSpaces((prev) => prev.filter((s) => s.id !== id));
     if (activeSpaceId === id) setActiveSpaceId(null);
   }
+
+  const checklistItems: ChecklistItem[] = useMemo(() => [
+    {
+      id: "source", label: "Connecter une source", done: connectors.some((c) => c.connected),
+      hint: "Claude Code, Notion, Drive, Obsidian…", onClick: () => setSettingsOpen(true),
+    },
+    {
+      id: "brain", label: "Générer le cerveau", done: !!graph,
+      hint: "L'IA locale dessine ta carte", onClick: () => handleGenerate(),
+    },
+    {
+      id: "page", label: "Ouvrir une page", done: uxFlags.openedPage,
+      hint: "Clique sur une bulle de la carte",
+    },
+    {
+      id: "import", label: "Importer un fichier", done: uxFlags.importedFile,
+      hint: "Glisse un PDF sur la carte, ou via +",
+      onClick: () => { setNoteTitle(""); setNoteParent(rootId); setImportError(null); setNoteOpen(true); },
+    },
+    {
+      id: "wikilink", label: "Lier deux pages", done: (graph?.nodes ?? []).some((n) => n.content?.includes("[[")),
+      hint: "Tape [[ dans une page",
+    },
+    {
+      id: "ai", label: "Brancher une IA", done: aiConnected,
+      hint: "Claude, Cursor, Codex…", onClick: () => setSettingsOpen(true),
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  ], [connectors, graph, uxFlags, aiConnected, rootId]);
+  const checklistDone = checklistItems.every((i) => i.done);
 
   const activeSpace = spaces.find((s) => s.id === activeSpaceId);
   const displayGraph = graph && activeSpace?.node_ids
@@ -559,6 +631,19 @@ function App() {
             </div>
           )}
 
+          {/* ── Checklist « Bien démarrer » ── */}
+          {view === "map" && graph && !generating && !checklistDismissed && !checklistDone && (
+            <div className="pointer-events-none absolute bottom-4 left-4 z-20">
+              <StarterChecklist
+                items={checklistItems}
+                onDismiss={() => {
+                  localStorage.setItem("lucid.checklist.dismissed", "1");
+                  setChecklistDismissed(true);
+                }}
+              />
+            </div>
+          )}
+
           {/* ── Toast (feedback import drag & drop) ── */}
           {toast && (
             <div className="panel pointer-events-none absolute bottom-6 left-1/2 z-30 -translate-x-1/2 rounded-full px-4 py-2 text-sm text-[var(--color-text)]">
@@ -675,12 +760,25 @@ function App() {
                 </button>
               </div>
 
-              {/* Actions */}
+              {/* Créer — l'action primaire, mise en avant */}
+              {graph && (
+                <div className="ml-1 flex items-center pl-3 border-l border-[var(--color-border)]">
+                  <button
+                    onClick={() => { setNoteTitle(""); setNoteParent(rootId); setImportError(null); setNoteOpen(true); }}
+                    title="Nouvelle note ou import de fichier"
+                    className="flex size-8 items-center justify-center rounded-full bg-[var(--color-accent)] text-white shadow-sm transition-transform hover:scale-105"
+                  >
+                    <Plus className="size-4" />
+                  </button>
+                </div>
+              )}
+
+              {/* Données : régénérer + historique */}
               <div className="ml-1 flex items-center gap-0.5 pl-3 border-l border-[var(--color-border)]">
                 {graph && (
                   <button
                     onClick={handleGenerate}
-                    title="Régénérer"
+                    title="Régénérer le cerveau (sync des sources)"
                     className="rounded-lg p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
                   >
                     <RefreshCw className="size-4" />
@@ -734,15 +832,10 @@ function App() {
                     </div>
                   )}
                 </div>
-                {graph && (
-                  <button
-                    onClick={() => { setNoteTitle(""); setNoteParent(rootId); setImportError(null); setNoteOpen(true); }}
-                    title="Nouvelle note"
-                    className="rounded-lg p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-                  >
-                    <Plus className="size-4" />
-                  </button>
-                )}
+              </div>
+
+              {/* App : paramètres + thème */}
+              <div className="ml-1 flex items-center gap-0.5 pl-3 border-l border-[var(--color-border)]">
                 <button
                   onClick={() => setSettingsOpen(true)}
                   title="Paramètres"
@@ -766,6 +859,7 @@ function App() {
               onSpaceCreate={handleSpaceCreate}
               onSpaceRename={handleSpaceRename}
               onSpaceDelete={handleSpaceDelete}
+              onRestored={refreshGraph}
             />
           )}
 
@@ -793,6 +887,32 @@ function App() {
             </div>
           )}
         </>
+      )}
+
+      {/* ── Onboarding premier lancement (au-dessus des deux branches) ── */}
+      {booted && !generating && (onboarding === "sources" || onboarding === "connect") && (
+        <Onboarding
+          phase={onboarding}
+          connectors={connectors}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onGenerate={() => { setOnboarding("waiting"); handleGenerate(); }}
+          onDone={finishOnboarding}
+        />
+      )}
+      {/* Les Settings doivent rester accessibles PAR-DESSUS l'onboarding (bouton
+          Configurer), y compris quand il n'y a pas encore de graphe. */}
+      {settingsOpen && !graph && !generating && (
+        <SettingsModal
+          connectors={connectors}
+          spaces={spaces}
+          onRefresh={() => connectorsStatus().then(setConnectors)}
+          onSyncDone={handleGenerate}
+          onClose={() => { setSettingsOpen(false); connectorsStatus().then(setConnectors); }}
+          onSpaceCreate={handleSpaceCreate}
+          onSpaceRename={handleSpaceRename}
+          onSpaceDelete={handleSpaceDelete}
+              onRestored={refreshGraph}
+        />
       )}
     </div>
   );

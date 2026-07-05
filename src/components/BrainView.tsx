@@ -19,9 +19,13 @@ export function GenerateEmpty({
           Génère ta mind map intelligente
         </h2>
         <p className="mt-1 max-w-md text-sm text-[var(--color-muted)]">
-          L'IA locale (Gemma 3) analyse tes conversations Claude Code et en
-          extrait une carte de bulles : projets, concepts et leurs connexions.
-          100% sur ta machine.
+          L'IA locale analyse tes sources (Claude Code, Notion, Google Drive,
+          Obsidian, fichiers…) et en dessine une carte : projets, concepts et
+          leurs connexions. 100 % sur ta machine, rien ne part en ligne.
+        </p>
+        <p className="mt-2 max-w-md text-xs text-[var(--color-muted)]">
+          Astuce : tu peux aussi glisser-déposer des PDF, Word ou CSV
+          directement sur la carte une fois générée.
         </p>
       </div>
       {error && (

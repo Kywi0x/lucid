@@ -1,0 +1,85 @@
+name: Release (dmg + exe)
+
+# Pousser un tag `v*` (ex. `git tag v0.1.0 && git push origin v0.1.0`) déclenche
+# le build macOS (.dmg) + Windows (.exe NSIS) et publie une GitHub Release avec
+# les deux installateurs. Des copies à nom fixe alimentent la page de download.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Sidecars (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install poppler tesseract tesseract-lang dylibbundler
+          ./scripts/bundle-sidecars.sh
+
+      - name: Sidecars (Windows)
+        if: runner.os == 'Windows'
+        run: pwsh scripts/bundle-sidecars.ps1
+
+      - name: Build + release
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Lucid ${{ github.ref_name }}"
+          releaseBody: "Téléchargez le .dmg (macOS) ou le .exe (Windows) ci-dessous."
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # Copie à nom fixe → liens stables `releases/latest/download/<nom>` pour docs/download.html
+      - name: Stable-named asset (macOS)
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dmg=$(ls src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg | head -1)
+          cp "$dmg" "Lucid-macOS-arm64.dmg"
+          gh release upload "${{ github.ref_name }}" "Lucid-macOS-arm64.dmg" --clobber
+
+      - name: Stable-named asset (Windows)
+        if: runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          Copy-Item $exe.FullName "Lucid-Windows-setup.exe"
+          gh release upload "${{ github.ref_name }}" "Lucid-Windows-setup.exe" --clobber

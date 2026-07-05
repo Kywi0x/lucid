@@ -195,7 +195,16 @@ fn load_remote_catalog() -> Vec<ModelDef> {
 // ── Sélection du modèle actif ─────────────────────────────────────────────────
 
 fn total_ram_gb() -> f32 {
+    #[cfg(target_os = "macos")]
     let output = Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok();
+    #[cfg(windows)]
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command",
+               "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
+        .output().ok();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let output: Option<std::process::Output> = None; // Linux : fallback 8.0
+
     output
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -237,6 +246,14 @@ fn resolve_binary() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         if p.is_file() { return Some(p); }
     }
+    // App packagée : sidecar statique à côté de l'exécutable (Contents/MacOS/).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sidecar = dir.join(format!("llama-completion{}", std::env::consts::EXE_SUFFIX));
+            if sidecar.is_file() { return Some(sidecar); }
+        }
+    }
+    // Dev : checkout llama.cpp dans le dossier de données.
     let candidate = app_data_dir()?
         .join("llama.cpp").join("build").join("bin").join("llama-completion");
     candidate.is_file().then_some(candidate)

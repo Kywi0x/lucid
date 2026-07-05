@@ -18,7 +18,8 @@ pub struct AiClientStatus {
 /// (dev : target/debug/ ; app packagée : Contents/MacOS/ en sidecar).
 pub fn mcp_binary_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let p = exe.parent().ok_or("exécutable sans dossier")?.join("lucid_mcp");
+    let p = exe.parent().ok_or("exécutable sans dossier")?
+        .join(format!("lucid_mcp{}", std::env::consts::EXE_SUFFIX));
     if p.exists() {
         return Ok(p);
     }

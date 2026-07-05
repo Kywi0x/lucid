@@ -2,6 +2,7 @@
 //! Expose les commandes appelables depuis le frontend React.
 
 mod ai;
+mod backup;
 mod connectors;
 mod mcp_clients;
 mod models;
@@ -780,6 +781,21 @@ fn resolve_mcp_proposal(id: String, accept: bool) -> Result<usize, String> {
     resolve_proposal_in(&dir, &id, accept)
 }
 
+/// Exporte le cerveau en zip (~2 Mo, hors modèles) pour la sauvegarde cloud.
+#[tauri::command]
+fn export_backup() -> Result<Vec<u8>, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    backup::export_in(&dir)
+}
+
+/// Restaure une sauvegarde (zip) dans le dossier de données. Renvoie le nombre
+/// de fichiers restaurés. L'app doit recharger le graphe ensuite.
+#[tauri::command]
+fn import_backup(bytes: Vec<u8>) -> Result<usize, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    backup::import_in(&dir, &bytes)
+}
+
 /// Statut des clients IA (Claude Desktop/Code, Cursor) : installés ? connectés au MCP Lucid ?
 #[tauri::command]
 fn ai_clients_status() -> Vec<mcp_clients::AiClientStatus> {
@@ -827,6 +843,7 @@ fn read_lossy(p: &std::path::Path) -> Result<String, String> {
 }
 
 // ponytail: textutil = natif macOS ; passer à une crate docx le jour du port Windows.
+#[cfg(target_os = "macos")]
 fn textutil_to_text(p: &std::path::Path) -> Result<String, String> {
     let out = std::process::Command::new("textutil")
         .args(["-convert", "txt", "-stdout"])
@@ -837,6 +854,12 @@ fn textutil_to_text(p: &std::path::Path) -> Result<String, String> {
         return Err(format!("textutil a échoué : {}", String::from_utf8_lossy(&out.stderr)));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// Hors macOS : import .doc/.rtf/.docx non supporté en v1 (textutil est natif macOS).
+#[cfg(not(target_os = "macos"))]
+fn textutil_to_text(_p: &std::path::Path) -> Result<String, String> {
+    Err("Import .doc/.rtf/.docx non supporté sur cette plateforme (macOS uniquement en v1).".into())
 }
 
 #[cfg(test)]
@@ -918,6 +941,7 @@ mod import_tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn docx_via_textutil() {
         // Round-trip : txt → docx (textutil) → notre extraction. macOS only.
         let dir = std::env::temp_dir().join("brainlink_test_import");
@@ -1576,6 +1600,8 @@ pub fn run() {
             ai_clients_status,
             connect_ai_client,
             disconnect_ai_client,
+            export_backup,
+            import_backup,
             set_node_parent,
             rename_node,
             obsidian_set_vault,

@@ -30,3 +30,7 @@ src-tauri/target/
 *.njsproj
 *.sln
 *.sw?
+
+# Sidecars du bundle (générés par scripts/bundle-sidecars.sh)
+src-tauri/binaries/
+src-tauri/resources/

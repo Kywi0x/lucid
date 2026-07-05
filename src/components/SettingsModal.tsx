@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Plug,
   MessageCircle,
@@ -16,6 +16,7 @@ import {
   Trash2,
   Plus,
   Bot,
+  User,
 } from "lucide-react";
 import claudeLogo from "@/assets/claude-logo.png";
 import googleDriveLogo from "@/assets/google_drive.svg.png";
@@ -38,9 +39,12 @@ import {
   aiClientsStatus,
   connectAiClient,
   disconnectAiClient,
+  exportBackup,
+  importBackup,
   type ModelInfo,
 } from "@/lib/api";
 import type { AiClientStatus } from "@/lib/types";
+import { supabase, BACKUP_BUCKET } from "@/lib/supabase";
 import type { ConnectorStatus, Space } from "@/lib/types";
 import { cn, relativeDate } from "@/lib/utils";
 
@@ -706,7 +710,181 @@ function ModelSection() {
 
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
-type Section = "connectors" | "ai-clients" | "spaces" | "model";
+type Section = "connectors" | "ai-clients" | "spaces" | "model" | "account";
+
+// ── Section « Compte » : auth Supabase + sauvegarde cloud du cerveau ─────────
+function AccountSection({ onRestored }: { onRestored?: () => void }) {
+  const [session, setSession] = useState<import("@supabase/supabase-js").Session | null>(null);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [backups, setBackups] = useState<{ name: string; created_at: string; size: number }[]>([]);
+
+  useEffect(() => {
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  const uid = session?.user.id;
+
+  const refreshBackups = useCallback(async () => {
+    if (!supabase || !uid) return;
+    const { data, error } = await supabase.storage.from(BACKUP_BUCKET)
+      .list(uid, { sortBy: { column: "created_at", order: "desc" }, limit: 20 });
+    if (!error && data) {
+      setBackups(data.map((f) => ({
+        name: f.name,
+        created_at: f.created_at ?? "",
+        size: (f.metadata as { size?: number } | null)?.size ?? 0,
+      })));
+    }
+  }, [uid]);
+  useEffect(() => { refreshBackups(); }, [refreshBackups]);
+
+  async function auth(mode: "signin" | "signup") {
+    if (!supabase || !email.trim() || password.length < 6) {
+      setMsg("Email + mot de passe (6 caractères min).");
+      return;
+    }
+    setBusy(mode); setMsg(null);
+    try {
+      const { error, data } = mode === "signin"
+        ? await supabase.auth.signInWithPassword({ email: email.trim(), password })
+        : await supabase.auth.signUp({ email: email.trim(), password });
+      if (error) throw error;
+      if (mode === "signup" && !data.session) {
+        setMsg("Compte créé — vérifie ta boîte mail pour confirmer, puis connecte-toi.");
+      }
+    } catch (e) {
+      setMsg(String((e as Error).message ?? e));
+    } finally { setBusy(null); }
+  }
+
+  async function handleBackup() {
+    if (!supabase || !uid) return;
+    setBusy("backup"); setMsg(null);
+    try {
+      const bytes = await exportBackup();
+      const name = `${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
+      const { error } = await supabase.storage.from(BACKUP_BUCKET)
+        .upload(`${uid}/${name}`, new Blob([bytes.buffer as ArrayBuffer], { type: "application/zip" }));
+      if (error) throw error;
+      setMsg(`Sauvegardé ✓ (${(bytes.length / 1024 / 1024).toFixed(1)} Mo)`);
+      await refreshBackups();
+    } catch (e) {
+      setMsg(String((e as Error).message ?? e));
+    } finally { setBusy(null); }
+  }
+
+  async function handleRestore(name: string) {
+    if (!supabase || !uid) return;
+    if (!confirm("Restaurer cette sauvegarde ? Le cerveau actuel sera remplacé (une copie locale de brain.json est gardée).")) return;
+    setBusy(name); setMsg(null);
+    try {
+      const { data, error } = await supabase.storage.from(BACKUP_BUCKET).download(`${uid}/${name}`);
+      if (error || !data) throw error ?? new Error("Téléchargement vide");
+      const n = await importBackup(new Uint8Array(await data.arrayBuffer()));
+      setMsg(`${n} fichiers restaurés ✓`);
+      onRestored?.();
+    } catch (e) {
+      setMsg(String((e as Error).message ?? e));
+    } finally { setBusy(null); }
+  }
+
+  if (!supabase) {
+    return (
+      <div className="p-5">
+        <p className="mb-1 text-sm font-semibold text-[var(--color-text)]">Compte</p>
+        <p className="text-xs leading-relaxed text-[var(--color-muted)]">
+          Supabase n'est pas configuré : remplis <code>VITE_SUPABASE_URL</code> et{" "}
+          <code>VITE_SUPABASE_ANON_KEY</code> dans <code>.env</code> puis relance l'app.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full overflow-y-auto p-5">
+      <p className="mb-1 text-sm font-semibold text-[var(--color-text)]">Compte</p>
+      <p className="mb-4 text-xs leading-relaxed text-[var(--color-muted)]">
+        Optionnel — l'app fonctionne entièrement sans compte. Le compte sert à
+        <strong> sauvegarder ton cerveau dans le cloud</strong> (~2 Mo chiffrés au repos)
+        et à le retrouver sur un autre Mac.
+      </p>
+
+      {!session ? (
+        <div className="space-y-2">
+          <input
+            type="email" value={email} onChange={(e) => setEmail(e.target.value)}
+            placeholder="email@exemple.fr"
+            className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-sm text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+          />
+          <input
+            type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+            placeholder="Mot de passe (6 caractères min)"
+            className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-sm text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+          />
+          <div className="flex gap-2">
+            <button onClick={() => auth("signin")} disabled={busy !== null}
+              className="flex-1 rounded-lg bg-[var(--color-accent)] px-3 py-2 text-sm text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-40">
+              {busy === "signin" ? <Loader2 className="mx-auto size-4 animate-spin" /> : "Se connecter"}
+            </button>
+            <button onClick={() => auth("signup")} disabled={busy !== null}
+              className="flex-1 rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] disabled:opacity-40">
+              {busy === "signup" ? <Loader2 className="mx-auto size-4 animate-spin" /> : "Créer un compte"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <div className="flex items-center gap-3 rounded-xl border border-[var(--color-border)] px-3.5 py-2.5">
+            <span className="size-2 shrink-0 rounded-full bg-[var(--color-ok)]" />
+            <p className="min-w-0 flex-1 truncate text-sm text-[var(--color-text)]">{session.user.email}</p>
+            <button onClick={() => supabase!.auth.signOut()}
+              className="shrink-0 rounded-lg px-2.5 py-1 text-xs text-[var(--color-muted)] hover:bg-[var(--color-surface-2)]">
+              Se déconnecter
+            </button>
+          </div>
+
+          <button onClick={handleBackup} disabled={busy !== null}
+            className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--color-accent)] px-3 py-2 text-sm text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-40">
+            {busy === "backup" ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            Sauvegarder mon cerveau maintenant
+          </button>
+
+          {backups.length > 0 && (
+            <div>
+              <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+                Sauvegardes ({backups.length})
+              </p>
+              <ul className="space-y-1">
+                {backups.map((b) => (
+                  <li key={b.name} className="flex items-center justify-between gap-2 rounded-lg border border-[var(--color-border)] px-3 py-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-xs text-[var(--color-text)]">
+                        {b.created_at ? relativeDate(b.created_at) : b.name}
+                      </p>
+                      <p className="text-[10px] text-[var(--color-muted)]">{(b.size / 1024 / 1024).toFixed(1)} Mo</p>
+                    </div>
+                    <button onClick={() => handleRestore(b.name)} disabled={busy !== null}
+                      className="shrink-0 rounded-lg px-2 py-1 text-[11px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] disabled:opacity-40">
+                      {busy === b.name ? <Loader2 className="size-3 animate-spin" /> : "Restaurer"}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {msg && <p className="mt-3 text-xs text-[var(--color-muted)]">{msg}</p>}
+    </div>
+  );
+}
 
 // ── Section « Mes IA » : connexion one-click du serveur MCP Lucid ────────────
 
@@ -720,7 +898,7 @@ function AiClientLogo({ id }: { id: string }) {
   }
 }
 
-function AiClientsSection() {
+export function AiClientsSection() {
   const [clients, setClients] = useState<AiClientStatus[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [msgs, setMsgs] = useState<Record<string, string>>({});
@@ -813,11 +991,13 @@ interface Props {
   onSpaceCreate: (name: string) => void;
   onSpaceRename: (id: string, name: string) => void;
   onSpaceDelete: (id: string) => void;
+  /** Appelé après restauration d'une sauvegarde (recharge le graphe). */
+  onRestored?: () => void;
 }
 
 export function SettingsModal({
   connectors, spaces, onRefresh, onSyncDone, onClose,
-  onSpaceCreate, onSpaceRename, onSpaceDelete,
+  onSpaceCreate, onSpaceRename, onSpaceDelete, onRestored,
 }: Props) {
   const [section, setSection] = useState<Section>("connectors");
 
@@ -826,6 +1006,7 @@ export function SettingsModal({
     { id: "ai-clients", label: "Mes IA",   desc: "Qui consulte ton cerveau",  icon: <Bot className="size-3.5" /> },
     { id: "spaces",     label: "Spaces",   desc: "Tes vues du graphe",        icon: <Layers className="size-3.5" /> },
     { id: "model",      label: "IA locale", desc: "Le moteur d'analyse",      icon: <Cpu className="size-3.5" /> },
+    { id: "account",    label: "Compte",   desc: "Sauvegarde cloud",          icon: <User className="size-3.5" /> },
   ];
 
   return (
@@ -882,6 +1063,7 @@ export function SettingsModal({
             <SpacesSection spaces={spaces} onCreate={onSpaceCreate} onRename={onSpaceRename} onDelete={onSpaceDelete} />
           )}
           {section === "model" && <ModelSection />}
+          {section === "account" && <AccountSection onRestored={onRestored} />}
         </div>
       </div>
     </div>

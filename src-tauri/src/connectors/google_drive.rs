@@ -457,9 +457,37 @@ fn extract_pdf(
     result
 }
 
+/// Résout un binaire externe : sidecar du bundle d'abord (app packagée,
+/// binaire à côté de l'exécutable), puis Homebrew, puis le PATH.
 fn which_bin(name: &str) -> Option<String> {
-    Command::new("which").arg(name).output().ok()
-        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sidecar = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            if sidecar.is_file() { return Some(sidecar.to_string_lossy().into_owned()); }
+        }
+    }
+    // Fallbacks Unix (Homebrew + PATH). Sur Windows, MVP = sidecar-first uniquement
+    // (poppler/tesseract non embarqués → PDF/OCR dégrade proprement).
+    #[cfg(unix)]
+    {
+        for prefix in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            let p = std::path::Path::new(prefix).join(name);
+            if p.is_file() { return Some(p.to_string_lossy().into_owned()); }
+        }
+        return Command::new("which").arg(name).output().ok()
+            .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
+            .filter(|s| !s.is_empty());
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// Dossier tessdata du bundle (Contents/Resources/tessdata) si présent —
+/// nécessaire au tesseract embarqué pour trouver fra+eng.
+fn tessdata_prefix() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let res = exe.parent()?.parent()?.join("Resources").join("tessdata");
+    res.is_dir().then_some(res)
 }
 
 /// pdftotext (poppler) en premier ; fallback OCR (pdftoppm + tesseract) pour les PDFs scannés.
@@ -520,7 +548,9 @@ fn ocr_pdf(path: &std::path::Path) -> Option<String> {
 
     let mut pages = Vec::new();
     for entry in &entries {
-        if let Ok(ocr) = Command::new(&tesseract)
+        let mut cmd = Command::new(&tesseract);
+        if let Some(td) = tessdata_prefix() { cmd.env("TESSDATA_PREFIX", td); }
+        if let Ok(ocr) = cmd
             .arg(entry.path())
             .arg("stdout")
             .args(["-l", "fra+eng"])

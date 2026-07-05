@@ -189,6 +189,17 @@ export function importFile(path: string, parentId: string): Promise<import("./ty
   return invoke("import_file", { path, parentId });
 }
 
+/** Exporte le cerveau en zip (octets) pour la sauvegarde cloud (~2 Mo, hors modèles). */
+export async function exportBackup(): Promise<Uint8Array> {
+  const bytes: number[] = await invoke("export_backup");
+  return new Uint8Array(bytes);
+}
+
+/** Restaure une sauvegarde zip dans le dossier de données. Renvoie le nombre de fichiers. */
+export function importBackup(bytes: Uint8Array): Promise<number> {
+  return invoke("import_backup", { bytes: Array.from(bytes) });
+}
+
 /** Statut des clients IA installés (Claude Desktop/Code, Cursor) vis-à-vis du MCP Lucid. */
 export function aiClientsStatus(): Promise<import("./types").AiClientStatus[]> {
   return invoke("ai_clients_status");

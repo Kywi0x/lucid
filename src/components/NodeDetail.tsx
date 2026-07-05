@@ -671,7 +671,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                     <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
                   </div>
                 ) : (
-                  <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+                  <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
                 )
               )}
             </div>
@@ -724,7 +724,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                 <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
               </div>
             ) : (
-              <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Commencer à écrire…" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+              <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
             )
           )}
           {(display.decisions ?? []).length > 0 && (

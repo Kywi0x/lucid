@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "externalBin": [
+      "binaries/llama-completion",
+      "binaries/lucid_mcp"
+    ],
+    "resources": {
+      "resources/win-libs/*.dll": "./"
+    }
+  }
+}
