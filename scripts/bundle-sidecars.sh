@@ -34,22 +34,26 @@ cp "src-tauri/target/release/lucid_mcp" "$BIN_DIR/lucid_mcp-$TRIPLE"
 echo "── 2/5 llama-completion"
 # Local : build statique (self-contained, pas de dylib). CI : release officielle
 # llama.cpp (dynamique → ses dylibs seront embarqués par dylibbundler ci-dessous).
-LLAMA_DYLIBS=""
+LLAMA_DYLIBS=""; LLAMA_SRC=""
 if [ -f "$LLAMA_STATIC" ]; then
   echo "   → build statique local"
   cp "$LLAMA_STATIC" "$BIN_DIR/llama-completion-$TRIPLE"
 else
-  echo "   → download release officielle (macos-arm64)"
+  echo "   → download release officielle (macos-arm64, .tar.gz)"
   # Auth GitHub API si dispo (évite le rate-limit anonyme sur les runners partagés).
-  gh_auth=(); [ -n "${GITHUB_TOKEN:-}" ] && gh_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-  url=$(curl -fsSL "${gh_auth[@]}" https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
-    | grep -o 'https://[^"]*bin-macos-arm64\.zip' | head -1)
+  # ${a[@]+"${a[@]}"} = expansion sûre d'un array vide sous `set -u` (bash 3.2 macOS).
+  auth=(); [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  api=https://api.github.com/repos/ggml-org/llama.cpp/releases/latest
+  url=$(curl -fsSL ${auth[@]+"${auth[@]}"} "$api" \
+    | grep -o 'https://[^"]*bin-macos-arm64\.tar\.gz' | head -1 || true)
   [ -n "$url" ] || { echo "❌ asset llama.cpp macos-arm64 introuvable"; exit 1; }
-  tmp=$(mktemp -d); curl -fsSL "$url" -o "$tmp/llama.zip"; unzip -q "$tmp/llama.zip" -d "$tmp/x"
-  cli=$(find "$tmp/x" -name llama-cli -type f | head -1)
+  tmp=$(mktemp -d); curl -fsSL ${auth[@]+"${auth[@]}"} "$url" -o "$tmp/llama.tgz"
+  tar -xzf "$tmp/llama.tgz" -C "$tmp"
+  cli=$(find "$tmp" -name llama-cli -type f | head -1)
   [ -n "$cli" ] || { echo "❌ llama-cli introuvable dans l'archive"; exit 1; }
   cp "$cli" "$BIN_DIR/llama-completion-$TRIPLE"
-  LLAMA_DYLIBS="llama-completion"   # → à passer dans dylibbundler
+  LLAMA_DYLIBS="llama-completion"      # → à passer dans dylibbundler
+  LLAMA_SRC=$(dirname "$cli")          # dossier des dylibs @rpath (libllama, libggml…)
 fi
 
 echo "── 3/5 poppler (pdftotext + pdftoppm) + dylibs"
@@ -66,14 +70,23 @@ done
 # dylibbundler : copie la fermeture de dylibs dans resources/libs et réécrit
 # les chemins en @executable_path/../Resources/libs/ (les sidecars finissent
 # dans Contents/MacOS/, les libs dans Contents/Resources/libs/).
-for b in pdftotext pdftoppm tesseract $LLAMA_DYLIBS; do
+for b in pdftotext pdftoppm tesseract; do
   echo "   dylibbundler: $b"
   dylibbundler -of -b -x "$BIN_DIR/$b-$TRIPLE" \
     -d "$LIB_DIR/" -p "@executable_path/../Resources/libs/" \
     -s /opt/homebrew/lib < /dev/null > /dev/null
 done
+# llama téléchargé (dynamique) : ses dylibs @rpath sont dans l'archive → -s LLAMA_SRC.
+# (build statique local : LLAMA_DYLIBS vide, rien à faire.)
+if [ -n "$LLAMA_DYLIBS" ]; then
+  echo "   dylibbundler: llama-completion"
+  dylibbundler -of -b -x "$BIN_DIR/llama-completion-$TRIPLE" \
+    -d "$LIB_DIR/" -p "@executable_path/../Resources/libs/" \
+    -s /opt/homebrew/lib -s "$LLAMA_SRC" < /dev/null > /dev/null
+fi
 
-echo "── 5/5 re-signature ad-hoc (dylibbundler invalide les signatures)"
+echo "── 5/5 bit exécutable + re-signature ad-hoc (dylibbundler invalide les signatures)"
+chmod +x "$BIN_DIR"/*-"$TRIPLE"   # le llama téléchargé perd parfois son +x après cp/bundle
 codesign -f -s - "$BIN_DIR"/*-"$TRIPLE" "$LIB_DIR"/*.dylib 2>/dev/null
 
 echo
