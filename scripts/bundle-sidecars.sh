@@ -19,6 +19,14 @@ LLAMA_STATIC="$HOME/Library/Application Support/fr.ideeri.brainlink/llama.cpp/bu
 rm -rf "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
 mkdir -p "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
 
+# tauri-build (build.rs) valide l'existence de TOUS les externalBin dès qu'on
+# compile le crate — y compris `cargo build --bin lucid_mcp` ci-dessous. On crée
+# des placeholders vides pour satisfaire cette vérification ; les vrais binaires
+# les écrasent aux étapes suivantes.
+for b in llama-completion lucid_mcp pdftotext pdftoppm tesseract; do
+  : > "$BIN_DIR/$b-$TRIPLE"
+done
+
 echo "── 1/5 lucid_mcp (release)"
 (cd src-tauri && cargo build --release --bin lucid_mcp --quiet)
 cp "src-tauri/target/release/lucid_mcp" "$BIN_DIR/lucid_mcp-$TRIPLE"
@@ -32,7 +40,9 @@ if [ -f "$LLAMA_STATIC" ]; then
   cp "$LLAMA_STATIC" "$BIN_DIR/llama-completion-$TRIPLE"
 else
   echo "   → download release officielle (macos-arm64)"
-  url=$(curl -fsSL https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+  # Auth GitHub API si dispo (évite le rate-limit anonyme sur les runners partagés).
+  gh_auth=(); [ -n "${GITHUB_TOKEN:-}" ] && gh_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  url=$(curl -fsSL "${gh_auth[@]}" https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
     | grep -o 'https://[^"]*bin-macos-arm64\.zip' | head -1)
   [ -n "$url" ] || { echo "❌ asset llama.cpp macos-arm64 introuvable"; exit 1; }
   tmp=$(mktemp -d); curl -fsSL "$url" -o "$tmp/llama.zip"; unzip -q "$tmp/llama.zip" -d "$tmp/x"
