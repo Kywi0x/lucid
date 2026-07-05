@@ -56,7 +56,7 @@ export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDo
             </h2>
             <p className="mx-auto mt-1 max-w-md text-center text-sm text-[var(--color-muted)]">
               Ton second cerveau se nourrit de tes sources. Tout est analysé
-              <strong> 100 % en local</strong> — rien ne quitte ce Mac.
+              <strong> 100 % en local</strong> — rien ne quitte cette machine.
             </p>
 
             <div className="mt-5 space-y-1.5">

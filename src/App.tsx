@@ -481,7 +481,7 @@ function App() {
     <div className="relative h-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
 
       {!graph && !generating ? (
-        <GenerateEmpty error={error} onGenerate={handleGenerate} />
+        <GenerateEmpty error={error} onGenerate={handleGenerate} onOpenSettings={() => setSettingsOpen(true)} />
       ) : (
         <>
           {/* ── Canvas principal ── */}

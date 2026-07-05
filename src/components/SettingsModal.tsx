@@ -812,7 +812,7 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
       <p className="mb-4 text-xs leading-relaxed text-[var(--color-muted)]">
         Optionnel — l'app fonctionne entièrement sans compte. Le compte sert à
         <strong> sauvegarder ton cerveau dans le cloud</strong> (~2 Mo chiffrés au repos)
-        et à le retrouver sur un autre Mac.
+        et à le retrouver sur une autre machine.
       </p>
 
       {!session ? (
@@ -947,7 +947,7 @@ export function AiClientsSection() {
                     "size-1.5 shrink-0 rounded-full " +
                     (c.connected ? "bg-[var(--color-ok)]" : c.installed ? "bg-[#e0a33c]" : "bg-[var(--color-border)]")
                   } />
-                  {c.connected ? "Connecté au cerveau Lucid" : c.installed ? "Détecté — pas encore connecté" : "Non détecté sur ce Mac"}
+                  {c.connected ? "Connecté au cerveau Lucid" : c.installed ? "Détecté — pas encore connecté" : "Non détecté sur cette machine"}
                 </p>
               </div>
               {c.connected ? (

@@ -60,9 +60,15 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Compte/sauvegarde cloud Supabase (optionnel) : si les secrets sont vides,
+          # supabase=null → l'app reste 100 % locale, section Compte « non configuré ».
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Lucid ${{ github.ref_name }}"
+          # Release seulement sur push de tag v* ; en workflow_dispatch (test), on
+          # build sans publier de release (évite de créer un tag « main » parasite).
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Lucid {0}', github.ref_name) || '' }}
           releaseBody: "Téléchargez le .dmg (macOS) ou le .exe (Windows) ci-dessous."
           releaseDraft: false
           prerelease: false
@@ -70,7 +76,7 @@ jobs:
 
       # Copie à nom fixe → liens stables `releases/latest/download/<nom>` pour docs/download.html
       - name: Stable-named asset (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -79,7 +85,7 @@ jobs:
           gh release upload "${{ github.ref_name }}" "Lucid-macOS-arm64.dmg" --clobber
 
       - name: Stable-named asset (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh

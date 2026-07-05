@@ -1,15 +1,18 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Brain, Sparkles, Loader2, AlertTriangle, RotateCw } from "lucide-react";
+import { Brain, Sparkles, Loader2, AlertTriangle, RotateCw, Plug } from "lucide-react";
 import type { BrainProgress } from "@/lib/api";
 
-/** État vide : invite à générer le second cerveau. */
+/** État vide : invite à connecter une source puis générer le second cerveau. */
 export function GenerateEmpty({
   error,
   onGenerate,
+  onOpenSettings,
 }: {
   error: string | null;
   onGenerate: () => void;
+  /** Ouvre les Réglages (section Sources) — indispensable au 1er lancement sans données. */
+  onOpenSettings: () => void;
 }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
@@ -34,13 +37,26 @@ export function GenerateEmpty({
           {error}
         </div>
       )}
-      <button
-        onClick={onGenerate}
-        className="flex items-center gap-2 rounded-lg bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
-      >
-        <Sparkles className="size-4" />
-        Générer ma mind map
-      </button>
+      <div className="flex flex-col items-center gap-2">
+        <button
+          onClick={onGenerate}
+          className="flex items-center gap-2 rounded-lg bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+        >
+          <Sparkles className="size-4" />
+          Générer ma mind map
+        </button>
+        <button
+          onClick={onOpenSettings}
+          className="flex items-center gap-2 rounded-lg border border-[var(--color-border)] px-4 py-2 text-sm font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-2)]"
+        >
+          <Plug className="size-4" />
+          Connecter une source / importer un fichier
+        </button>
+      </div>
+      <p className="max-w-md text-xs text-[var(--color-muted)]">
+        Aucune source détectée ? Connecte Notion, Google Drive ou importe un fichier
+        depuis les Réglages, puis génère ta carte.
+      </p>
     </div>
   );
 }
