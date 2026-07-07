@@ -71,9 +71,21 @@
 
   <script>
     // État live via l'API GitHub (repo public, sans auth). Pas de rebuild de page :
-    // la date/statut se recalcule à chaque visite.
+    // tout se recalcule à chaque visite (statut par plateforme + version).
     const REPO = "Kywi0x/lucid";
     const fmt = d => new Date(d).toLocaleString("fr-FR", { dateStyle: "long", timeStyle: "short" });
+    // Icône selon l'état d'un job GitHub Actions.
+    const jobIcon = j =>
+      !j ? "⚪️"
+      : j.status !== "completed" ? "🟡"
+      : j.conclusion === "success" ? "🟢"
+      : j.conclusion === "skipped" ? "⚪️"
+      : "🔴";
+    const jobText = j =>
+      !j ? "non lancé"
+      : j.status !== "completed" ? "en cours…"
+      : j.conclusion === "success" ? "OK"
+      : j.conclusion;
     (async () => {
       const el = document.getElementById("status");
       try {
@@ -83,18 +95,19 @@
         ]);
         const run = (await runsRes.json()).workflow_runs?.[0];
         const rel = relRes.ok ? await relRes.json() : null;
+        if (!run) { el.textContent = "Aucun build trouvé."; return; }
+
+        const jobs = (await (await fetch(`https://api.github.com/repos/${REPO}/actions/runs/${run.id}/jobs`)).json()).jobs || [];
+        const mac = jobs.find(j => /macos/i.test(j.name));
+        const win = jobs.find(j => /windows/i.test(j.name));
+
         const lines = [];
-        if (run) {
-          const label = run.status !== "completed"
-            ? "🟡 <b>Build en cours…</b> (reviens dans ~15 min)"
-            : run.conclusion === "success"
-              ? "🟢 <b>Build à jour</b> — prêt à télécharger"
-              : `🔴 <b>Dernier build en échec</b> (${run.conclusion})`;
-          lines.push(`${label}<br><a href="${run.html_url}" target="_blank" rel="noopener">Voir le build</a> · ${fmt(run.updated_at)}`);
-        }
+        lines.push(`<b>Build #${run.run_number}</b> · commit <code>${run.head_sha.slice(0, 7)}</code> · <a href="${run.html_url}" target="_blank" rel="noopener">détails</a>`);
+        lines.push(`${jobIcon(mac)} macOS : ${jobText(mac)}`);
+        lines.push(`${jobIcon(win)} Windows : ${jobText(win)}`);
         const dmg = rel?.assets?.find(a => a.name === "Lucid-macOS-arm64.dmg");
-        if (dmg) lines.push(`Installateur mis à jour le <b>${fmt(dmg.updated_at)}</b>`);
-        el.innerHTML = lines.join("<br>") || "État indisponible.";
+        if (dmg) lines.push(`Installateur publié le <b>${fmt(dmg.updated_at)}</b>`);
+        el.innerHTML = lines.join("<br>");
       } catch {
         el.textContent = "État du build indisponible pour le moment.";
       }

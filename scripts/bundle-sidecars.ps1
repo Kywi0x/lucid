@@ -25,12 +25,17 @@ $ghHeaders = @{ "User-Agent" = "lucid-ci" }
 if ($env:GITHUB_TOKEN) { $ghHeaders["Authorization"] = "Bearer $($env:GITHUB_TOKEN)" }
 
 Write-Host "── 1/2 llama-completion (release officielle llama.cpp, CPU x64)"
-$rel = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" -Headers $ghHeaders
-$asset = $rel.assets | Where-Object { $_.name -like "*bin-win-cpu-x64.zip" } | Select-Object -First 1
-if (-not $asset) {
-    $asset = $rel.assets | Where-Object { $_.name -like "*bin-win*x64.zip" } | Select-Object -First 1
+# On veut STRICTEMENT l'archive CPU x64 (contient llama-cli.exe + DLL ggml).
+# `latest` publie ses assets par vagues : l'exe CPU peut manquer quelques minutes
+# alors que les zips cudart/cuda sont déjà là. On balaie donc les dernières releases
+# jusqu'à en trouver une avec l'asset CPU (pas de fallback → jamais un zip cudart).
+$releases = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" -Headers $ghHeaders
+$asset = $null
+foreach ($r in $releases) {
+    $asset = $r.assets | Where-Object { $_.name -like "*bin-win-cpu-x64.zip" } | Select-Object -First 1
+    if ($asset) { break }
 }
-if (-not $asset) { throw "Aucun asset llama.cpp win-x64 trouvé dans la dernière release." }
+if (-not $asset) { throw "Aucun asset llama.cpp *bin-win-cpu-x64.zip dans les 10 dernières releases." }
 Write-Host "   → $($asset.name)"
 
 $zip = Join-Path $env:TEMP $asset.name
