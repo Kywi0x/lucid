@@ -37,18 +37,25 @@
     a.btn svg { width: 20px; height: 20px; }
     .note { color: var(--muted); font-size: .8rem; margin-top: 1.75rem; }
     .note a { color: var(--accent); }
+    .status {
+      margin: 0 0 1.75rem; font-size: .85rem; color: var(--muted);
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: .7rem 1rem; line-height: 1.6;
+    }
+    .status b { color: var(--fg); font-weight: 600; }
   </style>
 </head>
 <body>
   <main class="wrap">
     <h1>Lucid</h1>
     <p class="tag">Votre second cerveau, 100&nbsp;% en local.</p>
+    <p class="status" id="status">Chargement de l'état du build…</p>
     <div class="btns">
-      <a class="btn primary" href="https://github.com/Kywi0x/lucid/releases/latest/download/Lucid-macOS-arm64.dmg">
+      <a class="btn primary" href="https://github.com/Kywi0x/lucid/releases/download/alpha/Lucid-macOS-arm64.dmg">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M16.4 12.6c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9s-1.8-.8-3-.8c-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7 2-1.1 2.8-2.2c.9-1.3 1.2-2.5 1.3-2.6-.1 0-2.4-1-2.5-3.6zM14.1 5.4c.6-.8 1.1-1.9 1-3-1 0-2.1.6-2.8 1.4-.6.7-1.1 1.8-1 2.9 1.1.1 2.2-.5 2.8-1.3z"/></svg>
         Télécharger pour Mac
       </a>
-      <a class="btn" href="https://github.com/Kywi0x/lucid/releases/latest/download/Lucid-Windows-setup.exe">
+      <a class="btn" href="https://github.com/Kywi0x/lucid/releases/download/alpha/Lucid-Windows-setup.exe">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.5 10.5 4.4v7.1H3zm0 13L10.5 19.6v-7H3zM11.5 4.3 21 3v8.5h-9.5zM11.5 12.5H21V21l-9.5-1.3z"/></svg>
         Télécharger pour Windows
       </a>
@@ -61,5 +68,37 @@
       Toutes les versions sur <a href="https://github.com/Kywi0x/lucid/releases">GitHub Releases</a>.
     </p>
   </main>
+
+  <script>
+    // État live via l'API GitHub (repo public, sans auth). Pas de rebuild de page :
+    // la date/statut se recalcule à chaque visite.
+    const REPO = "Kywi0x/lucid";
+    const fmt = d => new Date(d).toLocaleString("fr-FR", { dateStyle: "long", timeStyle: "short" });
+    (async () => {
+      const el = document.getElementById("status");
+      try {
+        const [runsRes, relRes] = await Promise.all([
+          fetch(`https://api.github.com/repos/${REPO}/actions/workflows/release.yml/runs?per_page=1`),
+          fetch(`https://api.github.com/repos/${REPO}/releases/tags/alpha`),
+        ]);
+        const run = (await runsRes.json()).workflow_runs?.[0];
+        const rel = relRes.ok ? await relRes.json() : null;
+        const lines = [];
+        if (run) {
+          const label = run.status !== "completed"
+            ? "🟡 <b>Build en cours…</b> (reviens dans ~15 min)"
+            : run.conclusion === "success"
+              ? "🟢 <b>Build à jour</b> — prêt à télécharger"
+              : `🔴 <b>Dernier build en échec</b> (${run.conclusion})`;
+          lines.push(`${label}<br><a href="${run.html_url}" target="_blank" rel="noopener">Voir le build</a> · ${fmt(run.updated_at)}`);
+        }
+        const dmg = rel?.assets?.find(a => a.name === "Lucid-macOS-arm64.dmg");
+        if (dmg) lines.push(`Installateur mis à jour le <b>${fmt(dmg.updated_at)}</b>`);
+        el.innerHTML = lines.join("<br>") || "État indisponible.";
+      } catch {
+        el.textContent = "État du build indisponible pour le moment.";
+      }
+    })();
+  </script>
 </body>
 </html>

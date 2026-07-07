@@ -1,10 +1,13 @@
 name: Release (dmg + exe)
 
-# Pousser un tag `v*` (ex. `git tag v0.1.0 && git push origin v0.1.0`) déclenche
-# le build macOS (.dmg) + Windows (.exe NSIS) et publie une GitHub Release avec
-# les deux installateurs. Des copies à nom fixe alimentent la page de download.
+# Deux déclencheurs :
+#  - Tag `v*` (ex. `git tag v0.1.0 && git push origin v0.1.0`) → release versionnée figée.
+#  - Push sur `main` → build auto qui met à jour l'asset de la release `alpha`
+#    (URL stable `releases/download/alpha/Lucid-macOS-arm64.dmg`, toujours = dernier main).
+# Dans les deux cas : build macOS (.dmg) + Windows (.exe NSIS) + copies à nom fixe.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -74,22 +77,33 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-      # Copie à nom fixe → liens stables `releases/latest/download/<nom>` pour docs/download.html
+      # Copie à nom fixe → lien stable. Tag v* → sa release ; push main → release `alpha`.
       - name: Stable-named asset (macOS)
-        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
+        if: runner.os == 'macOS'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'alpha' }}
         run: |
           dmg=$(ls src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg | head -1)
           cp "$dmg" "Lucid-macOS-arm64.dmg"
-          gh release upload "${{ github.ref_name }}" "Lucid-macOS-arm64.dmg" --clobber
+          # ponytail: crée la release alpha si absente ; sinon on clobbe juste l'asset.
+          gh release view "$TARGET" >/dev/null 2>&1 || \
+            gh release create "$TARGET" --prerelease \
+              --title "Lucid ($TARGET — dernier build de main)" \
+              --notes "Build automatique du dernier commit sur \`main\`. Les installateurs ci-dessous sont mis à jour à chaque push."
+          gh release upload "$TARGET" "Lucid-macOS-arm64.dmg" --clobber
 
       - name: Stable-named asset (Windows)
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
+        if: runner.os == 'Windows'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'alpha' }}
         shell: pwsh
         run: |
           $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           Copy-Item $exe.FullName "Lucid-Windows-setup.exe"
-          gh release upload "${{ github.ref_name }}" "Lucid-Windows-setup.exe" --clobber
+          gh release view $env:TARGET *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TARGET --prerelease --title "Lucid ($env:TARGET — dernier build de main)" --notes "Build automatique du dernier commit sur main."
+          }
+          gh release upload $env:TARGET "Lucid-Windows-setup.exe" --clobber
