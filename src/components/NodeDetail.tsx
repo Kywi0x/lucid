@@ -10,6 +10,8 @@ import type { BrainGraph, BrainNode, NodeSnapshotInfo } from "@/lib/types";
 import { relativeDate, cn } from "@/lib/utils";
 import { exportNodeMd, synthesizeNode, saveNodeContent, loadNodeContent, listNodeSnapshots, getNodeSnapshot, renameNode, askNode, generateContent } from "@/lib/api";
 import { MarkdownEditor } from "./MarkdownEditor";
+import { Properties } from "./Properties";
+import { parseFrontmatter, serializeFrontmatter, type Prop } from "@/lib/frontmatter";
 import claudeLogo from "@/assets/claude-logo.png";
 import driveLogo  from "@/assets/google_drive.svg.png";
 import notionLogo from "@/assets/Notion_app_logo.png";
@@ -338,18 +340,30 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
       .finally(() => setSourceLoading(false));
   }, [node.id]);
 
-  const editorContent = localContent ?? node.content ?? sourceText ?? "";
+  // Propriétés (frontmatter) + corps markdown, séparés : l'éditeur ne voit que le corps.
+  // Une seule source de vérité (le contenu sérialisé) ; reseed au changement de nœud /
+  // chargement source / restauration — PAS sur l'écho de save (évite le clobber en cours d'édition).
+  const [props, setProps] = useState<Prop[]>(() => parseFrontmatter(node.content ?? "").props);
+  const [body, setBody] = useState(() => parseFrontmatter(node.content ?? "").body);
+  useEffect(() => {
+    const { props: p, body: b } = parseFrontmatter(localContent ?? node.content ?? sourceText ?? "");
+    setProps(p);
+    setBody(b);
+  }, [node.id, sourceText, localContent]);
+
+  const persistBody = (b: string) => { setBody(b); handleContentChange(serializeFrontmatter(props, b)); };
+  const persistProps = (p: Prop[]) => { setProps(p); handleContentChange(serializeFrontmatter(p, body)); };
 
   const taskStats = useMemo(() => {
-    const all = editorContent.match(/^\s*[-*] \[[ xX]\]/gm) ?? [];
-    const done = editorContent.match(/^\s*[-*] \[[xX]\]/gm) ?? [];
+    const all = body.match(/^\s*[-*] \[[ xX]\]/gm) ?? [];
+    const done = body.match(/^\s*[-*] \[[xX]\]/gm) ?? [];
     return { total: all.length, done: done.length };
-  }, [editorContent]);
+  }, [body]);
 
   const headings = useMemo(() => {
-    return [...editorContent.matchAll(/^(#{1,3}) (.+)$/gm)]
+    return [...body.matchAll(/^(#{1,3}) (.+)$/gm)]
       .map((m) => ({ level: m[1].length, text: m[2].trim() }));
-  }, [editorContent]);
+  }, [body]);
 
   function scrollToHeading(text: string) {
     const root: ParentNode = contentColRef.current ?? document;
@@ -671,7 +685,10 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                     <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
                   </div>
                 ) : (
-                  <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+                  <>
+                    <Properties props={props} onChange={persistProps} />
+                    <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+                  </>
                 )
               )}
             </div>
@@ -724,7 +741,10 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                 <Loader2 className="size-3.5 animate-spin" /> Chargement du contenu…
               </div>
             ) : (
-              <MarkdownEditor content={editorContent} onChange={handleContentChange} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+              <div className="space-y-3">
+                <Properties props={props} onChange={persistProps} />
+                <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+              </div>
             )
           )}
           {(display.decisions ?? []).length > 0 && (

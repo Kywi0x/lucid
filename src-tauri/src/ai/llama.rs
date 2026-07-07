@@ -137,10 +137,30 @@ fn fetch_catalog() -> Vec<ModelDef> {
 
 const CATALOG_VERSION: &str = "v2-curated"; // bump pour invalider le cache si le filtre change
 
-/// Charge le catalogue (cache → fetch réseau) + les GGUF déjà présents localement.
+/// Modèles curés hébergés HORS du CDN GPT4All (HuggingFace) — donc invisibles du
+/// fetch distant filtré (`raw_to_model` n'accepte que `gpt4all.io`). Téléchargeables
+/// in-app via l'URL `resolve/main` (redirection 302 HF suivie par reqwest par défaut).
+fn curated_models() -> Vec<ModelDef> {
+    vec![
+        // Gemma 4 E4B (Google, avr. 2026) — successeur de Gemma 3 4B. Repo officiel ggml-org.
+        ModelDef {
+            id: "gemma-4-e4b-it-q4-k-m".into(),
+            name: "Gemma 4 E4B (Google)".into(),
+            file: "gemma-4-E4B-it-Q4_K_M.gguf".into(),
+            url: "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf".into(),
+            size_gb: 5.34,
+            min_ram_gb: 8.0,
+        },
+    ]
+}
+
+/// Charge le catalogue (cache → fetch réseau) + modèles curés HF + GGUF présents localement.
 pub fn load_catalog() -> Vec<ModelDef> {
-    // 1. Catalogue distant (depuis cache ou réseau)
-    let remote = load_remote_catalog();
+    // 1. Catalogue distant (depuis cache ou réseau) + curés HF (Gemma 4…).
+    let mut remote = load_remote_catalog();
+    for c in curated_models() {
+        if !remote.iter().any(|m| m.file == c.file) { remote.push(c); }
+    }
 
     // 2. Modèles locaux déjà présents dans <data>/models/ (ex. Gemma téléchargé manuellement)
     let remote_files: std::collections::HashSet<&str> = remote.iter().map(|m| m.file.as_str()).collect();
@@ -428,6 +448,12 @@ fn format_prompt(filename: &str, system: Option<&str>, user: &str) -> String {
         } else {
             format!("[INST] {sys}\n\n{user} [/INST]")
         }
+    } else if filename.contains("gemma-4") || filename.contains("gemma4") {
+        // Gemma 4 — tokens <|turn>/<turn|>, tour système natif. On OMET délibérément
+        // le token <|think|> : sinon le modèle entre en mode raisonnement (chain-of-thought
+        // dans un canal <|channel>thought), ce qui gaspille des tokens et pollue le JSON.
+        // Pour l'extraction/synthèse on veut la réponse directe.
+        format!("<|turn>system\n{sys}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n")
     } else if filename.contains("gemma") {
         // Gemma 2 / 3
         format!(
@@ -452,6 +478,8 @@ fn format_prompt(filename: &str, system: Option<&str>, user: &str) -> String {
 fn clean_output(s: &str) -> String {
     let mut out = s
         .replace("<end_of_turn>", "")
+        .replace("<turn|>", "")   // Gemma 4 fin de tour
+        .replace("<eos>", "")     // Gemma 4 fin de séquence
         .replace("<|im_end|>", "")
         .replace("<|end|>", "")
         .replace("[end of text]", "")
@@ -468,7 +496,7 @@ fn clean_output(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_output;
+    use super::{clean_output, format_prompt};
 
     #[test]
     fn strips_json_fences() {
@@ -478,5 +506,31 @@ mod tests {
     #[test]
     fn passes_plain_json() {
         assert_eq!(clean_output("  {\"a\":1}  "), "{\"a\":1}");
+    }
+
+    #[test]
+    fn strips_gemma4_tokens() {
+        assert_eq!(clean_output("réponse<turn|><eos>"), "réponse");
+    }
+
+    #[test]
+    fn curated_has_downloadable_gemma4() {
+        let c = super::curated_models();
+        let g4 = c.iter().find(|m| m.file == "gemma-4-E4B-it-Q4_K_M.gguf").expect("Gemma 4 curé attendu");
+        assert!(g4.url.starts_with("https://huggingface.co/") && g4.url.ends_with(".gguf"), "URL HF directe attendue");
+        // id doit matcher l'id dérivé du nom de fichier (cohérence avec le scan local / select_model)
+        let derived = g4.file.trim_end_matches(".gguf").to_lowercase().replace(['.', ' ', '_'], "-");
+        assert_eq!(g4.id, derived, "id curé doit correspondre à l'id dérivé du fichier");
+    }
+
+    #[test]
+    fn gemma4_uses_turn_template_not_gemma3() {
+        // Un GGUF « gemma-4 » doit prendre le template <|turn>, PAS celui de Gemma 3.
+        let p = format_prompt("gemma-4-e4b-it-q4_k_m.gguf", Some("sys"), "salut");
+        assert!(p.contains("<|turn>system") && p.contains("<|turn>model"), "template Gemma 4 attendu");
+        assert!(!p.contains("<start_of_turn>"), "ne doit pas utiliser le template Gemma 2/3");
+        // Gemma 2/3 garde son template.
+        let p3 = format_prompt("gemma-3-4b-it-q4_k_m.gguf", Some("sys"), "salut");
+        assert!(p3.contains("<start_of_turn>user"), "Gemma 3 garde son template");
     }
 }
