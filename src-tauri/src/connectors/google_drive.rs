@@ -35,14 +35,15 @@ pub fn has_credentials() -> bool {
             && !std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default().is_empty())
 }
 
+// Priorité : baké au build (option_env!) → env/.env runtime → fichier user (legacy).
+// L'env passe AVANT le fichier pour qu'un `.env` frais l'emporte sur un
+// google_credentials.json obsolète (ex. après un reset du secret côté Google).
 fn google_client_id() -> String {
-    // option_env! = baked in at compile time when GOOGLE_CLIENT_ID is set during `tauri build`
     if let Some(id) = option_env!("GOOGLE_CLIENT_ID") {
         if !id.is_empty() { return id.to_string(); }
     }
-    load_credentials()
-        .map(|c| c.client_id)
-        .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
+    std::env::var("GOOGLE_CLIENT_ID").ok().filter(|s| !s.is_empty())
+        .or_else(|| load_credentials().map(|c| c.client_id))
         .unwrap_or_default()
 }
 
@@ -50,10 +51,37 @@ fn google_client_secret() -> String {
     if let Some(s) = option_env!("GOOGLE_CLIENT_SECRET") {
         if !s.is_empty() { return s.to_string(); }
     }
-    load_credentials()
-        .map(|c| c.client_secret)
-        .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok())
+    std::env::var("GOOGLE_CLIENT_SECRET").ok().filter(|s| !s.is_empty())
+        .or_else(|| load_credentials().map(|c| c.client_secret))
         .unwrap_or_default()
+}
+
+// ─── PKCE (RFC 7636) ───────────────────────────────────────────────────────
+// Un client desktop est PUBLIC : le client_secret est extractible du binaire.
+// PKCE remplace le secret comme garde-fou de l'échange de code : un `verifier`
+// aléatoire est généré à la connexion, seul son hash (challenge S256) part dans
+// l'URL d'auth, et le verifier n'est révélé qu'à l'échange du code.
+fn pkce_pair() -> (String, String) {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("RNG OS indisponible");
+    let verifier = b64url(&bytes);
+    let digest = { use sha2::Digest; sha2::Sha256::digest(verifier.as_bytes()) };
+    (verifier, b64url(&digest))
+}
+
+/// base64url sans padding (RFC 4648 §5) — l'encodage exigé par PKCE.
+fn b64url(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 { out.push(T[(n >> 6 & 63) as usize] as char); }
+        if chunk.len() > 2 { out.push(T[(n & 63) as usize] as char); }
+    }
+    out
 }
 
 // ─── Tokens ──────────────────────────────────────────────────────────────────
@@ -119,7 +147,8 @@ fn valid_access_token() -> Result<String, String> {
         .map_err(|e| e.to_string())?;
 
     if let Some(err) = resp.get("error") {
-        return Err(format!("Rafraîchissement refusé : {err}"));
+        let desc = resp.get("error_description").and_then(|d| d.as_str()).unwrap_or("");
+        return Err(format!("Rafraîchissement refusé : {err} — {desc}"));
     }
     let at = resp["access_token"].as_str().ok_or("Pas d'access_token.")?.to_string();
     let ei = resp["expires_in"].as_i64().unwrap_or(3600);
@@ -130,14 +159,16 @@ fn valid_access_token() -> Result<String, String> {
 // ─── OAuth loopback flow ──────────────────────────────────────────────────────
 
 /// Prépare la session OAuth : bind un port local, construit l'URL d'autorisation.
-/// Retourne (listener, auth_url, redirect_uri) — le caller ouvre auth_url dans le navigateur.
-pub fn prepare_connect() -> Result<(TcpListener, String, String), String> {
+/// Retourne (listener, auth_url, redirect_uri, code_verifier) — le caller ouvre
+/// auth_url dans le navigateur puis passe le verifier à `finish_connect`.
+pub fn prepare_connect() -> Result<(TcpListener, String, String, String), String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://localhost:{port}");
 
     let redirect_enc = format!("http%3A%2F%2Flocalhost%3A{port}");
     let client_id = google_client_id();
+    let (verifier, challenge) = pkce_pair();
     let auth_url = format!(
         "https://accounts.google.com/o/oauth2/auth\
          ?client_id={client_id}\
@@ -145,13 +176,16 @@ pub fn prepare_connect() -> Result<(TcpListener, String, String), String> {
          &response_type=code\
          &scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly\
          &access_type=offline\
-         &prompt=consent",
+         &prompt=consent\
+         &code_challenge={challenge}\
+         &code_challenge_method=S256",
     );
-    Ok((listener, auth_url, redirect_uri))
+    Ok((listener, auth_url, redirect_uri, verifier))
 }
 
 /// Attend la redirection OAuth, extrait le code et l'échange contre des tokens.
-pub fn finish_connect(listener: TcpListener, redirect_uri: &str) -> Result<(), String> {
+/// `code_verifier` = celui généré par `prepare_connect` (PKCE).
+pub fn finish_connect(listener: TcpListener, redirect_uri: &str, code_verifier: &str) -> Result<(), String> {
     let code = wait_for_code(listener)?;
 
     let client = reqwest::blocking::Client::new();
@@ -163,6 +197,7 @@ pub fn finish_connect(listener: TcpListener, redirect_uri: &str) -> Result<(), S
             ("code", code.as_str()),
             ("client_id", cid.as_str()),
             ("client_secret", csecret.as_str()),
+            ("code_verifier", code_verifier),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
         ])
@@ -172,7 +207,8 @@ pub fn finish_connect(listener: TcpListener, redirect_uri: &str) -> Result<(), S
         .map_err(|e| e.to_string())?;
 
     if let Some(err) = resp.get("error") {
-        return Err(format!("Échange de code refusé : {err}"));
+        let desc = resp.get("error_description").and_then(|d| d.as_str()).unwrap_or("");
+        return Err(format!("Échange de code refusé : {err} — {desc}"));
     }
     let at = resp["access_token"].as_str().ok_or("Pas d'access_token.")?.to_string();
     let rt = resp["refresh_token"].as_str().map(str::to_string);
@@ -734,4 +770,34 @@ pub fn load_conversations() -> Vec<Conversation> {
 
 pub fn load_by_id(id: &str) -> Option<Conversation> {
     load_conversations().into_iter().find(|c| c.summary.id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b64url_no_padding() {
+        // Vecteurs base64url sans padding.
+        assert_eq!(b64url(b"Man"), "TWFu");
+        assert_eq!(b64url(b"Ma"), "TWE");
+        assert_eq!(b64url(b"M"), "TQ");
+        // Pas de caractères non-url (+ / =).
+        assert!(b64url(&[0xff, 0xff, 0xff]).bytes().all(|c| c != b'+' && c != b'/' && c != b'='));
+    }
+
+    #[test]
+    fn pkce_verifier_and_challenge_coherent() {
+        let (v, c) = pkce_pair();
+        // 32 octets → 43 chars base64url, verifier ET challenge (sha256=32 octets).
+        assert_eq!(v.len(), 43);
+        assert_eq!(c.len(), 43);
+        // Le challenge DOIT être b64url(sha256(verifier)) (sinon Google refuse l'échange).
+        let expected = { use sha2::Digest; b64url(&sha2::Sha256::digest(v.as_bytes())) };
+        assert_eq!(c, expected);
+        // Charset PKCE (unreserved) uniquement.
+        assert!(v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        // Deux appels → verifiers différents (aléa réel).
+        assert_ne!(pkce_pair().0, v);
+    }
 }

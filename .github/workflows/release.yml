@@ -67,6 +67,10 @@ jobs:
           # supabase=null → l'app reste 100 % locale, section Compte « non configuré ».
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          # Creds OAuth Google bakés au build (option_env! dans google_drive.rs) → l'user
+          # n'a rien à saisir. Le client_secret n'est plus critique (PKCE), mais reste un secret CI.
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         with:
           # Release seulement sur push de tag v* ; en workflow_dispatch (test), on
           # build sans publier de release (évite de créer un tag « main » parasite).

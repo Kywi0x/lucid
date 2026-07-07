@@ -234,7 +234,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
 #[tauri::command]
 async fn google_drive_connect(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (listener, auth_url, redirect_uri) =
+        let (listener, auth_url, redirect_uri, verifier) =
             connectors::google_drive::prepare_connect()?;
 
         use tauri_plugin_opener::OpenerExt;
@@ -242,7 +242,7 @@ async fn google_drive_connect(app: tauri::AppHandle) -> Result<(), String> {
             .open_url(&auth_url, None::<&str>)
             .map_err(|e| format!("Impossible d'ouvrir le navigateur : {e}"))?;
 
-        connectors::google_drive::finish_connect(listener, &redirect_uri)
+        connectors::google_drive::finish_connect(listener, &redirect_uri, &verifier)
     })
     .await
     .map_err(|e| format!("Tâche interrompue : {e}"))?
