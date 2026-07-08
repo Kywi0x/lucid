@@ -203,7 +203,9 @@ fn tools_list() -> Value {
         {
             "name": "brain_overview",
             "description": "Vue d'ensemble du second cerveau de l'utilisateur (projets, résumés, mots-clés). À appeler en premier pour découvrir ce que contient le cerveau.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            // readOnlyHint → Claude Desktop autorise « Toujours autoriser » (lecture seule, sans effet de bord).
+            "annotations": { "title": "Vue d'ensemble", "readOnlyHint": true, "openWorldHint": false }
         },
         {
             "name": "brain_search",
@@ -213,7 +215,8 @@ fn tools_list() -> Value {
                 "properties": { "query": { "type": "string", "description": "Termes de recherche" } },
                 "required": ["query"],
                 "additionalProperties": false
-            }
+            },
+            "annotations": { "title": "Recherche", "readOnlyHint": true, "openWorldHint": false }
         },
         {
             "name": "brain_node",
@@ -223,7 +226,8 @@ fn tools_list() -> Value {
                 "properties": { "node_id": { "type": "string", "description": "Id du nœud (ex. p:brainlink, note-123…)" } },
                 "required": ["node_id"],
                 "additionalProperties": false
-            }
+            },
+            "annotations": { "title": "Lire une page", "readOnlyHint": true, "openWorldHint": false }
         },
         {
             "name": "brain_add_note",
@@ -237,7 +241,10 @@ fn tools_list() -> Value {
                 },
                 "required": ["parent_id", "label"],
                 "additionalProperties": false
-            }
+            },
+            // Écriture (proposition à valider dans Lucid) → PAS readOnly : Claude Desktop
+            // continue de demander une confirmation, mais l'action n'est pas destructive.
+            "annotations": { "title": "Proposer une page", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
         }
     ])
 }

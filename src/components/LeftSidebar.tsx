@@ -3,6 +3,7 @@ import { Layers, MessageCircle, Send, Loader2, X } from "lucide-react";
 import { askBrain, createStructure } from "@/lib/api";
 import type { Space } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { AiStatusBar } from "./AiStatusBar";
 
 // Panneaux ouverts par le dock de widgets (bord gauche). La gestion des
 // connecteurs / spaces / modèle vit dans SettingsModal — ici : usage quotidien.
@@ -107,7 +108,7 @@ export function AssistantPanel({ onClose, onGraphChange, activeSpaceId }: { onCl
 
   return (
     <div className="flex h-full flex-col">
-      <PanelHeader icon={<MessageCircle className="size-3.5" />} title="Assistant" onClose={onClose} />
+      <PanelHeader icon={<MessageCircle className="size-3.5" />} title="Lucid IA" onClose={onClose} />
       <div className="flex-1 space-y-2 overflow-y-auto p-3">
         {messages.length === 0 && (
           <p className="px-1 pt-2 text-xs leading-relaxed text-[var(--color-muted)]">
@@ -153,6 +154,7 @@ export function AssistantPanel({ onClose, onGraphChange, activeSpaceId }: { onCl
             <Send className="size-4" />
           </button>
         </div>
+        <AiStatusBar input={input} />
       </div>
     </div>
   );

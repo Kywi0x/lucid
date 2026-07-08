@@ -10,6 +10,7 @@ import type { BrainGraph, BrainNode, NodeSnapshotInfo } from "@/lib/types";
 import { relativeDate, cn } from "@/lib/utils";
 import { exportNodeMd, synthesizeNode, saveNodeContent, loadNodeContent, listNodeSnapshots, getNodeSnapshot, renameNode, askNode, generateContent } from "@/lib/api";
 import { MarkdownEditor } from "./MarkdownEditor";
+import { AiStatusBar } from "./AiStatusBar";
 import { Properties } from "./Properties";
 import { parseFrontmatter, serializeFrontmatter, type Prop } from "@/lib/frontmatter";
 import claudeLogo from "@/assets/claude-logo.png";
@@ -190,7 +191,7 @@ function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCoun
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-2.5">
         <Sparkle className="size-3.5 text-[var(--color-accent)]" />
-        <span className="flex-1 text-xs font-semibold text-[var(--color-text)]">Assistant</span>
+        <span className="flex-1 text-xs font-semibold text-[var(--color-text)]">Lucid IA</span>
         {onCollapse && (
           <button onClick={onCollapse} title="Replier l'assistant"
             className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
@@ -258,6 +259,7 @@ function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCoun
             <Send className="size-3.5" />
           </button>
         </div>
+        <AiStatusBar input={input} />
       </div>
     </div>
   );

@@ -300,6 +300,21 @@ async fn notion_connect(token: String) -> Result<(), String> {
     .map_err(|e| format!("Erreur : {e}"))?
 }
 
+/// Modèle IA actif + taille de sa fenêtre de contexte (pour l'UI des assistants).
+#[derive(serde::Serialize)]
+struct AiInfo {
+    model: String,
+    context_tokens: u32,
+}
+
+#[tauri::command]
+fn ai_info() -> AiInfo {
+    AiInfo {
+        model: ai::llama::active_model_stored().map(|m| m.name).unwrap_or_else(|| "—".into()),
+        context_tokens: ai::llama::CONTEXT_TOKENS,
+    }
+}
+
 /// Synchronise les pages Notion. Renvoie (nouvelles, total).
 #[tauri::command]
 async fn notion_sync() -> Result<(usize, usize), String> {
@@ -330,18 +345,78 @@ fn notion_load_page(id: String) -> Result<String, String> {
     Ok(conv.messages.into_iter().map(|m| m.text).collect::<Vec<_>>().join("\n\n"))
 }
 
-/// Chat local sur le `brain.md`.
+/// Contexte BORNÉ pour ask_brain : aperçu compact (report) + pages les plus
+/// pertinentes à la question (récupération par mots-clés). Injecter tout brain.md
+/// dépasse la fenêtre du modèle (8192 tokens) → llama plante. Ici on borne à
+/// `budget` octets, quelle que soit la taille du cerveau.
+fn ask_context(graph: &BrainGraph, question: &str, report: &str) -> String {
+    const BUDGET: usize = 16_000; // ~4000 tokens, laisse la place au report + réponse
+    let terms: Vec<String> = question
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(str::to_string)
+        .collect();
+
+    let label_of: std::collections::HashMap<&str, &str> =
+        graph.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
+
+    // Score = correspondances des mots de la question (titre pondéré fort).
+    let mut scored: Vec<(usize, &BrainNode)> = graph.nodes.iter()
+        .filter(|n| n.kind != "root")
+        .map(|n| {
+            let title = n.label.to_lowercase();
+            let hay = format!("{} {} {}", n.summary, n.keywords.join(" "), n.content).to_lowercase();
+            let score = terms.iter().map(|t|
+                if title.contains(t.as_str()) { 5 } else { 0 } + hay.matches(t.as_str()).count()
+            ).sum();
+            (score, n)
+        })
+        .filter(|(s, _)| *s > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.weight.cmp(&a.1.weight)));
+
+    // Aucun match (question vague) → replie sur les nœuds les plus « lourds ».
+    let mut selected: Vec<&BrainNode> = if scored.is_empty() {
+        let mut v: Vec<&BrainNode> = graph.nodes.iter().filter(|n| n.kind != "root").collect();
+        v.sort_by(|a, b| b.weight.cmp(&a.weight));
+        v
+    } else {
+        scored.into_iter().map(|(_, n)| n).collect()
+    };
+    selected.truncate(40);
+
+    let mut ctx = format!("APERÇU :\n{report}\n\nPAGES PERTINENTES :\n");
+    for n in selected {
+        if ctx.len() > BUDGET { ctx.push_str("[…autres pages omises…]\n"); break; }
+        let parent = n.parent_id.as_deref().and_then(|p| label_of.get(p)).copied().unwrap_or("");
+        let body = if !n.summary.trim().is_empty() {
+            n.summary.trim().to_string()
+        } else {
+            n.content.chars().take(300).collect::<String>()
+        };
+        if parent.is_empty() {
+            ctx.push_str(&format!("- {} : {body}\n", n.label));
+        } else {
+            ctx.push_str(&format!("- {} (dans {parent}) : {body}\n", n.label));
+        }
+    }
+    ctx
+}
+
 #[tauri::command]
 async fn ask_brain(question: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-        let brain = std::fs::read_to_string(dir.join("brain.md"))
+        let raw = std::fs::read_to_string(dir.join("brain.json"))
             .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
+        let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let report = std::fs::read_to_string(dir.join("brain_report.md")).unwrap_or_default();
         let engine = LlamaEngine::detect()?;
         let system = "Tu es l'assistant du second cerveau de l'utilisateur. Réponds en \
-français, de façon concise, en te basant UNIQUEMENT sur le contexte fourni (son brain.md). \
-Si l'information n'y figure pas, dis-le clairement.";
-        let user = format!("CONTEXTE (brain.md) :\n{brain}\n\nQUESTION : {question}");
+français, de façon concise, en te basant UNIQUEMENT sur le contexte fourni. Cite les pages \
+par leur titre. Si l'information n'y figure pas, dis-le clairement.";
+        let user = format!("CONTEXTE :\n{}\n\nQUESTION : {question}", ask_context(&graph, &question, &report));
         engine.complete(Some(system), &user, 512)
     })
     .await
@@ -1711,8 +1786,41 @@ pub fn run() {
             remove_node_from_space,
             export_space_md,
             seed_demo,
-            reset_demo
+            reset_demo,
+            ai_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    #[test]
+    fn ask_context_selectionne_les_pages_pertinentes_et_reste_borne() {
+        let mut nodes = vec![
+            BrainNode {
+                id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 3,
+                summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
+                community: 0, parent_id: None, synthesized_at: None, content: String::new(),
+                connector: None, source_id: None, source_project: None,
+            },
+            demo_leaf("p1", "root", "Notes Jaon", "Réunion avec Jaon sur le projet."),
+            demo_leaf("p2", "root", "Recette", "Cuisine et macros."),
+        ];
+        // Bruit volumineux : sans le bornage, injecterait ~300k octets.
+        for i in 0..500 {
+            nodes.push(demo_leaf(&format!("n{i}"), "root", "Divers", &"lorem ipsum ".repeat(50)));
+        }
+        let graph = BrainGraph {
+            nodes, edges: vec![], markdown: String::new(),
+            report: String::new(), generated_at: String::new(),
+        };
+
+        let ctx = ask_context(&graph, "Quelles pages parlent de Jaon ?", "APERCU");
+        assert!(ctx.contains("Notes Jaon"), "la page pertinente doit être incluse");
+        assert!(!ctx.contains("Recette"), "les pages hors sujet sont exclues");
+        assert!(ctx.len() < 20_000, "le contexte doit rester borné, pas tout le cerveau");
+    }
 }

@@ -156,6 +156,18 @@ export function listModels(): Promise<ModelInfo[]> {
   return invoke("list_models");
 }
 
+export interface AiInfo {
+  /** Nom du modèle actif (ex. « Gemma 3 4B »). */
+  model: string;
+  /** Taille de la fenêtre de contexte en tokens. */
+  context_tokens: number;
+}
+
+/** Modèle IA actif + sa fenêtre de contexte (affiché dans les assistants). */
+export function aiInfo(): Promise<AiInfo> {
+  return invoke("ai_info");
+}
+
 /** Change le modèle actif (si non téléchargé, aiSetupNeeded() passera à true). */
 export function setActiveModel(id: string): Promise<void> {
   return invoke("set_active_model", { id });

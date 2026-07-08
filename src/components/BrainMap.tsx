@@ -27,6 +27,10 @@ interface Props {
   panelOffset?: number;
   /** Centre la caméra sur ce nœud (k force le re-déclenchement). */
   focus?: { id: string; k: number } | null;
+  /** Régénération en cours (hors genesis) : le root pulse et « parle ». */
+  busy?: boolean;
+  /** Message façon Lucid affiché sous le root pendant `busy`. */
+  busyMessage?: string | null;
 }
 
 interface NodeInfo {
@@ -280,6 +284,7 @@ export function BrainMap({
   revealKey = 0, streamLabels = [], streamTotal = 0,
   spaces, onAddNodeToSpace, onMoveNode, onImportFiles,
   onBackgroundClick, panelOffset = 0, focus = null,
+  busy = false, busyMessage = null,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -347,6 +352,7 @@ export function BrainMap({
   S.current = {
     infos, childrenOf, colorOf, neighbors, q, selectedId, theme, linkEdges,
     onSelect, onMoveNode, onImportFiles, onBackgroundClick, isGenesis, streamLabels, streamTotal, rootId,
+    busy, busyMessage,
   };
 
   // Refit caméra au chargement / à chaque régénération.
@@ -592,6 +598,16 @@ export function BrainMap({
           ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.5, 0, Math.PI * 2);
           ctx.strokeStyle = hexA(color, 0.12 + 0.05 * pulse);
           ctx.stroke();
+          // Régénération : ondes concentriques qui s'étendent (« Lucid analyse »).
+          if (s.busy) {
+            for (let k = 0; k < 3; k++) {
+              const prog = (time * 0.5 + k / 3) % 1;
+              ctx.beginPath(); ctx.arc(p.x, p.y, r * (1 + prog * 2.4), 0, Math.PI * 2);
+              ctx.strokeStyle = hexA(color, 0.28 * (1 - prog));
+              ctx.lineWidth = 1.2 / c.zoom;
+              ctx.stroke();
+            }
+          }
         }
         // Proposition MCP : anneau pointillé pulsant (« fantôme » à valider)
         if (isPending) {
@@ -649,6 +665,23 @@ export function BrainMap({
       }
       ctx.globalAlpha = 1;
       (ctx as any).letterSpacing = "0px";
+
+      // ── Lucid « parle » pendant la régénération (busy, hors genesis) ──
+      if (s.busy && s.busyMessage) {
+        const rootInfo = s.infos.get(s.rootId);
+        if (rootInfo) {
+          const rp = pos(rootInfo);
+          const cy = sy(rp.y) + rootInfo.r * c.zoom + 38; // sous le label du root
+          const dots = ".".repeat(1 + (Math.floor(time * 2) % 3));
+          ctx.font = "500 12px ui-monospace, SFMono-Regular, Menlo, monospace";
+          ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.shadowColor = t.dark ? "rgba(0,0,0,0.7)" : "rgba(245,247,251,0.9)";
+          ctx.shadowBlur = 4;
+          ctx.fillStyle = t.accent;
+          ctx.fillText(s.busyMessage + dots, sx(rp.x), cy);
+          ctx.shadowBlur = 0;
+        }
+      }
 
       raf = requestAnimationFrame(draw);
     };

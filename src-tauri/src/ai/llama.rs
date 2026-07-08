@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const APP_DIR: &str = "fr.ideeri.brainlink";
+/// Taille de la fenêtre de contexte passée à llama (`-c`). Exposée à l'UI via
+/// `ai_info` pour afficher la capacité et avertir si un prompt la dépasse.
+pub const CONTEXT_TOKENS: u32 = 8192;
 /// Catalogue GPT4All officiel — URLs vérifiées et maintenues par l'équipe GPT4All.
 const CATALOG_URL: &str =
     "https://raw.githubusercontent.com/nomic-ai/gpt4all/main/gpt4all-chat/metadata/models3.json";
@@ -406,7 +409,7 @@ impl LlamaEngine {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("-m").arg(&self.model)
             .args(["-ngl", "99"])
-            .args(["-c", "8192"])
+            .args(["-c", &CONTEXT_TOKENS.to_string()])
             .args(["-n", &max_tokens.to_string()])
             .args(["--temp", "0.2"])
             .args(["--top-p", "0.9"])

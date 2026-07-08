@@ -96,6 +96,9 @@ function App() {
   const [streamTotal, setStreamTotal]   = useState(0);
   const [connectors, setConnectors] = useState<ConnectorStatus[]>([]);
   const [generating, setGenerating] = useState(false);
+  // Genesis = la carte se construit à l'écran (1er cerveau). En régénération
+  // (re-sync), on garde la carte affichée et on ajoute les nouveaux nœuds.
+  const [genesisRun, setGenesisRun] = useState(false);
   const [progress, setProgress]   = useState<BrainProgress | null>(null);
   const [error, setError]         = useState<string | null>(null);
 
@@ -185,6 +188,14 @@ function App() {
     return syncs.length ? syncs[syncs.length - 1] : null;
   }, [connectors]);
 
+  // Petite phrase « Lucid » affichée sous le root pendant une régénération.
+  const busyMessage = useMemo(() => {
+    if (!generating) return null;
+    if (!progress) return "Lucid se prépare";
+    if (progress.label.startsWith("Synthèse")) return "Lucid tisse l'arborescence";
+    return `Lucid analyse tes contenus (${progress.current}/${progress.total})`;
+  }, [generating, progress]);
+
   useEffect(() => {
     aiSetupNeeded().then(setNeedsSetup);
     readBrainGraph().then((g) => {
@@ -210,20 +221,25 @@ function App() {
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  async function handleGenerate() {
+  // `skipSync` : la sync a déjà été faite par le connecteur (bouton Synchroniser)
+  // → on régénère seulement, sans re-synchroniser tous les connecteurs.
+  async function handleGenerate(opts?: { skipSync?: boolean }) {
+    setGenesisRun(!graph); // genesis uniquement s'il n'y a pas encore de carte
     setGenerating(true);
     setError(null);
     setProgress(null);
     setStreamLabels([]);
     try {
       // Sync tous les connecteurs connectés avant de régénérer.
-      const syncs: Promise<unknown>[] = [];
-      for (const c of connectors) {
-        if (!c.connected) continue;
-        if (c.id === "notion") syncs.push(notionSync().catch(() => {}));
-        if (c.id === "google-drive") syncs.push(googleDriveSync().catch(() => {}));
+      if (!opts?.skipSync) {
+        const syncs: Promise<unknown>[] = [];
+        for (const c of connectors) {
+          if (!c.connected) continue;
+          if (c.id === "notion") syncs.push(notionSync().catch(() => {}));
+          if (c.id === "google-drive") syncs.push(googleDriveSync().catch(() => {}));
+        }
+        if (syncs.length) await Promise.all(syncs);
       }
-      if (syncs.length) await Promise.all(syncs);
 
       setGraph(await generateBrain());
       setStreamLabels([]);
@@ -517,7 +533,9 @@ function App() {
               selectedId={selectedNode?.id ?? null}
               query={query}
               revealKey={revealKey}
-              streamLabels={generating ? streamLabels : []}
+              streamLabels={generating && genesisRun ? streamLabels : []}
+              busy={generating && !genesisRun}
+              busyMessage={busyMessage}
               streamTotal={streamTotal}
               spaces={spaces}
               onAddNodeToSpace={handleAddNodeToSpace}
@@ -540,8 +558,9 @@ function App() {
             <MarkdownView markdown={graph.markdown} onRegenerate={handleGenerate} />
           )}
 
-          {/* ── Overlay progression ── */}
-          {generating && (
+          {/* ── Overlay progression : uniquement au 1er cerveau (genesis). En
+                 régénération, c'est le root « Lucid » qui pulse et parle. ── */}
+          {generating && genesisRun && (
             <div className="absolute inset-0 z-20 flex items-end justify-center pb-24 pointer-events-none">
               <div className="pointer-events-auto rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] px-6 py-4 shadow-[var(--shadow-float)] min-w-[320px]">
                 <GenerateProgress progress={progress} />
@@ -560,7 +579,7 @@ function App() {
             </DockBtn>
             <DockBtn
               active={leftPanel === "assistant"}
-              title="Assistant"
+              title="Lucid IA"
               onClick={() => setLeftPanel((p) => (p === "assistant" ? null : "assistant"))}
             >
               <MessageCircle className="size-4" />
@@ -802,7 +821,7 @@ function App() {
               <div className="ml-1 flex items-center gap-0.5 pl-3 border-l border-[var(--color-border)]">
                 {graph && (
                   <button
-                    onClick={handleGenerate}
+                    onClick={() => handleGenerate()}
                     title="Régénérer le cerveau (sync des sources)"
                     className="rounded-lg p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
                   >
@@ -879,7 +898,7 @@ function App() {
               connectors={connectors}
               spaces={spaces}
               onRefresh={() => connectorsStatus().then(setConnectors)}
-              onSyncDone={handleGenerate}
+              onSyncDone={() => handleGenerate({ skipSync: true })}
               onClose={() => setSettingsOpen(false)}
               onSpaceCreate={handleSpaceCreate}
               onSpaceRename={handleSpaceRename}
@@ -944,7 +963,7 @@ function App() {
           connectors={connectors}
           spaces={spaces}
           onRefresh={() => connectorsStatus().then(setConnectors)}
-          onSyncDone={handleGenerate}
+          onSyncDone={() => handleGenerate({ skipSync: true })}
           onClose={() => { setSettingsOpen(false); connectorsStatus().then(setConnectors); }}
           onSpaceCreate={handleSpaceCreate}
           onSpaceRename={handleSpaceRename}

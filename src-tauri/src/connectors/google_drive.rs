@@ -496,6 +496,11 @@ fn extract_pdf(
 /// Résout un binaire externe : sidecar du bundle d'abord (app packagée,
 /// binaire à côté de l'exécutable), puis Homebrew, puis le PATH.
 fn which_bin(name: &str) -> Option<String> {
+    // Sidecar embarqué : UNIQUEMENT en release (app packagée). En dev, Tauri
+    // copie dans target/debug/ une version relocalisée pour le bundle (dylibs →
+    // ../Resources/libs, absent hors bundle) → elle se lance mais sort du vide.
+    // On la saute donc en debug pour utiliser Homebrew/PATH qui, lui, marche.
+    #[cfg(not(debug_assertions))]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
