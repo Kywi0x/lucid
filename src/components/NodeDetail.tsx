@@ -10,7 +10,7 @@ import type { BrainGraph, BrainNode, NodeSnapshotInfo } from "@/lib/types";
 import { relativeDate, cn } from "@/lib/utils";
 import { exportNodeMd, synthesizeNode, saveNodeContent, loadNodeContent, listNodeSnapshots, getNodeSnapshot, renameNode, askNode, generateContent } from "@/lib/api";
 import { MarkdownEditor } from "./MarkdownEditor";
-import { AiStatusBar } from "./AiStatusBar";
+import { AiStatusBar, useAiReady, AI_MISSING_HINT } from "./AiStatusBar";
 import { Properties } from "./Properties";
 import { parseFrontmatter, serializeFrontmatter, type Prop } from "@/lib/frontmatter";
 import claudeLogo from "@/assets/claude-logo.png";
@@ -167,6 +167,7 @@ function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCoun
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [withChildren, setWithChildren] = useState(childCount > 0);
+  const aiOk = useAiReady();
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, loading]);
@@ -247,13 +248,15 @@ function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCoun
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-            placeholder="Poser une question…"
+            placeholder={aiOk === false ? AI_MISSING_HINT : "Poser une question…"}
             rows={1}
-            className="max-h-28 flex-1 resize-none rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-xs text-[var(--color-text)] outline-none"
+            disabled={aiOk === false}
+            className="max-h-28 flex-1 resize-none rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-xs text-[var(--color-text)] outline-none disabled:opacity-50"
           />
           <button
             onClick={send}
-            disabled={loading || !input.trim()}
+            disabled={loading || !input.trim() || aiOk === false}
+            title={aiOk === false ? AI_MISSING_HINT : undefined}
             className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--color-accent)] text-white transition-opacity hover:opacity-90 disabled:opacity-40"
           >
             <Send className="size-3.5" />
@@ -267,6 +270,7 @@ function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCoun
 
 export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand, onContentSaved, onCreateNote, onNodeRenamed }: Props) {
   const ancestors = useAncestors(node, graph);
+  const aiOk = useAiReady();
   const Icon = ICON[node.kind as keyof typeof ICON] ?? FileText;
   const children = graph?.nodes.filter((n) => n.parent_id === node.id) ?? [];
 
@@ -480,8 +484,8 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
           <>
             <button
               onClick={handleSynthesize}
-              disabled={synthesizing}
-              title="Relancer la synthèse IA"
+              disabled={synthesizing || aiOk === false}
+              title={aiOk === false ? AI_MISSING_HINT : "Relancer la synthèse IA"}
               className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-accent)] disabled:opacity-40"
             >
               <RefreshCw className={cn("size-3.5", synthesizing && "animate-spin")} />
@@ -691,7 +695,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                 ) : (
                   <>
                     <Properties props={props} onChange={persistProps} />
-                    <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+                    <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={aiOk === false ? undefined : generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
                   </>
                 )
               )}
@@ -747,7 +751,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
             ) : (
               <div className="space-y-3">
                 <Properties props={props} onChange={persistProps} />
-                <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+                <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={aiOk === false ? undefined : generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
               </div>
             )
           )}

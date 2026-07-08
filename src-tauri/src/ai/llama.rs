@@ -331,7 +331,10 @@ pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
     let mut downloaded = 0u64;
     let tmp = dest.with_extension("part");
     let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 65_536];
+    let mut buf = vec![0u8; 1_048_576];
+    // Émettre un event IPC par chunk (~37 000 pour 2,3 Go) étranglait la boucle,
+    // surtout sur Windows/WebView2 : on n'émet qu'au changement de pourcent.
+    let mut last_percent: u8 = u8::MAX;
 
     loop {
         use std::io::{Read, Write};
@@ -339,11 +342,14 @@ pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
         if n == 0 { break; }
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         downloaded += n as u64;
-        let (dl_mb, tot_mb) = (downloaded as f32 / 1_048_576.0, total as f32 / 1_048_576.0);
         let percent = if total > 0 { (downloaded * 100 / total).min(100) as u8 } else { 0 };
-        let _ = tauri::Emitter::emit(app, "download-progress", DownloadProgress {
-            downloaded_mb: dl_mb, total_mb: tot_mb, percent,
-        });
+        if percent != last_percent {
+            last_percent = percent;
+            let (dl_mb, tot_mb) = (downloaded as f32 / 1_048_576.0, total as f32 / 1_048_576.0);
+            let _ = tauri::Emitter::emit(app, "download-progress", DownloadProgress {
+                downloaded_mb: dl_mb, total_mb: tot_mb, percent,
+            });
+        }
     }
     drop(file);
     std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())

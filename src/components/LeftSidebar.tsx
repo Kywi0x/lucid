@@ -3,7 +3,7 @@ import { Layers, MessageCircle, Send, Loader2, X } from "lucide-react";
 import { askBrain, createStructure } from "@/lib/api";
 import type { Space } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { AiStatusBar } from "./AiStatusBar";
+import { AiStatusBar, useAiReady, AI_MISSING_HINT } from "./AiStatusBar";
 
 // Panneaux ouverts par le dock de widgets (bord gauche). La gestion des
 // connecteurs / spaces / modèle vit dans SettingsModal — ici : usage quotidien.
@@ -85,6 +85,7 @@ export function AssistantPanel({ onClose, onGraphChange, activeSpaceId }: { onCl
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const aiOk = useAiReady();
 
   async function send() {
     const q = input.trim();
@@ -143,12 +144,14 @@ export function AssistantPanel({ onClose, onGraphChange, activeSpaceId }: { onCl
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
             rows={1}
-            placeholder="Demander…"
-            className="max-h-24 min-h-9 flex-1 resize-none rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-xs outline-none placeholder:text-[var(--color-muted)] focus:border-[var(--color-accent)]"
+            disabled={aiOk === false}
+            placeholder={aiOk === false ? AI_MISSING_HINT : "Demander…"}
+            className="max-h-24 min-h-9 flex-1 resize-none rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-xs outline-none placeholder:text-[var(--color-muted)] focus:border-[var(--color-accent)] disabled:opacity-50"
           />
           <button
             onClick={send}
-            disabled={loading || !input.trim()}
+            disabled={loading || !input.trim() || aiOk === false}
+            title={aiOk === false ? AI_MISSING_HINT : undefined}
             className="flex size-9 items-center justify-center rounded-md bg-[var(--color-accent)] text-white disabled:opacity-50"
           >
             <Send className="size-4" />

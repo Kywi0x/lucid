@@ -700,9 +700,17 @@ function ModelSection() {
         ))}
       </div>
       {models.some((m) => m.active && !m.downloaded) && (
-        <p className="mt-2 text-[10px] text-[var(--color-warn)]">
-          Modèle non téléchargé — redémarrez l'app pour le télécharger.
-        </p>
+        <div className="mt-2 flex items-center gap-2">
+          <p className="flex-1 text-[10px] text-[var(--color-warn)]">
+            Modèle non téléchargé — les features IA sont désactivées.
+          </p>
+          <button
+            onClick={() => { localStorage.removeItem("lucid.ai.skipped"); location.reload(); }}
+            className="shrink-0 rounded-lg bg-[var(--color-accent)] px-2.5 py-1 text-[10px] font-medium text-white hover:opacity-90"
+          >
+            Installer maintenant
+          </button>
+        </div>
       )}
     </div>
   );

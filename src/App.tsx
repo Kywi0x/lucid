@@ -190,7 +190,11 @@ function App() {
   }, [generating, progress]);
 
   useEffect(() => {
-    aiSetupNeeded().then(setNeedsSetup);
+    // L'IA locale est optionnelle : si l'user a passé le setup, on n'affiche
+    // plus l'écran de téléchargement (installable plus tard via les Réglages).
+    aiSetupNeeded().then((n) =>
+      setNeedsSetup(n && localStorage.getItem("lucid.ai.skipped") !== "1"),
+    );
     readBrainGraph().then((g) => {
       if (g) { setGraph(g); setRevealKey((k) => k + 1); }
       setBooted(true); // graphe initial chargé (ou absent) → l'onboarding peut se prononcer
@@ -518,7 +522,12 @@ function App() {
   }, [displayGraph, proposals]);
 
   if (needsSetup) {
-    return <SetupScreen onDone={() => setNeedsSetup(false)} />;
+    return (
+      <SetupScreen
+        onDone={() => setNeedsSetup(false)}
+        onSkip={() => { localStorage.setItem("lucid.ai.skipped", "1"); setNeedsSetup(false); }}
+      />
+    );
   }
 
   return (

@@ -1,6 +1,16 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle } from "lucide-react";
-import { aiInfo, type AiInfo } from "@/lib/api";
+import { aiInfo, aiReady, type AiInfo } from "@/lib/api";
+
+/** IA locale prête ? `null` pendant la vérification (évite le flash désactivé). */
+export function useAiReady(): boolean | null {
+  const [ok, setOk] = useState<boolean | null>(null);
+  useEffect(() => { aiReady().then(setOk).catch(() => setOk(false)); }, []);
+  return ok;
+}
+
+/** Hint standard quand l'IA locale n'est pas installée. */
+export const AI_MISSING_HINT = "IA locale non installée — Réglages → Modèle";
 
 /** Barre de statut des assistants : modèle actif, fenêtre de contexte, et
  *  avertissement si l'input estimé s'approche de la limite. */

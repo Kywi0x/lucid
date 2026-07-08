@@ -203,8 +203,10 @@ pub struct Progress {
 }
 
 /// Génère le graphe à partir des conversations (arbre récursif agnostique de la source).
+/// `engine: None` = pas d'IA locale installée — la génération marche quand même
+/// (structure + texte source), seule l'extraction IA optionnelle est sautée.
 pub fn generate_brain(
-    engine: &LlamaEngine,
+    engine: Option<&LlamaEngine>,
     conversations: &[Conversation],
     cache_path: Option<&Path>,
     mut progress: impl FnMut(Progress),
@@ -230,7 +232,7 @@ pub fn generate_brain(
         // ponytail: extraction IA par page désactivée (utilité incertaine, coût = N appels
         // Gemma en série). Repasser AI_EXTRACTION à true pour réactiver — le code et le
         // cache sont intacts. Analyse à la demande : `synthesize_node`.
-        let ex = if !AI_EXTRACTION {
+        let ex = if !AI_EXTRACTION || engine.is_none() {
             cache.get(&key).cloned().unwrap_or_default()
         } else if let Some(cached) = cache.get(&key) {
             cache_hits += 1;
@@ -240,7 +242,8 @@ pub fn generate_brain(
             let ex = if total_text < 150 {
                 Extraction::default()
             } else {
-                let raw = match engine.complete(
+                // Garanti Some par la première branche du if.
+                let raw = match engine.unwrap().complete(
                     Some(SYSTEM_PROMPT),
                     &extraction_prompt(conv),
                     MAX_OUTPUT_TOKENS,

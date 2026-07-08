@@ -19,13 +19,13 @@ pub fn list_conversations_pub() -> Vec<ConversationSummary> {
 /// Démo en ligne de commande du pipeline complet (utilisé par `examples/brain.rs`).
 /// Persiste le graphe (`brain.json` + `brain.md`) comme le ferait la commande Tauri.
 pub fn run_pipeline_demo(limit: usize) -> Result<BrainGraph, String> {
-    let engine = LlamaEngine::detect()?;
+    let engine = LlamaEngine::detect().ok();
     let mut convs = load_all_conversations();
     if limit > 0 {
         convs.truncate(limit);
     }
     let cache_path = ai::llama::app_data_dir().map(|d| d.join("brain_cache.json"));
-    let graph = pipeline::generate_brain(&engine, &convs, cache_path.as_deref(), |p| {
+    let graph = pipeline::generate_brain(engine.as_ref(), &convs, cache_path.as_deref(), |p| {
         eprintln!("[{}/{}] {}", p.current, p.total, p.label);
     }, |_, _, _| {})?;
     if let Some(dir) = ai::llama::app_data_dir() {
@@ -1698,7 +1698,8 @@ fn reset_demo() -> Result<(), String> {
 #[tauri::command]
 async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let engine = LlamaEngine::detect()?;
+        // Sans IA locale la génération marche quand même (structure + texte source).
+        let engine = LlamaEngine::detect().ok();
         let convs = load_all_conversations();
         if convs.is_empty() {
             return Err("Aucune conversation à analyser.".to_string());
@@ -1740,7 +1741,7 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
 
         let cache_path = ai::llama::app_data_dir().map(|d| d.join("brain_cache.json"));
         let mut graph = pipeline::generate_brain(
-            &engine,
+            engine.as_ref(),
             &convs,
             cache_path.as_deref(),
             |p| {

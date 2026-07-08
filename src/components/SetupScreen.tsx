@@ -8,9 +8,13 @@ import { cn } from "@/lib/utils";
 interface DownloadProgress { downloaded_mb: number; total_mb: number; percent: number; }
 type Step = "pick" | "downloading" | "copying";
 
-interface Props { onDone: () => void; }
+interface Props {
+  onDone: () => void;
+  /** Continuer sans IA locale : l'app marche, les features IA sont grisées. */
+  onSkip: () => void;
+}
 
-export function SetupScreen({ onDone }: Props) {
+export function SetupScreen({ onDone, onSkip }: Props) {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [step, setStep] = useState<Step>("pick");
@@ -128,6 +132,12 @@ export function SetupScreen({ onDone }: Props) {
                 className="flex w-full items-center justify-center gap-1.5 text-xs text-[var(--color-muted)] hover:text-[var(--color-text)] transition-colors disabled:opacity-40"
               >
                 <FolderOpen className="size-3.5" /> J'ai déjà le fichier .gguf
+              </button>
+              <button
+                onClick={onSkip}
+                className="mt-1 text-[11px] text-[var(--color-muted)] hover:text-[var(--color-text)] transition-colors"
+              >
+                Continuer sans IA — tu pourras l'installer plus tard dans les Réglages
               </button>
             </div>
           )}
