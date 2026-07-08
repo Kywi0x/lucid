@@ -53,6 +53,7 @@ impl Draft {
             connector: self.connector,
             source_id: self.source_id,
             source_project: self.source_project,
+            source_text: String::new(),
         };
         (node, edge)
     }
@@ -96,6 +97,7 @@ pub fn parse(content: &str) -> BrainGraph {
         connector: None,
         source_id: None,
         source_project: None,
+        source_text: String::new(),
     }];
     let mut edges: Vec<BrainEdge> = Vec::new();
     let mut generated_at = String::new();

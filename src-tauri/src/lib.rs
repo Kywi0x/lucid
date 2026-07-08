@@ -366,7 +366,7 @@ fn ask_context(graph: &BrainGraph, question: &str, report: &str) -> String {
         .filter(|n| n.kind != "root")
         .map(|n| {
             let title = n.label.to_lowercase();
-            let hay = format!("{} {} {}", n.summary, n.keywords.join(" "), n.content).to_lowercase();
+            let hay = format!("{} {} {} {}", n.summary, n.keywords.join(" "), n.content, n.source_text).to_lowercase();
             let score = terms.iter().map(|t|
                 if title.contains(t.as_str()) { 5 } else { 0 } + hay.matches(t.as_str()).count()
             ).sum();
@@ -392,8 +392,10 @@ fn ask_context(graph: &BrainGraph, question: &str, report: &str) -> String {
         let parent = n.parent_id.as_deref().and_then(|p| label_of.get(p)).copied().unwrap_or("");
         let body = if !n.summary.trim().is_empty() {
             n.summary.trim().to_string()
-        } else {
+        } else if !n.content.trim().is_empty() {
             n.content.chars().take(300).collect::<String>()
+        } else {
+            n.source_text.chars().take(300).collect::<String>()
         };
         if parent.is_empty() {
             ctx.push_str(&format!("- {} : {body}\n", n.label));
@@ -733,6 +735,7 @@ fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, lab
         connector: None,
         source_id: None,
         source_project: None,
+        source_text: String::new(),
     };
     graph.edges.push(BrainEdge {
         source: parent_id, target: id, kind: "contains".into(), relation: "contains".into(),
@@ -1139,6 +1142,7 @@ concis) et \"children\" (liste de sous-pages, même format, 2 niveaux maximum, \
                 connector: None,
                 source_id: None,
                 source_project: None,
+                source_text: String::new(),
             });
             graph.edges.push(BrainEdge {
                 source: parent.to_string(), target: id.clone(),
@@ -1239,10 +1243,26 @@ async fn synthesize_node(node_id: String) -> Result<BrainNode, String> {
 
         let mut ctx = String::new();
 
-        // Résumés + décisions des enfants
+        // Contenu propre du nœud (indispensable depuis que l'extraction IA
+        // auto est désactivée : les summaries sont vides tant qu'on n'a pas
+        // synthétisé à la main).
+        let own = graph.nodes[node_idx].content.trim();
+        if !own.is_empty() {
+            ctx.push_str(own);
+            ctx.push_str("\n\n");
+        }
+
+        // Résumés + décisions des enfants (fallback : début du contenu si pas de summary)
         let children: Vec<(String, String, Vec<String>)> = graph.nodes.iter()
             .filter(|n| n.parent_id.as_deref() == Some(node_id.as_str()))
-            .map(|n| (n.label.clone(), n.summary.clone(), n.decisions.clone()))
+            .map(|n| {
+                let gist = if n.summary.trim().is_empty() {
+                    n.content.chars().take(600).collect()
+                } else {
+                    n.summary.clone()
+                };
+                (n.label.clone(), gist, n.decisions.clone())
+            })
             .collect();
         if !children.is_empty() {
             ctx.push_str("## Sous-espaces / pages\n");
@@ -1502,10 +1522,12 @@ fn export_space_md(space_id: String) -> Result<String, String> {
 fn demo_leaf(id: &str, parent: &str, label: &str, content: &str) -> BrainNode {
     BrainNode {
         id: id.into(), label: label.into(), kind: "leaf".into(), weight: 1,
-        summary: content.lines().next().unwrap_or("").to_string(),
+        // Pas de summary : le bloc « Synthèse IA » ne doit pas mentir — l'user
+        // pourra tester la vraie synthèse manuelle sur ces pages.
+        summary: String::new(),
         keywords: vec![], decisions: vec![], patterns: vec![], community: 1,
         parent_id: Some(parent.into()), synthesized_at: None, content: content.into(),
-        connector: None, source_id: None, source_project: None,
+        connector: None, source_id: None, source_project: None, source_text: String::new(),
     }
 }
 
@@ -1517,26 +1539,120 @@ fn seed_demo() -> Result<BrainGraph, String> {
         id: id.into(), label: label.into(), kind: "container".into(), weight,
         summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
         community: 1, parent_id: Some("root".into()), synthesized_at: None,
-        content: String::new(), connector: None, source_id: None, source_project: None,
+        content: String::new(), connector: None, source_id: None, source_project: None, source_text: String::new(),
     };
 
     let mut nodes = vec![
         BrainNode {
-            id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 6,
-            summary: "Démo d'exploration".into(), keywords: vec![], decisions: vec![],
+            id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 8,
+            summary: "Contenu d'exemple — remplacé par tes vraies données au premier sync.".into(),
+            keywords: vec![], decisions: vec![],
             patterns: vec![], community: 0, parent_id: None, synthesized_at: None,
-            content: String::new(), connector: None, source_id: None, source_project: None,
+            content: String::new(), connector: None, source_id: None, source_project: None, source_text: String::new(),
         },
         container("demo-guide", "Prise en main", 2),
-        container("demo-projet", "Projet exemple", 2),
+        container("demo-projet", "Projet Alpha", 3),
+        container("demo-cours", "Cours de chimie", 2),
         demo_leaf("demo-welcome", "demo-guide", "Bienvenue 👋",
-            "# Bienvenue dans Lucid\n\nCeci est une **démo**. Clique sur les bulles pour explorer, ouvre une page, crée un espace.\n\nQuand tu quittes la démo, tout est effacé et remis à zéro."),
-        demo_leaf("demo-sources", "demo-guide", "Tes sources",
-            "# Connecter tes sources\n\nLucid agrège Claude Code, Notion, Google Drive…\n\nTout est analysé **100 % en local**."),
+"# Bienvenue dans Lucid
+
+Ton second cerveau, **100 % local** — rien ne quitte cette machine.
+
+## Explore
+
+- Clique sur les bulles pour naviguer, ouvre une page, déplace-toi à la molette.
+- ⌘K ouvre la recherche rapide.
+- Regarde [[Plan de lancement]] : propriétés, tableau, tâches — une page peut tout porter.
+
+## Crée
+
+- `+` ou clic droit sur la carte → nouvelle page.
+- Tape `[[` dans une page pour la lier à une autre : les liens deviennent des ponts sur la carte.
+- **Glisse un PDF, Word ou CSV** directement sur la carte : il devient une page.
+
+## Quand tu es prêt
+
+Connecte une vraie source (voir [[Connecter tes sources]]) — ce contenu d'exemple s'effacera tout seul."),
+        demo_leaf("demo-sources", "demo-guide", "Connecter tes sources",
+"# Connecter tes sources
+
+Lucid agrège tes outils en un seul cerveau : **Claude Code**, **Notion**, **Google Drive**, **Obsidian**…
+
+1. Ouvre les Paramètres → Sources.
+2. Connecte une source et lance un Sync.
+3. Génère ton cerveau : la carte se reconstruit avec **tes** données.
+
+Tout est analysé **en local** (llama.cpp). Ton cerveau est aussi consultable par tes IA via MCP."),
+        demo_leaf("demo-plan", "demo-projet", "Plan de lancement",
+"---
+statut: En cours
+échéance: 2026-09-15
+tags: [produit, mvp]
+---
+
+# Plan de lancement
+
+## Jalons
+
+| Jalon | Responsable | Échéance | État |
+| --- | --- | --- | --- |
+| Prototype | Alex | Juin | ✅ Fait |
+| Beta privée | Sam | Août | 🔶 En cours |
+| Lancement public | Équipe | Septembre | ⬜ À venir |
+
+## Tâches
+
+- [x] Valider le concept avec 5 utilisateurs
+- [ ] Rédiger la page d'accueil
+- [ ] Préparer la démo produit
+
+Contexte : voir [[Notes de réunion]] et [[Idées]]."),
         demo_leaf("demo-meeting", "demo-projet", "Notes de réunion",
-            "# Réunion de lancement\n\n- Objectif : valider le MVP\n- Prochaine étape : premier connecteur\n\n## Décisions\n\n- Stack Tauri validée"),
+"---
+date: 2026-07-02
+participants: [Alex, Sam]
+---
+
+# Réunion de lancement
+
+- Objectif : valider le MVP avant la beta.
+- Le [[Plan de lancement]] est la référence unique.
+
+## Décisions
+
+- Cible : indépendants et petites équipes.
+- La beta privée passe avant toute nouvelle feature."),
         demo_leaf("demo-ideas", "demo-projet", "Idées",
-            "# Idées en vrac\n\n- Fusion de concepts proches\n- Watch auto du dossier\n- Export Markdown par espace"),
+"# Idées en vrac
+
+- Mode présentation de la carte
+- Export PDF par espace
+- Raccourcis clavier personnalisables
+
+À trier lors de la prochaine réunion — voir [[Notes de réunion]]."),
+        demo_leaf("demo-atomes", "demo-cours", "Les atomes",
+"# Les atomes
+
+Un atome = noyau (protons + neutrons) + électrons.
+
+| Élément | Symbole | Z |
+| --- | --- | --- |
+| Hydrogène | H | 1 |
+| Carbone | C | 6 |
+| Oxygène | O | 8 |
+
+Le numéro atomique **Z** = nombre de protons."),
+        demo_leaf("demo-reactions", "demo-cours", "Réactions chimiques",
+"# Réactions chimiques
+
+Une réaction conserve la masse (Lavoisier) : les atomes se réarrangent, rien ne se perd.
+
+Exemple : combustion du méthane
+`CH₄ + 2 O₂ → CO₂ + 2 H₂O`
+
+Base : [[Les atomes]].
+
+> 💡 Astuce : clique sur **Synthétiser** sur la bulle « Cours de chimie » pour voir l'IA locale résumer ces pages."),
     ];
     nodes.shrink_to_fit();
 
@@ -1544,14 +1660,15 @@ fn seed_demo() -> Result<BrainGraph, String> {
         source: src.into(), target: tgt.into(), kind: "contains".into(), relation: "contains".into(),
     };
     let edges = vec![
-        edge("root", "demo-guide"), edge("root", "demo-projet"),
+        edge("root", "demo-guide"), edge("root", "demo-projet"), edge("root", "demo-cours"),
         edge("demo-guide", "demo-welcome"), edge("demo-guide", "demo-sources"),
-        edge("demo-projet", "demo-meeting"), edge("demo-projet", "demo-ideas"),
+        edge("demo-projet", "demo-plan"), edge("demo-projet", "demo-meeting"), edge("demo-projet", "demo-ideas"),
+        edge("demo-cours", "demo-atomes"), edge("demo-cours", "demo-reactions"),
     ];
 
     let graph = BrainGraph {
         nodes, edges,
-        markdown: "# Lucid — démo\n\nGraphe d'exemple pour l'exploration.".into(),
+        markdown: "# Lucid — contenu d'exemple\n\nGraphe starter pour la prise en main.".into(),
         report: String::new(),
         generated_at: "demo".into(),
     };
@@ -1559,8 +1676,8 @@ fn seed_demo() -> Result<BrainGraph, String> {
     std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     save_spaces(&dir, &[Space {
-        id: "space_demo".into(), name: "Démo".into(),
-        node_ids: Some(vec!["demo-meeting".into(), "demo-ideas".into()]),
+        id: "space_demo".into(), name: "Projet Alpha".into(),
+        node_ids: Some(vec!["demo-plan".into(), "demo-meeting".into(), "demo-ideas".into()]),
     }]);
     std::fs::write(dir.join("demo.flag"), "1").map_err(|e| e.to_string())?;
     Ok(graph)
@@ -1589,14 +1706,27 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
 
         // Une vraie génération n'est plus une démo : retire le flag pour qu'un
         // reset_demo ultérieur ne puisse jamais effacer ce cerveau réel.
-        if let Some(d) = ai::llama::app_data_dir() { let _ = std::fs::remove_file(d.join("demo.flag")); }
+        // Le contenu starter (et son espace de démo) est jetable : dès qu'une
+        // donnée connecteur arrive, on repart de zéro — rien n'est préservé.
+        let was_demo = ai::llama::app_data_dir()
+            .map(|d| d.join("demo.flag").exists())
+            .unwrap_or(false);
+        if was_demo {
+            if let Some(d) = ai::llama::app_data_dir() {
+                let _ = std::fs::remove_file(d.join("demo.flag"));
+                let _ = std::fs::remove_file(d.join("spaces.json"));
+            }
+        }
 
         // Préserve l'état utilisateur avant que le pipeline écrase brain.json :
         //  - contenu édité (tout nœud) ;
         //  - nœuds « note » créés à la main (absents des conversations, sinon perdus).
-        let prev_graph = ai::llama::app_data_dir()
-            .and_then(|d| std::fs::read_to_string(d.join("brain.json")).ok())
-            .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).ok());
+        // Sauf en sortie de démo : le starter ne doit jamais fuiter dans le vrai cerveau.
+        let prev_graph = if was_demo { None } else {
+            ai::llama::app_data_dir()
+                .and_then(|d| std::fs::read_to_string(d.join("brain.json")).ok())
+                .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).ok())
+        };
         let saved_content: std::collections::HashMap<String, String> = prev_graph
             .as_ref()
             .map(|g| g.nodes.iter()
@@ -1804,7 +1934,7 @@ mod ask_tests {
                 id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 3,
                 summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
                 community: 0, parent_id: None, synthesized_at: None, content: String::new(),
-                connector: None, source_id: None, source_project: None,
+                connector: None, source_id: None, source_project: None, source_text: String::new(),
             },
             demo_leaf("p1", "root", "Notes Jaon", "Réunion avec Jaon sur le projet."),
             demo_leaf("p2", "root", "Recette", "Cuisine et macros."),

@@ -49,7 +49,6 @@ import {
   resolveMcpProposal,
   setNodeParent,
   seedDemo,
-  resetDemo,
   type BrainProgress,
 } from "@/lib/api";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -134,15 +133,11 @@ function App() {
     () => localStorage.getItem("lucid.checklist.dismissed") === "1",
   );
 
-  // ── Onboarding premier lancement : sources → génération → brancher son IA ──
+  // ── Onboarding premier lancement : auto-seed starter → (1re génération) → brancher son IA ──
+  // Plus d'écran bloquant : on atterrit sur la carte pré-remplie, la modale
+  // « brancher son IA » n'apparaît qu'après la première vraie génération.
   const [booted, setBooted] = useState(false); // évite le flash avant le chargement initial
-  const [onboarding, setOnboarding] = useState<null | "sources" | "waiting" | "connect">(
-    () =>
-      localStorage.getItem("lucid.onboarded") === "1" ||
-      localStorage.getItem("lucid.demo") === "1"
-        ? null
-        : "sources",
-  );
+  const [onboarding, setOnboarding] = useState<null | "waiting" | "connect">(null);
   // Mode démo : carte explorable sans connecteur, données jetables (reset à la sortie).
   const [demoMode, setDemoMode] = useState(() => localStorage.getItem("lucid.demo") === "1");
   function finishOnboarding() {
@@ -156,19 +151,17 @@ function App() {
     await listSpaces().then(setSpaces);
     localStorage.setItem("lucid.demo", "1");
     setDemoMode(true);
-    setOnboarding(null);
   }
-  async function handleQuitDemo() {
-    await resetDemo();
-    setGraph(null);
-    await listSpaces().then(setSpaces);
-    localStorage.removeItem("lucid.demo");
-    setDemoMode(false);
-    setOnboarding("sources");
-  }
-  // Utilisateur existant (cerveau déjà généré) : pas d'onboarding, sortie silencieuse.
+  // Premier lancement (modèle prêt, pas de cerveau, jamais onboardé) :
+  // seed automatique du contenu starter — jamais d'écran bloquant.
   useEffect(() => {
-    if (graph && onboarding === "sources") finishOnboarding();
+    if (!booted || needsSetup !== false || graph || generating || demoMode) return;
+    if (localStorage.getItem("lucid.onboarded") === "1") return;
+    handleSeedDemo().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [booted, needsSetup, graph]);
+  // Première vraie génération terminée → propose de brancher ses IA.
+  useEffect(() => {
     if (graph && onboarding === "waiting") setOnboarding("connect");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graph]);
@@ -225,6 +218,9 @@ function App() {
   // → on régénère seulement, sans re-synchroniser tous les connecteurs.
   async function handleGenerate(opts?: { skipSync?: boolean }) {
     setGenesisRun(!graph); // genesis uniquement s'il n'y a pas encore de carte
+    // Première vraie génération (on quitte le contenu starter) → à la fin,
+    // proposer de brancher ses IA (phase "connect").
+    if (localStorage.getItem("lucid.onboarded") !== "1") setOnboarding("waiting");
     setGenerating(true);
     setError(null);
     setProgress(null);
@@ -245,6 +241,9 @@ function App() {
       setStreamLabels([]);
       setRevealKey((k) => k + 1);
       connectorsStatus().then(setConnectors);
+      // Le cerveau réel remplace le contenu starter (côté Rust, demo.flag est retiré).
+      localStorage.removeItem("lucid.demo");
+      setDemoMode(false);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -448,14 +447,6 @@ function App() {
 
   const checklistItems: ChecklistItem[] = useMemo(() => [
     {
-      id: "source", label: "Connecter une source", done: connectors.some((c) => c.connected),
-      hint: "Claude Code, Notion, Drive, Obsidian…", onClick: () => setSettingsOpen(true),
-    },
-    {
-      id: "brain", label: "Générer le cerveau", done: !!graph,
-      hint: "L'IA locale dessine ta carte", onClick: () => handleGenerate(),
-    },
-    {
       id: "page", label: "Ouvrir une page", done: uxFlags.openedPage,
       hint: "Clique sur une bulle de la carte",
     },
@@ -465,8 +456,20 @@ function App() {
       onClick: () => { setNoteTitle(""); setNoteParent(rootId); setImportError(null); setNoteOpen(true); },
     },
     {
-      id: "wikilink", label: "Lier deux pages", done: (graph?.nodes ?? []).some((n) => n.content?.includes("[[")),
+      // Le contenu starter contient déjà des [[wikilinks]] : on ne compte que
+      // ceux écrits par l'utilisateur (hors nœuds demo-*).
+      id: "wikilink", label: "Lier deux pages", done:
+        (graph?.nodes ?? []).some((n) => !n.id.startsWith("demo-") && n.content?.includes("[[")),
       hint: "Tape [[ dans une page",
+    },
+    {
+      id: "source", label: "Connecter une source", done: connectors.some((c) => c.connected),
+      hint: "Claude Code, Notion, Drive, Obsidian…", onClick: () => setSettingsOpen(true),
+    },
+    {
+      // Le graphe starter (generated_at "demo") ne compte pas comme cerveau généré.
+      id: "brain", label: "Générer mon cerveau", done: !!graph && graph.generated_at !== "demo",
+      hint: "Tes vraies données remplacent l'exemple", onClick: () => handleGenerate(),
     },
     {
       id: "ai", label: "Brancher une IA", done: aiConnected,
@@ -933,8 +936,8 @@ function App() {
         </>
       )}
 
-      {/* ── Onboarding premier lancement (au-dessus des deux branches) ── */}
-      {booted && !generating && (onboarding === "sources" || onboarding === "connect") && (
+      {/* ── Onboarding : modale « brancher ses IA » après la 1re vraie génération ── */}
+      {booted && !generating && onboarding === "connect" && (
         <Onboarding
           phase={onboarding}
           connectors={connectors}
@@ -944,15 +947,15 @@ function App() {
           onSeedDemo={handleSeedDemo}
         />
       )}
-      {/* Bannière mode démo : sortie = reset complet à zéro. */}
+      {/* Bannière contenu starter : remplacé dès la première source connectée. */}
       {demoMode && !onboarding && (
         <div className="absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-3 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-1.5 shadow-[var(--shadow-float)]">
-          <span className="text-xs text-[var(--color-muted)]">Mode démo — données d'exemple</span>
+          <span className="text-xs text-[var(--color-muted)]">Contenu d'exemple — connecte une source pour le remplacer par tes données</span>
           <button
-            onClick={handleQuitDemo}
+            onClick={() => setSettingsOpen(true)}
             className="rounded-full bg-[var(--color-accent)] px-3 py-1 text-xs font-medium text-white hover:opacity-90"
           >
-            Quitter et repartir de zéro
+            Connecter une source
           </button>
         </div>
       )}

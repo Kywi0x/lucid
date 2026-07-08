@@ -348,7 +348,9 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
   const [props, setProps] = useState<Prop[]>(() => parseFrontmatter(node.content ?? "").props);
   const [body, setBody] = useState(() => parseFrontmatter(node.content ?? "").body);
   useEffect(() => {
-    const { props: p, body: b } = parseFrontmatter(localContent ?? node.content ?? sourceText ?? "");
+    // `node.content` vaut "" (jamais null) côté Rust : `||` pour que le texte
+    // source (PDF/Notion chargé via loadNodeContent) s'affiche quand rien n'est édité.
+    const { props: p, body: b } = parseFrontmatter(localContent ?? (node.content || sourceText || ""));
     setProps(p);
     setBody(b);
   }, [node.id, sourceText, localContent]);

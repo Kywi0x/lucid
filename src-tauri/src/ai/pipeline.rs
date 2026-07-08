@@ -14,6 +14,9 @@ use std::path::Path;
 /// Budget de caractères du texte condensé envoyé au modèle par conversation.
 const CONDENSE_CHARS: usize = 6000;
 const MAX_OUTPUT_TOKENS: u32 = 256;
+/// Extraction IA par page (résumé/mots-clés/concepts) pendant la génération.
+/// Désactivée : la mindmap se construit sur la structure seule, analyse à la demande.
+const AI_EXTRACTION: bool = false;
 
 /// Résultat structuré attendu du modèle pour une conversation.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -192,15 +195,6 @@ fn save_cache(path: &Path, cache: &HashMap<String, Extraction>) {
     }
 }
 
-fn synth_cache_key(c_key: &str, summaries: &[String], decisions: &[(String, String)]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    c_key.hash(&mut h);
-    summaries.hash(&mut h);
-    decisions.iter().for_each(|(d, _)| d.hash(&mut h));
-    format!("{:x}", h.finish())
-}
-
 /// Événement de progression remonté au frontend.
 pub struct Progress {
     pub current: usize,
@@ -233,7 +227,12 @@ pub fn generate_brain(
         });
 
         let key = cache_key(conv);
-        let ex = if let Some(cached) = cache.get(&key) {
+        // ponytail: extraction IA par page désactivée (utilité incertaine, coût = N appels
+        // Gemma en série). Repasser AI_EXTRACTION à true pour réactiver — le code et le
+        // cache sont intacts. Analyse à la demande : `synthesize_node`.
+        let ex = if !AI_EXTRACTION {
+            cache.get(&key).cloned().unwrap_or_default()
+        } else if let Some(cached) = cache.get(&key) {
             cache_hits += 1;
             cached.clone()
         } else {
@@ -345,6 +344,13 @@ pub fn generate_brain(
             connector: Some(conv.summary.source.clone()),
             source_id: Some(conv.summary.id.clone()),
             source_project: Some(conv.summary.project_slug.clone()),
+            // Document (1 message) → texte intégral ; conversation → version
+            // condensée (une session Claude Code brute ferait exploser brain.md).
+            source_text: if conv.messages.len() == 1 {
+                conv.messages[0].text.clone()
+            } else {
+                condense(conv)
+            },
         });
     }
 
@@ -359,38 +365,9 @@ pub fn generate_brain(
         save_cache(path, &cache);
     }
 
-    // Passe de synthèse : objectif par conteneur (mis en cache).
-    let synth_cache_path: Option<std::path::PathBuf> =
-        cache_path.map(|p| p.with_file_name("brain_synth_cache.json"));
-    let mut synth_cache: HashMap<String, String> = synth_cache_path
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let mut synth_hits = 0usize;
-
-    for (c_key, c) in containers.iter_mut() {
-        let skey = synth_cache_key(c_key, &c.summaries, &c.decisions);
-        if let Some(cached_obj) = synth_cache.get(&skey) {
-            c.objective = cached_obj.clone();
-            synth_hits += 1;
-            continue;
-        }
-        progress(Progress {
-            current: total,
-            total,
-            label: format!("Synthèse : {}", c.display),
-        });
-        c.objective = synthesize_container(engine, &c.display, &c.summaries, &c.decisions);
-        synth_cache.insert(skey, c.objective.clone());
-    }
-
-    if let Some(path) = synth_cache_path.as_deref() {
-        if let Ok(json) = serde_json::to_string(&synth_cache) {
-            let _ = std::fs::write(path, json);
-        }
-    }
-    eprintln!("🔄 Synthèse : {synth_hits}/{} depuis cache.", containers.len());
+    // ponytail: plus de synthèse IA des conteneurs ici — c'est le gros coût par
+    // conteneur et l'utilisateur la déclenche à la demande via `synthesize_node`.
+    // Les nœuds conteneurs partent donc sans `objective` (summary vide).
 
     let (nodes, edges) = build_graph(&containers, &leaves);
     let markdown = assemble_markdown(&nodes);
@@ -403,52 +380,6 @@ pub fn generate_brain(
         report,
         generated_at: chrono::Local::now().to_rfc3339(),
     })
-}
-
-#[derive(Deserialize, Default)]
-struct ContainerSynth {
-    #[serde(default)]
-    objective: String,
-    #[serde(default)]
-    themes: Vec<String>,
-}
-
-fn synthesize_container(
-    engine: &LlamaEngine,
-    display: &str,
-    summaries: &[String],
-    decisions: &[(String, String)],
-) -> String {
-    let summaries: Vec<String> = summaries.iter().take(10).cloned().collect();
-    let decisions: Vec<String> =
-        dedup_pairs(decisions).into_iter().take(8).map(|(d, _)| d).collect();
-    if summaries.is_empty() && decisions.is_empty() {
-        return String::new();
-    }
-    let user = format!(
-        "Projet : {display}\n\nRésumés :\n{s}\n\nDécisions clés :\n{d}\n\n\
-Produis UNIQUEMENT un JSON {{\"objective\": \"objectif global en 1 à 2 phrases\", \
-\"themes\": [\"thème\"]}}. En français, concis.",
-        s = summaries.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n"),
-        d = decisions.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n"),
-    );
-    let raw = match engine.complete(Some(SYSTEM_PROMPT), &user, 300) {
-        Ok(r) => r,
-        Err(_) => return String::new(),
-    };
-    let synth: ContainerSynth = extract_json(&raw)
-        .and_then(|j| serde_json::from_str(j).ok())
-        .unwrap_or_default();
-    let mut out = synth.objective.trim().to_string();
-    if !synth.themes.is_empty() {
-        let themes = synth.themes.join(", ");
-        if out.is_empty() {
-            out = format!("Thématiques : {themes}");
-        } else {
-            out.push_str(&format!(" · Thématiques : {themes}"));
-        }
-    }
-    out
 }
 
 /// Mots-clés d'un conteneur : concepts les plus fréquents.
@@ -495,6 +426,7 @@ fn build_graph(
         connector: None,
         source_id: None,
         source_project: None,
+        source_text: String::new(),
     });
 
     for (c_key, c) in containers {
@@ -515,6 +447,7 @@ fn build_graph(
             connector: None,
             source_id: None,
             source_project: None,
+            source_text: String::new(),
         });
         edges.push(BrainEdge {
             source: c.parent_id.clone(),
@@ -630,6 +563,9 @@ pub fn emit_section(buf: &mut String, n: &BrainNode, level: usize) {
     }
     if !n.content.is_empty() {
         buf.push_str(&n.content);
+        buf.push_str("\n\n");
+    } else if !n.source_text.is_empty() {
+        buf.push_str(&n.source_text);
         buf.push_str("\n\n");
     }
 }

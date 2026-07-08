@@ -84,6 +84,11 @@ pub struct BrainNode {
     /// Slug projet (utilisé uniquement par Claude Code pour localiser le fichier JSONL).
     #[serde(default)]
     pub source_project: Option<String>,
+    /// Texte source de la page (markdown issu du connecteur : PDF converti,
+    /// page Notion…). Rempli à la génération, sans IA. Embarqué dans brain.md
+    /// et utilisé par ask_brain — le cerveau reste exploitable hors app (MCP).
+    #[serde(default)]
+    pub source_text: String,
 }
 
 /// Une arête : relation de contenance dans l'arbre.
