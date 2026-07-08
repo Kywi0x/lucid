@@ -94,8 +94,14 @@ struct ModelInfo {
 }
 
 /// Liste les modèles disponibles avec leur statut (téléchargé, actif, recommandé).
+/// Async : load_catalog peut partir en réseau (15 s de timeout) et la lecture RAM
+/// spawne powershell sous Windows — jamais sur le thread UI (ça gelait l'app).
 #[tauri::command]
-fn list_models() -> Vec<ModelInfo> {
+async fn list_models() -> Vec<ModelInfo> {
+    tauri::async_runtime::spawn_blocking(list_models_blocking).await.unwrap_or_default()
+}
+
+fn list_models_blocking() -> Vec<ModelInfo> {
     let catalog = ai::llama::load_catalog();
     let active_id = ai::llama::active_model_stored().map(|m| m.id);
     let recommended_id = ai::llama::recommended_id(&catalog);

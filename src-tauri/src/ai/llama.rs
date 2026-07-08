@@ -217,22 +217,40 @@ fn load_remote_catalog() -> Vec<ModelDef> {
 
 // ── Sélection du modèle actif ─────────────────────────────────────────────────
 
-fn total_ram_gb() -> f32 {
-    #[cfg(target_os = "macos")]
-    let output = Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok();
+/// `Command` sans fenêtre console sur Windows — sans ça, chaque spawn
+/// (llama, pdftoppm, tesseract, powershell…) fait flasher un CMD à l'écran.
+pub fn quiet_command(bin: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(bin);
     #[cfg(windows)]
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command",
-               "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
-        .output().ok();
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let output: Option<std::process::Output> = None; // Linux : fallback 8.0
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
 
-    output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|b| b as f32 / 1_073_741_824.0)
-        .unwrap_or(8.0)
+fn total_ram_gb() -> f32 {
+    // La RAM ne change pas en cours de route : une seule lecture (le spawn
+    // powershell sous Windows coûte ~1-2 s, inacceptable à chaque list_models).
+    static RAM: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *RAM.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let output = quiet_command("sysctl").args(["-n", "hw.memsize"]).output().ok();
+        #[cfg(windows)]
+        let output = quiet_command("powershell")
+            .args(["-NoProfile", "-Command",
+                   "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
+            .output().ok();
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let output: Option<std::process::Output> = None; // Linux : fallback 8.0
+
+        output
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|b| b as f32 / 1_073_741_824.0)
+            .unwrap_or(8.0)
+    })
 }
 
 /// ID du modèle recommandé selon la RAM : le plus grand qui tient confortablement.
@@ -412,7 +430,7 @@ impl LlamaEngine {
         let filename = self.model.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
         let formatted = format_prompt(&filename, system, user);
 
-        let mut cmd = Command::new(&self.binary);
+        let mut cmd = quiet_command(&self.binary);
         cmd.arg("-m").arg(&self.model)
             .args(["-ngl", "99"])
             .args(["-c", &CONTEXT_TOKENS.to_string()])

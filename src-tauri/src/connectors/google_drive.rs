@@ -604,7 +604,7 @@ fn run_pdftotext(path: &std::path::Path) -> Option<String> {
     // Cherche dans Homebrew si absent du PATH par défaut
     let bin = which_bin("pdftotext")
         .unwrap_or_else(|| "/opt/homebrew/bin/pdftotext".to_string());
-    let out = Command::new(&bin)
+    let out = crate::ai::llama::quiet_command(&bin)
         .args(["-layout", "-nopgbrk"])
         .arg(path)
         .arg("-")
@@ -626,7 +626,7 @@ fn ocr_pdf(path: &std::path::Path) -> Option<String> {
         .unwrap_or_else(|| "/opt/homebrew/bin/tesseract".to_string());
 
     // 200 DPI, max 10 pages
-    let _ = Command::new(&pdftoppm)
+    let _ = crate::ai::llama::quiet_command(&pdftoppm)
         .args(["-r", "200", "-png", "-l", "10"])
         .arg(path)
         .arg(tmp_dir.join("page"))
@@ -641,7 +641,7 @@ fn ocr_pdf(path: &std::path::Path) -> Option<String> {
 
     let mut pages = Vec::new();
     for entry in &entries {
-        let mut cmd = Command::new(&tesseract);
+        let mut cmd = crate::ai::llama::quiet_command(&tesseract);
         if let Some(td) = tessdata_prefix() { cmd.env("TESSDATA_PREFIX", td); }
         if let Ok(ocr) = cmd
             .arg(entry.path())
