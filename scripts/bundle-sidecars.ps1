@@ -81,7 +81,17 @@ Write-Host "── 3/4 tesseract + tessdata (fra+eng+osd)"
 $7z = @("7z", "$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe") |
     Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
 if ($7z) {
-    $setupUrl = "https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-5.5.0.20241111.exe"
+    # Pas d'URL épinglée : on scrape l'index UB Mannheim et on prend le dernier
+    # installeur (le miroir retire parfois d'anciennes versions → 404 sinon).
+    # ponytail: tri lexical — suffisant tant que tesseract ne passe pas en 5.10+.
+    $idxUrl = "https://digi.bib.uni-mannheim.de/tesseract/"
+    $idx = Invoke-WebRequest $idxUrl -UseBasicParsing
+    $name = $idx.Links.href |
+        Where-Object { $_ -match '^tesseract-ocr-w64-setup-[0-9].*\.exe$' } |
+        Sort-Object | Select-Object -Last 1
+    if (-not $name) { throw "Aucun installeur tesseract-ocr-w64-setup-*.exe trouvé sur $idxUrl" }
+    Write-Host "   → $name"
+    $setupUrl = "$idxUrl$name"
     $setup = Join-Path $env:TEMP "tesseract-setup.exe"
     $out = Join-Path $env:TEMP "tesseract-win"
     Invoke-WebRequest $setupUrl -OutFile $setup
