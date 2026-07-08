@@ -15,6 +15,8 @@ interface Props {
   onGenerate: () => void;
   /** Termine (ou saute) l'onboarding. */
   onDone: () => void;
+  /** Seed un graphe de démo et entre dans la carte pour explorer sans connecteur. */
+  onSeedDemo: () => void;
 }
 
 function StepDots({ current }: { current: number }) {
@@ -34,7 +36,7 @@ function StepDots({ current }: { current: number }) {
 }
 
 /** Onboarding premier lancement : Sources → génération (genesis) → Brancher son IA. */
-export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDone }: Props) {
+export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDone, onSeedDemo }: Props) {
   const [copied, setCopied] = useState(false);
   const hasSource = connectors.some((c) => c.connected && c.conversation_count > 0);
 
@@ -46,7 +48,7 @@ export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDo
   }
 
   return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center bg-[var(--color-bg)]/80 backdrop-blur-sm">
+    <div className="absolute inset-0 z-40 flex items-center justify-center bg-[var(--color-bg)]/95">
       <div className="panel w-[560px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl">
         {phase === "sources" ? (
           <div className="px-8 py-7">
@@ -99,8 +101,11 @@ export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDo
                   Connecte au moins une source pour commencer.
                 </p>
               )}
-              <button onClick={onDone} className="mt-1 text-[11px] text-[var(--color-muted)] hover:text-[var(--color-text)]">
-                Plus tard — explorer d'abord
+              <button onClick={onSeedDemo} className="mt-1 text-xs text-[var(--color-accent)] hover:underline">
+                Explorer une démo (sans connecteur)
+              </button>
+              <button onClick={onDone} className="text-[11px] text-[var(--color-muted)] hover:text-[var(--color-text)]">
+                Plus tard
               </button>
             </div>
 

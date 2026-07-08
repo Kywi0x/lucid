@@ -48,6 +48,8 @@ import {
   listMcpProposals,
   resolveMcpProposal,
   setNodeParent,
+  seedDemo,
+  resetDemo,
   type BrainProgress,
 } from "@/lib/api";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -132,11 +134,34 @@ function App() {
   // ── Onboarding premier lancement : sources → génération → brancher son IA ──
   const [booted, setBooted] = useState(false); // évite le flash avant le chargement initial
   const [onboarding, setOnboarding] = useState<null | "sources" | "waiting" | "connect">(
-    () => (localStorage.getItem("lucid.onboarded") === "1" ? null : "sources"),
+    () =>
+      localStorage.getItem("lucid.onboarded") === "1" ||
+      localStorage.getItem("lucid.demo") === "1"
+        ? null
+        : "sources",
   );
+  // Mode démo : carte explorable sans connecteur, données jetables (reset à la sortie).
+  const [demoMode, setDemoMode] = useState(() => localStorage.getItem("lucid.demo") === "1");
   function finishOnboarding() {
     localStorage.setItem("lucid.onboarded", "1");
     setOnboarding(null);
+  }
+  async function handleSeedDemo() {
+    const g = await seedDemo();
+    setGraph(g);
+    setRevealKey((k) => k + 1);
+    await listSpaces().then(setSpaces);
+    localStorage.setItem("lucid.demo", "1");
+    setDemoMode(true);
+    setOnboarding(null);
+  }
+  async function handleQuitDemo() {
+    await resetDemo();
+    setGraph(null);
+    await listSpaces().then(setSpaces);
+    localStorage.removeItem("lucid.demo");
+    setDemoMode(false);
+    setOnboarding("sources");
   }
   // Utilisateur existant (cerveau déjà généré) : pas d'onboarding, sortie silencieuse.
   useEffect(() => {
@@ -518,7 +543,7 @@ function App() {
           {/* ── Overlay progression ── */}
           {generating && (
             <div className="absolute inset-0 z-20 flex items-end justify-center pb-24 pointer-events-none">
-              <div className="pointer-events-auto rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)]/90 backdrop-blur-md px-6 py-4 shadow-[var(--shadow-float)] min-w-[320px]">
+              <div className="pointer-events-auto rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] px-6 py-4 shadow-[var(--shadow-float)] min-w-[320px]">
                 <GenerateProgress progress={progress} />
               </div>
             </div>
@@ -897,7 +922,20 @@ function App() {
           onOpenSettings={() => setSettingsOpen(true)}
           onGenerate={() => { setOnboarding("waiting"); handleGenerate(); }}
           onDone={finishOnboarding}
+          onSeedDemo={handleSeedDemo}
         />
+      )}
+      {/* Bannière mode démo : sortie = reset complet à zéro. */}
+      {demoMode && !onboarding && (
+        <div className="absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-3 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-1.5 shadow-[var(--shadow-float)]">
+          <span className="text-xs text-[var(--color-muted)]">Mode démo — données d'exemple</span>
+          <button
+            onClick={handleQuitDemo}
+            className="rounded-full bg-[var(--color-accent)] px-3 py-1 text-xs font-medium text-white hover:opacity-90"
+          >
+            Quitter et repartir de zéro
+          </button>
+        </div>
       )}
       {/* Les Settings doivent rester accessibles PAR-DESSUS l'onboarding (bouton
           Configurer), y compris quand il n'y a pas encore de graphe. */}

@@ -283,6 +283,16 @@ export function listSpaces(): Promise<import("./types").Space[]> {
   return invoke("list_spaces");
 }
 
+/** Onboarding : seed un graphe de démo explorable (spaces + pages template). */
+export function seedDemo(): Promise<import("./types").BrainGraph> {
+  return invoke("seed_demo");
+}
+
+/** Onboarding : efface la démo et remet à zéro (no-op si ce n'est pas une démo). */
+export function resetDemo(): Promise<void> {
+  return invoke("reset_demo");
+}
+
 /** Crée un nouvel espace personnalisé. */
 export function createSpace(name: string): Promise<import("./types").Space> {
   return invoke("create_space", { name });

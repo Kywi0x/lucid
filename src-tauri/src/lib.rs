@@ -677,7 +677,11 @@ fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
     let ext = p.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
     let content = match ext.as_str() {
         "pdf" => connectors::google_drive::pdf_to_markdown(p, &label)
-            .ok_or("Extraction PDF impossible (pdftotext/tesseract requis — brew install poppler tesseract).")?,
+            .ok_or(if cfg!(windows) {
+                "Extraction PDF impossible : poppler non embarqué sur cette build Windows."
+            } else {
+                "Extraction PDF impossible (pdftotext/tesseract requis — brew install poppler tesseract)."
+            })?,
         "doc" | "docx" | "rtf" => textutil_to_text(p)?,
         "txt" | "md" | "markdown" => read_lossy(p)?,
         "csv" => csv_to_markdown(&read_lossy(p)?),
@@ -1414,6 +1418,90 @@ fn export_space_md(space_id: String) -> Result<String, String> {
     Ok(md)
 }
 
+// ─── Démo d'onboarding (explorer sans connecteur) ──────────────────────────────
+//
+// `seed_demo` écrit un brain.json + spaces.json factices pour explorer la carte
+// sans source. Un fichier `demo.flag` marque ces données comme jetables :
+// `reset_demo` n'efface QUE si le flag existe → jamais de vrai cerveau supprimé.
+
+fn demo_leaf(id: &str, parent: &str, label: &str, content: &str) -> BrainNode {
+    BrainNode {
+        id: id.into(), label: label.into(), kind: "leaf".into(), weight: 1,
+        summary: content.lines().next().unwrap_or("").to_string(),
+        keywords: vec![], decisions: vec![], patterns: vec![], community: 1,
+        parent_id: Some(parent.into()), synthesized_at: None, content: content.into(),
+        connector: None, source_id: None, source_project: None,
+    }
+}
+
+#[tauri::command]
+fn seed_demo() -> Result<BrainGraph, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+
+    let container = |id: &str, label: &str, weight: usize| BrainNode {
+        id: id.into(), label: label.into(), kind: "container".into(), weight,
+        summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
+        community: 1, parent_id: Some("root".into()), synthesized_at: None,
+        content: String::new(), connector: None, source_id: None, source_project: None,
+    };
+
+    let mut nodes = vec![
+        BrainNode {
+            id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 6,
+            summary: "Démo d'exploration".into(), keywords: vec![], decisions: vec![],
+            patterns: vec![], community: 0, parent_id: None, synthesized_at: None,
+            content: String::new(), connector: None, source_id: None, source_project: None,
+        },
+        container("demo-guide", "Prise en main", 2),
+        container("demo-projet", "Projet exemple", 2),
+        demo_leaf("demo-welcome", "demo-guide", "Bienvenue 👋",
+            "# Bienvenue dans Lucid\n\nCeci est une **démo**. Clique sur les bulles pour explorer, ouvre une page, crée un espace.\n\nQuand tu quittes la démo, tout est effacé et remis à zéro."),
+        demo_leaf("demo-sources", "demo-guide", "Tes sources",
+            "# Connecter tes sources\n\nLucid agrège Claude Code, Notion, Google Drive…\n\nTout est analysé **100 % en local**."),
+        demo_leaf("demo-meeting", "demo-projet", "Notes de réunion",
+            "# Réunion de lancement\n\n- Objectif : valider le MVP\n- Prochaine étape : premier connecteur\n\n## Décisions\n\n- Stack Tauri validée"),
+        demo_leaf("demo-ideas", "demo-projet", "Idées",
+            "# Idées en vrac\n\n- Fusion de concepts proches\n- Watch auto du dossier\n- Export Markdown par espace"),
+    ];
+    nodes.shrink_to_fit();
+
+    let edge = |src: &str, tgt: &str| BrainEdge {
+        source: src.into(), target: tgt.into(), kind: "contains".into(), relation: "contains".into(),
+    };
+    let edges = vec![
+        edge("root", "demo-guide"), edge("root", "demo-projet"),
+        edge("demo-guide", "demo-welcome"), edge("demo-guide", "demo-sources"),
+        edge("demo-projet", "demo-meeting"), edge("demo-projet", "demo-ideas"),
+    ];
+
+    let graph = BrainGraph {
+        nodes, edges,
+        markdown: "# Lucid — démo\n\nGraphe d'exemple pour l'exploration.".into(),
+        report: String::new(),
+        generated_at: "demo".into(),
+    };
+
+    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    save_spaces(&dir, &[Space {
+        id: "space_demo".into(), name: "Démo".into(),
+        node_ids: Some(vec!["demo-meeting".into(), "demo-ideas".into()]),
+    }]);
+    std::fs::write(dir.join("demo.flag"), "1").map_err(|e| e.to_string())?;
+    Ok(graph)
+}
+
+/// Efface les données de démo et remet à zéro — no-op si ce n'est pas une démo.
+#[tauri::command]
+fn reset_demo() -> Result<(), String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    if !dir.join("demo.flag").exists() { return Ok(()); }
+    for f in ["brain.json", "spaces.json", "demo.flag"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    Ok(())
+}
+
 /// Lance le pipeline IA : analyse toutes les conversations et construit le graphe.
 #[tauri::command]
 async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
@@ -1423,6 +1511,10 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
         if convs.is_empty() {
             return Err("Aucune conversation à analyser.".to_string());
         }
+
+        // Une vraie génération n'est plus une démo : retire le flag pour qu'un
+        // reset_demo ultérieur ne puisse jamais effacer ce cerveau réel.
+        if let Some(d) = ai::llama::app_data_dir() { let _ = std::fs::remove_file(d.join("demo.flag")); }
 
         // Préserve l'état utilisateur avant que le pipeline écrase brain.json :
         //  - contenu édité (tout nœud) ;
@@ -1617,7 +1709,9 @@ pub fn run() {
             delete_space,
             add_node_to_space,
             remove_node_from_space,
-            export_space_md
+            export_space_md,
+            seed_demo,
+            reset_demo
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

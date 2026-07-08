@@ -65,7 +65,7 @@ function Btn({
 
 const BUBBLE_CLASS =
   "flex items-center gap-0.5 rounded-xl border border-[var(--color-border)] " +
-  "bg-[var(--color-surface)] shadow-lg px-1.5 py-1 backdrop-blur-sm";
+  "bg-[var(--color-surface)] shadow-lg px-1.5 py-1";
 
 const FLOAT_CLASS =
   "flex items-center gap-0.5 rounded-xl border border-[var(--color-border)] " +

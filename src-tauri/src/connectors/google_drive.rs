@@ -498,8 +498,12 @@ fn extract_pdf(
 fn which_bin(name: &str) -> Option<String> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sidecar = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-            if sidecar.is_file() { return Some(sidecar.to_string_lossy().into_owned()); }
+            let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+            // Sidecar direct, puis sous-dossier `poppler/` (Windows : l'exe et ses
+            // DLLs y sont embarqués ensemble → DLLs chargées depuis leur propre dir).
+            for cand in [dir.join(&file), dir.join("poppler").join(&file)] {
+                if cand.is_file() { return Some(cand.to_string_lossy().into_owned()); }
+            }
         }
     }
     // Fallbacks Unix (Homebrew + PATH). Sur Windows, MVP = sidecar-first uniquement
