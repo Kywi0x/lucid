@@ -88,6 +88,13 @@ ex. `"claude"`, `"cowork"`, `"google-drive"`), l'ajouter à l'agrégation (cf. `
 Le graphe + drill-down + ponts fonctionnent sans autre changement. Les `SourceRef.link` deviennent
 les liens fichiers (chemin local ou URL Drive).
 
+## Règle : parité Mac/Windows (décision Liam, 2026-07-08)
+
+**Toute feature faisable sur Mac doit l'être sur Windows.** En pratique :
+- Jamais de dépendance à un binaire système supposé présent (`textutil`, Homebrew…) sans équivalent Windows.
+- Binaire externe requis → **sidecar embarqué** (cf. `binaries/windows/`, `tauri.windows.conf.json`) **+ fallback pur Rust** si possible (ex. `pdf-extract` derrière `pdftotext`).
+- Si un cas est **réellement impossible** (ex. `.doc` legacy binaire), l'UI le dit explicitement — **jamais d'échec silencieux** (le sync Drive Windows qui skippait tous les PDF sans un mot = l'anti-exemple).
+
 ## Prochaines étapes (priorité)
 
 1. **2e connecteur réel** pour valider le multi-sources : claude.ai (import export `.zip`) ou Cowork.

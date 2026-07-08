@@ -7,7 +7,10 @@
       "binaries/lucid_mcp"
     ],
     "resources": {
-      "resources/win-libs/*.dll": "./"
+      "resources/win-libs/*.dll": "./",
+      "resources/win-poppler/": "poppler/",
+      "resources/win-tesseract/": "tesseract/",
+      "resources/win-tessdata/": "tessdata/"
     }
   }
 }

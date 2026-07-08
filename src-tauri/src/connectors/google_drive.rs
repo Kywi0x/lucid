@@ -504,15 +504,30 @@ fn which_bin(name: &str) -> Option<String> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-            // Sidecar direct, puis sous-dossier `poppler/` (Windows : l'exe et ses
-            // DLLs y sont embarqués ensemble → DLLs chargées depuis leur propre dir).
-            for cand in [dir.join(&file), dir.join("poppler").join(&file)] {
+            // Sidecar direct (macOS externalBin), puis sous-dossiers Windows
+            // `poppler/` et `tesseract/` (chaque toolchain isolée avec ses DLLs,
+            // chargées depuis le dossier de l'exe — cf. tauri.windows.conf.json).
+            for cand in [
+                dir.join(&file),
+                dir.join("poppler").join(&file),
+                dir.join("tesseract").join(&file),
+            ] {
                 if cand.is_file() { return Some(cand.to_string_lossy().into_owned()); }
             }
         }
     }
-    // Fallbacks Unix (Homebrew + PATH). Sur Windows, MVP = sidecar-first uniquement
-    // (poppler/tesseract non embarqués → PDF/OCR dégrade proprement).
+    // Dev Windows : binaires posés par scripts/bundle-sidecars.ps1 (pas d'install
+    // système type Homebrew) → on pioche directement dans resources/ du repo.
+    #[cfg(all(windows, debug_assertions))]
+    {
+        let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        for sub in ["win-poppler", "win-tesseract"] {
+            let cand = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("resources").join(sub).join(&file);
+            if cand.is_file() { return Some(cand.to_string_lossy().into_owned()); }
+        }
+    }
+    // Fallbacks Unix (Homebrew + PATH).
     #[cfg(unix)]
     {
         for prefix in ["/opt/homebrew/bin", "/usr/local/bin"] {
@@ -527,12 +542,28 @@ fn which_bin(name: &str) -> Option<String> {
     None
 }
 
-/// Dossier tessdata du bundle (Contents/Resources/tessdata) si présent —
-/// nécessaire au tesseract embarqué pour trouver fra+eng.
+/// Dossier tessdata embarqué (fra+eng) pour le tesseract sidecar.
+/// macOS bundle : Contents/Resources/tessdata · Windows release : tessdata/ à côté
+/// de l'exe · dev Windows : resources/win-tessdata du repo (bundle-sidecars.ps1).
+/// None → tesseract système utilise son tessdata par défaut (Homebrew).
 fn tessdata_prefix() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let res = exe.parent()?.parent()?.join("Resources").join("tessdata");
-    res.is_dir().then_some(res)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let win = dir.join("tessdata");
+            if win.is_dir() { return Some(win); }
+            if let Some(parent) = dir.parent() {
+                let mac = parent.join("Resources").join("tessdata");
+                if mac.is_dir() { return Some(mac); }
+            }
+        }
+    }
+    #[cfg(all(windows, debug_assertions))]
+    {
+        let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources").join("win-tessdata");
+        if dev.is_dir() { return Some(dev); }
+    }
+    None
 }
 
 /// pdftotext (poppler) en premier ; fallback OCR (pdftoppm + tesseract) pour les PDFs scannés.
@@ -543,13 +574,30 @@ pub fn pdf_to_markdown(path: &std::path::Path, name: &str) -> Option<String> {
         eprintln!("✅ pdftotext OK ({} chars)", text.len());
         return Some(post_process(text));
     }
-    eprintln!("⚠️ pdftotext vide — tentative OCR…");
+    // Fallback pur Rust (pdf-extract) : indispensable sur Windows où poppler
+    // n'est pas embarqué — qualité moindre que pdftotext -layout mais universel.
+    if let Some(text) = extract_pdf_rust(path) {
+        eprintln!("✅ pdf-extract OK ({} chars)", text.len());
+        return Some(post_process(text));
+    }
+    eprintln!("⚠️ extraction texte vide — tentative OCR…");
     if let Some(text) = ocr_pdf(path) {
         eprintln!("✅ OCR OK ({} chars)", text.len());
         return Some(post_process(text));
     }
     eprintln!("❌ Extraction impossible : {name}");
     None
+}
+
+/// Extraction texte sans binaire externe. pdf-extract panique sur certains PDFs
+/// malformés → catch_unwind pour dégrader en None au lieu de crasher le sync.
+fn extract_pdf_rust(path: &std::path::Path) -> Option<String> {
+    let path = path.to_path_buf();
+    let text = std::panic::catch_unwind(move || pdf_extract::extract_text(&path).ok())
+        .ok()
+        .flatten()?;
+    let text = text.trim().to_string();
+    if text.len() < 20 { None } else { Some(text) }
 }
 
 fn run_pdftotext(path: &std::path::Path) -> Option<String> {

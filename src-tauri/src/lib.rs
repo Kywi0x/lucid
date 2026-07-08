@@ -756,11 +756,12 @@ fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
     let content = match ext.as_str() {
         "pdf" => connectors::google_drive::pdf_to_markdown(p, &label)
             .ok_or(if cfg!(windows) {
-                "Extraction PDF impossible : poppler non embarqué sur cette build Windows."
+                "Extraction impossible — PDF scanné ? OCR requis : lance scripts/bundle-sidecars.ps1 (embarque poppler + tesseract)."
             } else {
-                "Extraction PDF impossible (pdftotext/tesseract requis — brew install poppler tesseract)."
+                "Extraction PDF impossible (PDF scanné : OCR requis — brew install poppler tesseract tesseract-lang)."
             })?,
-        "doc" | "docx" | "rtf" => textutil_to_text(p)?,
+        "docx" => docx_to_text(p)?,
+        "doc" | "rtf" => textutil_to_text(p)?,
         "txt" | "md" | "markdown" => read_lossy(p)?,
         "csv" => csv_to_markdown(&read_lossy(p)?),
         other => return Err(format!("Format non supporté : .{other}")),
@@ -924,7 +925,37 @@ fn read_lossy(p: &std::path::Path) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-// ponytail: textutil = natif macOS ; passer à une crate docx le jour du port Windows.
+/// Extraction texte d'un .docx sans binaire externe (parité Mac/Windows, ADR-0015) :
+/// un .docx est un zip ; le texte vit dans word/document.xml. Paragraphes → \n,
+/// tags XML strippés, entités de base décodées. Suffisant pour alimenter brain.md.
+fn docx_to_text(p: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(f).map_err(|e| format!("docx invalide : {e}"))?;
+    let mut doc = zip.by_name("word/document.xml")
+        .map_err(|_| "docx invalide : word/document.xml absent.".to_string())?;
+    let mut xml = String::new();
+    doc.read_to_string(&mut xml).map_err(|e| e.to_string())?;
+
+    let xml = xml.replace("</w:p>", "\n").replace("<w:tab/>", "\t");
+    let mut out = String::with_capacity(xml.len() / 4);
+    let mut in_tag = false;
+    for c in xml.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out
+        .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&apos;", "'");
+    let out = out.trim().to_string();
+    if out.is_empty() { Err("Le document ne contient aucun texte.".into()) } else { Ok(out) }
+}
+
+// textutil (natif macOS) : .doc legacy et .rtf. Le .docx passe par docx_to_text (pur Rust).
 #[cfg(target_os = "macos")]
 fn textutil_to_text(p: &std::path::Path) -> Result<String, String> {
     let out = std::process::Command::new("textutil")
@@ -938,10 +969,56 @@ fn textutil_to_text(p: &std::path::Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-// Hors macOS : import .doc/.rtf/.docx non supporté en v1 (textutil est natif macOS).
+// Hors macOS : .doc legacy (format binaire propriétaire) et .rtf (v1) — réellement
+// non supportés, on le dit honnêtement (ADR-0015).
 #[cfg(not(target_os = "macos"))]
 fn textutil_to_text(_p: &std::path::Path) -> Result<String, String> {
-    Err("Import .doc/.rtf/.docx non supporté sur cette plateforme (macOS uniquement en v1).".into())
+    Err("Import .doc/.rtf non supporté sur Windows — convertis le fichier en .docx ou PDF.".into())
+}
+
+#[cfg(test)]
+mod docx_tests {
+    use super::*;
+
+    #[test]
+    fn extrait_le_texte_dun_docx_minimal() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("lucid_test_docx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.docx");
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        zw.start_file("word/document.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(
+            b"<w:document><w:body>\
+              <w:p><w:r><w:t>Bonjour &amp; bienvenue</w:t></w:r></w:p>\
+              <w:p><w:r><w:t>Deuxi\xc3\xa8me ligne</w:t></w:r></w:p>\
+              </w:body></w:document>",
+        ).unwrap();
+        zw.finish().unwrap();
+
+        let text = docx_to_text(&path).unwrap();
+        assert!(text.contains("Bonjour & bienvenue"), "entités décodées : {text}");
+        assert!(text.contains("Deuxième ligne"), "paragraphe suivant sur sa ligne : {text}");
+        assert!(text.lines().count() >= 2, "les </w:p> deviennent des sauts de ligne");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refuse_un_zip_sans_document_xml() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("lucid_test_docx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vide.docx");
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        zw.start_file("autre.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(b"rien").unwrap();
+        zw.finish().unwrap();
+
+        assert!(docx_to_text(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]
