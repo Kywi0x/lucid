@@ -390,11 +390,9 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     let mut new_count = 0usize;
 
     for f in all_files {
-        // PDF uniquement — Google Docs, images, vidéos ignorés.
-        if f.mime_type != "application/pdf" && !f.name.to_lowercase().ends_with(".pdf") {
-            continue;
-        }
-        eprintln!("📋 PDF détecté : {} ({})", f.name, f.mime_type);
+        // PDF, Google Slides, PowerPoint .pptx — le reste (images, vidéos…) ignoré.
+        let Some(kind) = drive_kind(&f) else { continue };
+        eprintln!("📋 {kind} détecté : {} ({})", f.name, f.mime_type);
 
         let id = f.id.clone();
         let modified = f.modified_time.clone();
@@ -417,7 +415,7 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
             }
         }
 
-        if let Some(conv) = ingest_file(&client, &access_token, f, &project, &project_slug, container_path) {
+        if let Some(conv) = ingest_file(&client, &access_token, f, kind, &project, &project_slug, container_path) {
             convs.push(conv);
             new_count += 1;
         }
@@ -434,16 +432,34 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     Ok((new_count, convs.len()))
 }
 
-/// Ingère un PDF Drive → Conversation.
+const MIME_SLIDES: &str = "application/vnd.google-apps.presentation";
+const MIME_PPTX: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+
+/// Type de fichier Drive supporté → clé de dispatch, None = ignoré.
+fn drive_kind(f: &DriveFile) -> Option<&'static str> {
+    let name = f.name.to_lowercase();
+    if f.mime_type == "application/pdf" || name.ends_with(".pdf") { return Some("pdf"); }
+    if f.mime_type == MIME_SLIDES { return Some("slides"); }
+    if f.mime_type == MIME_PPTX || name.ends_with(".pptx") { return Some("pptx"); }
+    None
+}
+
+/// Ingère un fichier Drive supporté (PDF, Slides, pptx) → Conversation.
 fn ingest_file(
     client: &reqwest::blocking::Client,
     access_token: &str,
     file: DriveFile,
+    kind: &str,
     project: &str,
     project_slug: &str,
     container_path: Vec<String>,
 ) -> Option<Conversation> {
-    let text = extract_pdf(client, access_token, &file)?;
+    let text = match kind {
+        "slides" => export_slides_text(client, access_token, &file),
+        "pptx" => download_then(client, access_token, &file, "pptx", |p| pptx_to_markdown(p)),
+        _ => extract_pdf(client, access_token, &file),
+    }?;
     let ts = file.modified_time.clone();
     Some(Conversation {
         summary: ConversationSummary {
@@ -465,13 +481,15 @@ fn ingest_file(
     })
 }
 
-// ─── Extraction PDF → Markdown ───────────────────────────────────────────────
+// ─── Extraction fichiers → Markdown ──────────────────────────────────────────
 
-/// Télécharge le PDF depuis Drive et extrait le texte en markdown.
-fn extract_pdf(
+/// Télécharge un fichier binaire Drive dans un tmp, applique `convert`, nettoie.
+fn download_then(
     client: &reqwest::blocking::Client,
     access_token: &str,
     file: &DriveFile,
+    ext: &str,
+    convert: impl FnOnce(&std::path::Path) -> Option<String>,
 ) -> Option<String> {
     let resp = client
         .get(format!("https://www.googleapis.com/drive/v3/files/{}", file.id))
@@ -486,11 +504,95 @@ fn extract_pdf(
         return None;
     }
     let safe_id: String = file.id.chars().take(8).filter(|c| c.is_alphanumeric()).collect();
-    let tmp = std::env::temp_dir().join(format!("brainlink_{safe_id}.pdf"));
+    let tmp = std::env::temp_dir().join(format!("brainlink_{safe_id}.{ext}"));
     std::fs::write(&tmp, &bytes).ok()?;
-    let result = pdf_to_markdown(&tmp, &file.name);
+    let result = convert(&tmp);
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+/// Télécharge le PDF depuis Drive et extrait le texte en markdown.
+fn extract_pdf(
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+    file: &DriveFile,
+) -> Option<String> {
+    download_then(client, access_token, file, "pdf", |p| pdf_to_markdown(p, &file.name))
+}
+
+/// Exporte le texte d'un Google Slides via l'API Drive (`files.export`).
+/// ponytail: text/plain ne marque pas les diapos — suffisant pour brain.md ;
+/// si la structure par diapo devient nécessaire, exporter en pptx et convertir.
+fn export_slides_text(
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+    file: &DriveFile,
+) -> Option<String> {
+    let resp = client
+        .get(format!("https://www.googleapis.com/drive/v3/files/{}/export", file.id))
+        .query(&[("mimeType", "text/plain")])
+        .bearer_auth(access_token)
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        eprintln!("⚠️ export Slides {} : HTTP {}", file.name, resp.status());
+        return None;
+    }
+    let text = resp.text().ok()?.trim().to_string();
+    if text.len() < 20 { None } else { Some(text) }
+}
+
+// ─── PowerPoint .pptx → Markdown (pur Rust, parité Mac/Windows — ADR-0015) ────
+
+/// Texte brut d'un fragment XML : `</a:p>`/`</w:p>` → sauts de ligne, tags
+/// strippés, entités de base décodées. Partagé avec docx_to_text (lib.rs).
+pub(crate) fn xml_text(xml: &str) -> String {
+    let xml = xml
+        .replace("</a:p>", "\n").replace("</w:p>", "\n")
+        .replace("<a:tab/>", "\t").replace("<w:tab/>", "\t");
+    let mut out = String::with_capacity(xml.len() / 4);
+    let mut in_tag = false;
+    for c in xml.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&apos;", "'")
+}
+
+/// Un .pptx est un zip : le texte de chaque diapo vit dans ppt/slides/slideN.xml.
+/// Sortie : `## Diapo N` + texte, dans l'ordre des diapos.
+pub fn pptx_to_markdown(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut zip = zip::ZipArchive::new(f).ok()?;
+
+    // Indices des diapos, triés numériquement (slide2 avant slide10).
+    let mut slides: Vec<(u32, String)> = (0..zip.len())
+        .filter_map(|i| {
+            let name = zip.by_index(i).ok()?.name().to_string();
+            let n: u32 = name.strip_prefix("ppt/slides/slide")?
+                .strip_suffix(".xml")?.parse().ok()?;
+            Some((n, name))
+        })
+        .collect();
+    slides.sort_by_key(|(n, _)| *n);
+
+    let mut out = String::new();
+    for (n, name) in slides {
+        let mut xml = String::new();
+        if zip.by_name(&name).ok()?.read_to_string(&mut xml).is_err() { continue; }
+        let text = xml_text(&xml);
+        let text = text.trim();
+        if text.is_empty() { continue; }
+        out.push_str(&format!("## Diapo {n}\n\n{text}\n\n"));
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Résout un binaire externe : sidecar du bundle d'abord (app packagée,
@@ -827,6 +929,52 @@ pub fn load_conversations() -> Vec<Conversation> {
 
 pub fn load_by_id(id: &str) -> Option<Conversation> {
     load_conversations().into_iter().find(|c| c.summary.id == id)
+}
+
+#[cfg(test)]
+mod pptx_tests {
+    use super::*;
+
+    #[test]
+    fn extrait_les_diapos_dans_lordre() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("lucid_test_pptx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.pptx");
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        // slide10 déclaré AVANT slide2 : le tri numérique doit remettre l'ordre.
+        zw.start_file("ppt/slides/slide10.xml", opts).unwrap();
+        zw.write_all(b"<p:sld><a:p><a:r><a:t>Conclusion</a:t></a:r></a:p></p:sld>").unwrap();
+        zw.start_file("ppt/slides/slide2.xml", opts).unwrap();
+        zw.write_all(b"<p:sld><a:p><a:r><a:t>Introduction &amp; plan</a:t></a:r></a:p></p:sld>").unwrap();
+        zw.finish().unwrap();
+
+        let md = pptx_to_markdown(&path).unwrap();
+        assert!(md.contains("## Diapo 2"), "{md}");
+        assert!(md.contains("Introduction & plan"), "entités décodées : {md}");
+        let i2 = md.find("## Diapo 2").unwrap();
+        let i10 = md.find("## Diapo 10").unwrap();
+        assert!(i2 < i10, "diapo 2 avant diapo 10 : {md}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refuse_un_pptx_sans_texte() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("lucid_test_pptx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vide.pptx");
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        zw.start_file("ppt/presentation.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(b"<p:presentation/>").unwrap();
+        zw.finish().unwrap();
+
+        assert!(pptx_to_markdown(&path).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

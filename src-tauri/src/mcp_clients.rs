@@ -36,7 +36,7 @@ struct ClientDesc {
 }
 
 const CLIENTS: &[ClientDesc] = &[
-    ClientDesc { id: "claude-desktop", name: "Claude Desktop", hint: "Redémarre Claude Desktop (Cmd+Q puis relance)." },
+    ClientDesc { id: "claude-desktop", name: "Claude Desktop", hint: "Redémarre Claude Desktop (quitte complètement puis relance)." },
     ClientDesc { id: "claude-code",    name: "Claude Code",    hint: "Ouvre une nouvelle session `claude` dans un terminal." },
     ClientDesc { id: "cursor",         name: "Cursor",         hint: "Redémarre Cursor." },
     ClientDesc { id: "codex",          name: "Codex (OpenAI)", hint: "Redémarre Codex (app ou CLI)." },
@@ -45,7 +45,8 @@ const CLIENTS: &[ClientDesc] = &[
 fn config_path(id: &str) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     match id {
-        "claude-desktop" => Some(home.join("Library/Application Support/Claude/claude_desktop_config.json")),
+        // config_dir = ~/Library/Application Support (Mac) / %APPDATA% Roaming (Windows)
+        "claude-desktop" => Some(dirs::config_dir()?.join("Claude").join("claude_desktop_config.json")),
         "claude-code"    => Some(home.join(".claude.json")),
         "cursor"         => Some(home.join(".cursor/mcp.json")),
         "codex"          => Some(home.join(".codex/config.toml")),
@@ -55,10 +56,16 @@ fn config_path(id: &str) -> Option<PathBuf> {
 
 fn is_installed(id: &str) -> bool {
     let app = |p: &str| Path::new(p).exists();
+    // data_local_dir = %LOCALAPPDATA% sur Windows (dossier d'install des apps Electron)
+    let local = |sub: &str| dirs::data_local_dir().is_some_and(|d| d.join(sub).exists());
     match id {
-        "claude-desktop" => app("/Applications/Claude.app") || config_path(id).is_some_and(|p| p.exists()),
+        "claude-desktop" => app("/Applications/Claude.app")
+            || local("AnthropicClaude")
+            || config_path(id).is_some_and(|p| p.exists()),
         "claude-code"    => config_path(id).is_some_and(|p| p.exists()),
-        "cursor"         => app("/Applications/Cursor.app") || dirs::home_dir().is_some_and(|h| h.join(".cursor").exists()),
+        "cursor"         => app("/Applications/Cursor.app")
+            || local("Programs/cursor")
+            || dirs::home_dir().is_some_and(|h| h.join(".cursor").exists()),
         "codex"          => dirs::home_dir().is_some_and(|h| h.join(".codex").exists()),
         _ => false,
     }

@@ -600,6 +600,8 @@ fn load_node_content(node_id: String) -> Result<String, String> {
         "claude-ai"    => connectors::claude_ai::load_by_id(source_id),
         "claude-code"  => connectors::claude_code::load_conversation(project_slug, source_id),
         "obsidian"     => connectors::obsidian::load_by_id(source_id),
+        // Import local : le markdown converti vit dans node.content, pas de cache connecteur.
+        "local-file"   => return Ok(node.content.clone()),
         _ => return Err(format!("Connecteur inconnu : {connector}")),
     };
 
@@ -696,24 +698,26 @@ fn save_node_content(node_id: String, content: String) -> Result<(), String> {
 /// Persisté dans brain.json ; préservé lors des régénérations (kind == "note").
 #[tauri::command]
 fn create_note_node(parent_id: String, label: String) -> Result<BrainNode, String> {
-    insert_note_node(parent_id, label, String::new())
+    insert_note_node(parent_id, label, String::new(), None)
 }
 
 /// Insère un nœud note (avec contenu markdown éventuel) dans brain.json.
 /// Cœur partagé entre `create_note_node` et `import_file`.
-fn insert_note_node(parent_id: String, label: String, content: String) -> Result<BrainNode, String> {
+/// `source` = (connector, source_id) — ex. ("local-file", chemin d'origine)
+/// pour que « Ouvrir l'original » retrouve le fichier.
+fn insert_note_node(parent_id: String, label: String, content: String, source: Option<(&str, String)>) -> Result<BrainNode, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    insert_note_node_in(&dir, format!("note-{ts}"), parent_id, label, content)
+    insert_note_node_in(&dir, format!("note-{ts}"), parent_id, label, content, source)
 }
 
 /// Variante injectable (id + dossier de données explicites) — testable, et
 /// utilisée par l'acceptation des propositions MCP (l'id de la proposition
 /// devient l'id du nœud, ce qui garde valides les références parent en chaîne).
-fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, label: String, content: String) -> Result<BrainNode, String> {
+fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, label: String, content: String, source: Option<(&str, String)>) -> Result<BrainNode, String> {
     let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
     let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if !graph.nodes.iter().any(|n| n.id == parent_id) {
@@ -738,8 +742,8 @@ fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, lab
         parent_id: Some(parent_id.clone()),
         synthesized_at: None,
         content,
-        connector: None,
-        source_id: None,
+        connector: source.as_ref().map(|(c, _)| c.to_string()),
+        source_id: source.map(|(_, sid)| sid),
         source_project: None,
         source_text: String::new(),
     };
@@ -767,6 +771,11 @@ fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
                 "Extraction PDF impossible (PDF scanné : OCR requis — brew install poppler tesseract tesseract-lang)."
             })?,
         "docx" => docx_to_text(p)?,
+        "pptx" => connectors::google_drive::pptx_to_markdown(p)
+            .ok_or("Extraction impossible : cette présentation ne contient pas de texte.")?,
+        // .ppt legacy = format binaire propriétaire : réellement impossible sans
+        // LibreOffice (ADR-0015) — on le dit.
+        "ppt" => return Err("Format .ppt (ancien PowerPoint) non supporté — enregistre-le en .pptx ou PDF.".into()),
         "doc" | "rtf" => textutil_to_text(p)?,
         "txt" | "md" | "markdown" => read_lossy(p)?,
         "csv" => csv_to_markdown(&read_lossy(p)?),
@@ -775,7 +784,9 @@ fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
     if content.trim().is_empty() {
         return Err("Le fichier ne contient aucun texte exploitable.".into());
     }
-    insert_note_node(parent_id, label, content)
+    // Garde le chemin d'origine : « Ouvrir l'original » l'ouvrira avec l'app
+    // par défaut (PowerPoint, Aperçu…) — le markdown reste la version cerveau.
+    insert_note_node(parent_id, label, content, Some(("local-file", path)))
 }
 
 // ─── Propositions MCP (écriture validée par l'utilisateur) ─────────────────────
@@ -832,7 +843,7 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
         }
         chain.reverse();
         for p in &chain {
-            insert_note_node_in(dir, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone())?;
+            insert_note_node_in(dir, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone(), None)?;
             std::fs::remove_file(mcp_pending_dir(dir).join(format!("{}.json", p.id)))
                 .map_err(|e| e.to_string())?;
         }
@@ -943,21 +954,7 @@ fn docx_to_text(p: &std::path::Path) -> Result<String, String> {
     let mut xml = String::new();
     doc.read_to_string(&mut xml).map_err(|e| e.to_string())?;
 
-    let xml = xml.replace("</w:p>", "\n").replace("<w:tab/>", "\t");
-    let mut out = String::with_capacity(xml.len() / 4);
-    let mut in_tag = false;
-    for c in xml.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            c if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    let out = out
-        .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        .replace("&quot;", "\"").replace("&apos;", "'");
-    let out = out.trim().to_string();
+    let out = connectors::google_drive::xml_text(&xml).trim().to_string();
     if out.is_empty() { Err("Le document ne contient aucun texte.".into()) } else { Ok(out) }
 }
 

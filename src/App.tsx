@@ -401,9 +401,9 @@ function App() {
 
   /** Drag & drop OS sur le canvas : import séquentiel (brain.json n'aime pas les écritures parallèles). */
   async function handleImportDrop(paths: string[], parentId: string) {
-    const supported = new Set(["pdf", "doc", "docx", "rtf", "txt", "md", "markdown", "csv"]);
+    const supported = new Set(["pdf", "doc", "docx", "pptx", "rtf", "txt", "md", "markdown", "csv"]);
     const ok = paths.filter((p) => supported.has(p.split(".").pop()?.toLowerCase() ?? ""));
-    if (!ok.length) { showToast("Formats supportés : PDF, Word, RTF, TXT, Markdown, CSV"); return; }
+    if (!ok.length) { showToast("Formats supportés : PDF, Word, PowerPoint (.pptx), RTF, TXT, Markdown, CSV"); return; }
     showToast(`Import de ${ok.length} fichier${ok.length > 1 ? "s" : ""}…`, 0);
     let last: BrainNode | null = null;
     const errs: string[] = [];
@@ -420,7 +420,7 @@ function App() {
   async function handleImportFile(parentId: string) {
     const path = await openFileDialog({
       multiple: false,
-      filters: [{ name: "Documents", extensions: ["pdf", "doc", "docx", "rtf", "txt", "md", "csv"] }],
+      filters: [{ name: "Documents", extensions: ["pdf", "doc", "docx", "pptx", "rtf", "txt", "md", "csv"] }],
     });
     if (typeof path !== "string") return;
     setImporting(true);
@@ -745,7 +745,7 @@ function App() {
                     onClick={() => handleImportFile(noteParent || rootId)}
                     disabled={importing}
                     className="rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] disabled:opacity-50"
-                    title="PDF, Word, RTF, TXT, Markdown ou CSV — converti en markdown"
+                    title="PDF, Word, PowerPoint (.pptx), RTF, TXT, Markdown ou CSV — converti en markdown"
                   >
                     {importing ? "Import…" : "Importer un fichier"}
                   </button>

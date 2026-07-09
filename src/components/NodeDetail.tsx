@@ -2,10 +2,11 @@ import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import {
   X, FolderGit2, Brain, FileText,
   Download, RefreshCw, Sparkles, Loader2, ChevronRight, Maximize2, Minimize2, Check,
-  History, RotateCcw, Send, Sparkle,
+  History, RotateCcw, Send, Sparkle, ExternalLink,
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
 } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
+import { openUrl, openPath } from "@tauri-apps/plugin-opener";
 import type { BrainGraph, BrainNode, NodeSnapshotInfo } from "@/lib/types";
 import { relativeDate, cn } from "@/lib/utils";
 import { exportNodeMd, synthesizeNode, saveNodeContent, loadNodeContent, listNodeSnapshots, getNodeSnapshot, renameNode, askNode, generateContent } from "@/lib/api";
@@ -271,6 +272,19 @@ function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCoun
 export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand, onContentSaved, onCreateNote, onNodeRenamed }: Props) {
   const ancestors = useAncestors(node, graph);
   const aiOk = useAiReady();
+
+  // « Ouvrir l'original » : le markdown est la version cerveau, l'original
+  // (Slides, PowerPoint, PDF, page Notion…) reste à un clic pour la mise en forme.
+  const openOriginal = useMemo(() => {
+    const sid = node.source_id;
+    if (!sid) return null;
+    switch (node.connector) {
+      case "google-drive": return () => openUrl(`https://drive.google.com/open?id=${sid}`);
+      case "notion":       return () => openUrl(`https://www.notion.so/${sid.replace(/-/g, "")}`);
+      case "local-file":   return () => openPath(sid).catch(() => openUrl(`file://${sid}`));
+      default: return null;
+    }
+  }, [node.id, node.connector, node.source_id]);
   const Icon = ICON[node.kind as keyof typeof ICON] ?? FileText;
   const children = graph?.nodes.filter((n) => n.parent_id === node.id) ?? [];
 
@@ -482,6 +496,17 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
 
         {node.kind !== "root" && (
           <>
+            {openOriginal && (
+              <button
+                onClick={openOriginal}
+                title={node.connector === "local-file"
+                  ? "Ouvrir l'original avec l'app par défaut"
+                  : "Ouvrir l'original dans le navigateur"}
+                className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
+            )}
             <button
               onClick={handleSynthesize}
               disabled={synthesizing || aiOk === false}
