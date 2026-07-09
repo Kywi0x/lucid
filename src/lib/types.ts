@@ -32,6 +32,16 @@ export interface AiClientStatus {
   name: string;
   installed: boolean;
   connected: boolean;
+  /** false = le client refuse les serveurs MCP locaux (ex. ChatGPT). */
+  supported: boolean;
+}
+
+/** Rapport de sync du connecteur « dossier local ». */
+export interface LocalFolderSyncReport {
+  new: number;
+  total: number;
+  /** Fichiers illisibles : "chemin — raison". */
+  skipped: string[];
 }
 
 /** Proposition de création déposée par le serveur MCP, en attente de validation. */

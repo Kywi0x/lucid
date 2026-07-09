@@ -43,9 +43,11 @@ pub fn run_pipeline_demo(limit: usize) -> Result<BrainGraph, String> {
 fn load_all_conversations() -> Vec<Conversation> {
     let mut convs = connectors::claude_code::load_all_conversations();
     convs.extend(connectors::claude_ai::load_conversations());
+    convs.extend(connectors::chatgpt::load_conversations());
     convs.extend(connectors::google_drive::load_conversations());
     convs.extend(connectors::notion::load_conversations());
     convs.extend(connectors::obsidian::load_all_conversations());
+    convs.extend(connectors::local_folder::load_conversations());
     convs
 }
 
@@ -147,9 +149,11 @@ fn list_conversations() -> Vec<ConversationSummary> {
 fn load_conversation(project_slug: String, id: String, source: Option<String>) -> Option<Conversation> {
     match source.as_deref() {
         Some("claude-ai")    => connectors::claude_ai::load_by_id(&id),
+        Some("chatgpt")      => connectors::chatgpt::load_by_id(&id),
         Some("google-drive") => connectors::google_drive::load_by_id(&id),
         Some("notion")       => connectors::notion::load_by_id(&id),
         Some("obsidian")     => connectors::obsidian::load_by_id(&id),
+        Some("local-folder") => connectors::local_folder::load_by_id(&id),
         _                    => connectors::claude_code::load_conversation(&project_slug, &id),
     }
 }
@@ -193,6 +197,18 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             conversation_count: ai_convs.len(),
             needs_setup: false,
         },
+        {
+            let cg_convs = connectors::chatgpt::load_conversations();
+            let cg_sync = cg_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max();
+            ConnectorStatus {
+                id: "chatgpt".into(),
+                name: "ChatGPT".into(),
+                connected: !cg_convs.is_empty(),
+                last_sync: cg_sync,
+                conversation_count: cg_convs.len(),
+                needs_setup: false,
+            }
+        },
         ConnectorStatus {
             id: "cowork".into(),
             name: "Cowork".into(),
@@ -232,6 +248,18 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             last_sync: None,
             conversation_count: connectors::obsidian::count_files(),
             needs_setup: !connectors::obsidian::is_connected(),
+        },
+        {
+            let lf_convs = connectors::local_folder::load_conversations();
+            let lf_sync = lf_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max();
+            ConnectorStatus {
+                id: "local-folder".into(),
+                name: "Dossier local".into(),
+                connected: connectors::local_folder::is_connected(),
+                last_sync: lf_sync,
+                conversation_count: lf_convs.len(),
+                needs_setup: !connectors::local_folder::is_connected(),
+            }
         },
     ]
 }
@@ -289,6 +317,18 @@ fn import_claude_ai(path: String) -> Result<usize, String> {
         return Err("Aucune conversation trouvée dans ce fichier.".to_string());
     }
     connectors::claude_ai::save_conversations(&convs)?;
+    Ok(count)
+}
+
+/// Importe un export ZIP ChatGPT. Renvoie le nombre de conversations importées.
+#[tauri::command]
+fn import_chatgpt(path: String) -> Result<usize, String> {
+    let convs = connectors::chatgpt::parse_zip(std::path::Path::new(&path))?;
+    let count = convs.len();
+    if count == 0 {
+        return Err("Aucune conversation trouvée dans ce fichier.".to_string());
+    }
+    connectors::chatgpt::save_conversations(&convs)?;
     Ok(count)
 }
 
@@ -598,8 +638,10 @@ fn load_node_content(node_id: String) -> Result<String, String> {
         "notion"       => connectors::notion::load_by_id(source_id),
         "google-drive" => connectors::google_drive::load_by_id(source_id),
         "claude-ai"    => connectors::claude_ai::load_by_id(source_id),
+        "chatgpt"      => connectors::chatgpt::load_by_id(source_id),
         "claude-code"  => connectors::claude_code::load_conversation(project_slug, source_id),
         "obsidian"     => connectors::obsidian::load_by_id(source_id),
+        "local-folder" => connectors::local_folder::load_by_id(source_id),
         // Import local : le markdown converti vit dans node.content, pas de cache connecteur.
         "local-file"   => return Ok(node.content.clone()),
         _ => return Err(format!("Connecteur inconnu : {connector}")),
@@ -611,7 +653,7 @@ fn load_node_content(node_id: String) -> Result<String, String> {
         Ok(conv.messages[0].text.clone())
     } else {
         Ok(conv.messages.iter().map(|m| {
-            let who = if m.role == "user" { "**Toi**" } else { "**Claude**" };
+            let who = if m.role == "user" { "**Toi**" } else { "**IA**" };
             format!("{who}\n\n{}", m.text.trim())
         }).collect::<Vec<_>>().join("\n\n---\n\n"))
     }
@@ -756,12 +798,11 @@ fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, lab
     Ok(node)
 }
 
-/// Importe un fichier local (PDF, DOC/DOCX/RTF, TXT/MD, CSV) : conversion en
-/// markdown puis création d'un nœud note sous `parent_id`.
-#[tauri::command]
-fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
-    let p = std::path::Path::new(&path);
-    let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Fichier importé").to_string();
+/// Convertit un fichier local en markdown (PDF, DOC/DOCX/RTF, PPTX, TXT/MD, CSV).
+/// Partagé entre `import_file` et le connecteur « dossier local ».
+/// Erreur = message honnête et actionnable (ADR-0015), jamais d'échec silencieux.
+pub(crate) fn file_to_markdown(p: &std::path::Path) -> Result<String, String> {
+    let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Fichier").to_string();
     let ext = p.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
     let content = match ext.as_str() {
         "pdf" => connectors::google_drive::pdf_to_markdown(p, &label)
@@ -784,6 +825,16 @@ fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
     if content.trim().is_empty() {
         return Err("Le fichier ne contient aucun texte exploitable.".into());
     }
+    Ok(content)
+}
+
+/// Importe un fichier local : conversion en markdown puis création d'un nœud
+/// note sous `parent_id`.
+#[tauri::command]
+fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
+    let p = std::path::Path::new(&path);
+    let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Fichier importé").to_string();
+    let content = file_to_markdown(p)?;
     // Garde le chemin d'origine : « Ouvrir l'original » l'ouvrira avec l'app
     // par défaut (PowerPoint, Aperçu…) — le markdown reste la version cerveau.
     insert_note_node(parent_id, label, content, Some(("local-file", path)))
@@ -1900,6 +1951,33 @@ fn obsidian_disconnect() {
     connectors::obsidian::disconnect();
 }
 
+/// Configure le dossier local à indexer.
+#[tauri::command]
+fn local_folder_set(path: String) -> Result<(), String> {
+    connectors::local_folder::set_folder(&path)
+}
+
+/// Renvoie le chemin du dossier local configuré (None si pas encore configuré).
+#[tauri::command]
+fn local_folder_path() -> Option<String> {
+    connectors::local_folder::folder_path()
+}
+
+/// Déconnecte le dossier local (supprime config + cache).
+#[tauri::command]
+fn local_folder_disconnect() {
+    connectors::local_folder::disconnect();
+}
+
+/// Synchronise le dossier local (extraction incrémentale). L'extraction PDF/OCR
+/// peut être longue → thread bloquant, pas le thread UI.
+#[tauri::command]
+async fn local_folder_sync() -> Result<connectors::local_folder::SyncReport, String> {
+    tauri::async_runtime::spawn_blocking(connectors::local_folder::sync)
+        .await
+        .map_err(|e| format!("Tâche de sync interrompue : {e}"))?
+}
+
 /// Charge les variables depuis `.env.local` / `.env` (CWD et dossiers parents).
 /// Utilisé en dev : les apps macOS GUI n'héritent pas des env vars du shell.
 /// Ne remplace pas une variable déjà définie.
@@ -1985,6 +2063,11 @@ pub fn run() {
             obsidian_set_vault,
             obsidian_vault_path,
             obsidian_disconnect,
+            import_chatgpt,
+            local_folder_set,
+            local_folder_path,
+            local_folder_disconnect,
+            local_folder_sync,
             list_snapshots,
             restore_snapshot,
             list_node_snapshots,

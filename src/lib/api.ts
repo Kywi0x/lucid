@@ -64,6 +64,31 @@ export function importClaudeAi(path: string): Promise<number> {
   return invoke("import_claude_ai", { path });
 }
 
+/** Importe un export ZIP ChatGPT. Renvoie le nb de conversations importées. */
+export function importChatGpt(path: string): Promise<number> {
+  return invoke("import_chatgpt", { path });
+}
+
+/** Configure le dossier local à indexer. */
+export function localFolderSet(path: string): Promise<void> {
+  return invoke("local_folder_set", { path });
+}
+
+/** Renvoie le chemin du dossier local configuré (null si pas encore configuré). */
+export function localFolderPath(): Promise<string | null> {
+  return invoke("local_folder_path");
+}
+
+/** Déconnecte le dossier local (supprime config + cache). */
+export function localFolderDisconnect(): Promise<void> {
+  return invoke("local_folder_disconnect");
+}
+
+/** Synchronise le dossier local (extraction incrémentale des fichiers). */
+export function localFolderSync(): Promise<import("./types").LocalFolderSyncReport> {
+  return invoke("local_folder_sync");
+}
+
 /** Enregistre les credentials OAuth Google (client_id + client_secret) en app data. */
 export function googleDriveSaveCredentials(clientId: string, clientSecret: string): Promise<void> {
   return invoke("google_drive_save_credentials", { clientId, clientSecret });

@@ -10,6 +10,7 @@ import {
   Circle,
   Clock,
   FileText,
+  Folder,
   Cpu,
   Layers,
   Pencil,
@@ -28,6 +29,11 @@ import {
   googleDriveDisconnect,
   googleDriveSync,
   importClaudeAi,
+  importChatGpt,
+  localFolderSet,
+  localFolderPath,
+  localFolderDisconnect,
+  localFolderSync,
   notionConnect,
   notionDisconnect,
   notionSync,
@@ -92,6 +98,18 @@ function LogoObsidian() {
   );
 }
 
+function LogoChatGpt() {
+  return <LogoImg src={openaiLogo} alt="ChatGPT" />;
+}
+
+function LogoLocalFolder() {
+  return (
+    <div className="flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)]">
+      <Folder className="size-4 text-[var(--color-accent)]" />
+    </div>
+  );
+}
+
 function LogoCowork() {
   return (
     <div className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-[#0EA5E9]">
@@ -103,9 +121,11 @@ function LogoCowork() {
 export function ConnectorLogo({ id }: { id: string }) {
   if (id === "claude-code")  return <LogoClaudeCode />;
   if (id === "claude-ai")    return <LogoClaudeAi />;
+  if (id === "chatgpt")      return <LogoChatGpt />;
   if (id === "google-drive") return <LogoGoogleDrive />;
   if (id === "notion")       return <LogoNotion />;
   if (id === "obsidian")     return <LogoObsidian />;
+  if (id === "local-folder") return <LogoLocalFolder />;
   if (id === "cowork")       return <LogoCowork />;
   return (
     <div className="flex size-7 items-center justify-center rounded-lg bg-[var(--color-surface-2)]">
@@ -163,6 +183,7 @@ interface ModalProps {
   notionToken?: string;
   onNotionTokenChange?: (v: string) => void;
   obsidianVault?: string | null;
+  localFolder?: string | null;
   onClose: () => void;
   onConnect: () => void;
   onSync: () => void;
@@ -170,7 +191,7 @@ interface ModalProps {
   onImport: () => void;
 }
 
-function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidianVault, onClose, onConnect, onSync, onDisconnect, onImport }: ModalProps) {
+function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidianVault, localFolder, onClose, onConnect, onSync, onDisconnect, onImport }: ModalProps) {
   const isSoon = c.id === "cowork";
 
   return (
@@ -204,7 +225,7 @@ function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidi
           </p>
           {c.connected ? (
             <p className="text-xs text-[var(--color-text)]">
-              {c.id === "claude-code" ? "~/.claude/projects/" : c.id === "claude-ai" ? "Import ZIP" : "Connecté"}
+              {c.id === "claude-code" ? "~/.claude/projects/" : c.id === "claude-ai" || c.id === "chatgpt" ? "Import ZIP" : "Connecté"}
             </p>
           ) : (
             <p className="text-xs text-[var(--color-muted)] italic">Aucun compte connecté</p>
@@ -236,10 +257,17 @@ function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidi
               <p className="text-center text-[11px] text-[var(--color-muted)]">{msg}</p>
             )}
 
-            {c.id === "claude-ai" && (
-              <ActionBtn busy={busy} icon={<FileText className="size-3.5" />} onClick={onImport}>
-                {c.connected ? "Réimporter un ZIP" : "Importer export ZIP"}
-              </ActionBtn>
+            {(c.id === "claude-ai" || c.id === "chatgpt") && (
+              <>
+                {c.id === "chatgpt" && !c.connected && (
+                  <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
+                    chatgpt.com → Réglages → Contrôle des données → Exporter les données, puis importe le ZIP reçu par mail.
+                  </p>
+                )}
+                <ActionBtn busy={busy} icon={<FileText className="size-3.5" />} onClick={onImport}>
+                  {c.connected ? "Réimporter un ZIP" : "Importer export ZIP"}
+                </ActionBtn>
+              </>
             )}
 
             {c.id === "notion" && !c.connected && (
@@ -303,6 +331,36 @@ function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidi
                 )}
                 <ActionBtn busy={busy} icon={<FileText className="size-3.5" />} onClick={onConnect}>
                   Changer de vault
+                </ActionBtn>
+                <ActionBtn busy={busy} icon={<LogOut className="size-3.5" />} onClick={onDisconnect} danger>
+                  Déconnecter
+                </ActionBtn>
+              </>
+            )}
+
+            {c.id === "local-folder" && !c.connected && (
+              <>
+                <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
+                  Choisis un dossier (cours, projets…) : PDF, Word, PowerPoint, Markdown, texte et CSV seront lus, 100 % en local.
+                </p>
+                <ActionBtn busy={busy} icon={<Folder className="size-3.5" />} onClick={onConnect} primary>
+                  Choisir le dossier
+                </ActionBtn>
+              </>
+            )}
+
+            {c.id === "local-folder" && c.connected && (
+              <>
+                {localFolder && (
+                  <p className="truncate rounded-lg bg-[var(--color-surface-2)] px-2.5 py-1.5 text-[10px] text-[var(--color-muted)]" title={localFolder}>
+                    {localFolder}
+                  </p>
+                )}
+                <ActionBtn busy={busy} icon={<RefreshCw className="size-3.5" />} onClick={onSync} primary>
+                  Synchroniser
+                </ActionBtn>
+                <ActionBtn busy={busy} icon={<Folder className="size-3.5" />} onClick={onConnect}>
+                  Changer de dossier
                 </ActionBtn>
                 <ActionBtn busy={busy} icon={<LogOut className="size-3.5" />} onClick={onDisconnect} danger>
                   Déconnecter
@@ -383,6 +441,18 @@ function ConnectorsSection({
     finally { set("claude-ai", false); }
   }
 
+  async function handleImportChatGpt() {
+    const selected = await open({ filters: [{ name: "Export ChatGPT", extensions: ["zip"] }], multiple: false });
+    if (!selected || typeof selected !== "string") return;
+    set("chatgpt", true); msg("chatgpt", "");
+    try {
+      const count = await importChatGpt(selected);
+      msg("chatgpt", `${count} conversations importées`);
+      onRefresh();
+    } catch (e) { msg("chatgpt", `Erreur : ${e}`); }
+    finally { set("chatgpt", false); }
+  }
+
   async function handleGoogleConnect() {
     set("google-drive", true); msg("google-drive", "En attente du navigateur…");
     try {
@@ -441,6 +511,46 @@ function ConnectorsSection({
       onRefresh();
     } catch (e) { msg("obsidian", `Erreur : ${e}`); }
     finally { set("obsidian", false); }
+  }
+
+  const [localFolder, setLocalFolder] = useState<string | null>(null);
+  useEffect(() => { localFolderPath().then(setLocalFolder); }, []);
+
+  async function handleLocalFolderConnect() {
+    const selected = await open({ directory: true, multiple: false });
+    if (!selected || typeof selected !== "string") return;
+    set("local-folder", true); msg("local-folder", "");
+    try {
+      await localFolderSet(selected);
+      setLocalFolder(selected);
+      msg("local-folder", "Dossier configuré — lance une synchronisation.");
+      onRefresh();
+    } catch (e) { msg("local-folder", `Erreur : ${e}`); }
+    finally { set("local-folder", false); }
+  }
+
+  async function handleLocalFolderSync() {
+    set("local-folder", true); msg("local-folder", "Synchronisation… (l'extraction PDF peut être longue)");
+    try {
+      const r = await localFolderSync();
+      const skipped = r.skipped.length ? ` — ${r.skipped.length} illisibles` : "";
+      msg("local-folder", (r.new > 0 ? `${r.new} nouveaux sur ${r.total}` : `${r.total} fichiers indexés`) + skipped);
+      if (r.skipped.length) console.warn("Dossier local — fichiers ignorés :", r.skipped);
+      onRefresh();
+      if (r.total > 0) onSyncDone();
+    } catch (e) { msg("local-folder", `Erreur : ${e}`); }
+    finally { set("local-folder", false); }
+  }
+
+  async function handleLocalFolderDisconnect() {
+    set("local-folder", true);
+    try {
+      await localFolderDisconnect();
+      setLocalFolder(null);
+      msg("local-folder", "Déconnecté");
+      onRefresh();
+    } catch (e) { msg("local-folder", `Erreur : ${e}`); }
+    finally { set("local-folder", false); }
   }
 
   async function handleNotionConnect() {
@@ -517,19 +627,26 @@ function ConnectorsSection({
           notionToken={notionToken}
           onNotionTokenChange={setNotionToken}
           obsidianVault={obsidianVault}
+          localFolder={localFolder}
           onClose={() => setModalId(null)}
           onConnect={
             openModal.id === "notion" ? handleNotionConnect :
             openModal.id === "obsidian" ? handleObsidianConnect :
+            openModal.id === "local-folder" ? handleLocalFolderConnect :
             handleGoogleConnect
           }
-          onSync={openModal.id === "notion" ? handleNotionSync : handleGoogleSync}
+          onSync={
+            openModal.id === "notion" ? handleNotionSync :
+            openModal.id === "local-folder" ? handleLocalFolderSync :
+            handleGoogleSync
+          }
           onDisconnect={
             openModal.id === "notion" ? handleNotionDisconnect :
             openModal.id === "obsidian" ? handleObsidianDisconnect :
+            openModal.id === "local-folder" ? handleLocalFolderDisconnect :
             handleGoogleDisconnect
           }
-          onImport={handleImportClaudeAi}
+          onImport={openModal.id === "chatgpt" ? handleImportChatGpt : handleImportClaudeAi}
         />
       )}
     </div>
@@ -900,6 +1017,7 @@ function AiClientLogo({ id }: { id: string }) {
   switch (id) {
     case "claude-desktop": return <LogoImg src={claudeLogo} alt="Claude Desktop" bg="bg-[#1a1a1a]" />;
     case "claude-code":    return <LogoClaudeCode />;
+    case "chatgpt":        return <LogoImg src={openaiLogo} alt="ChatGPT" />;
     case "cursor":         return <LogoImg src={cursorLogo} alt="Cursor" />;
     case "codex":          return <LogoImg src={openaiLogo} alt="Codex (OpenAI)" />;
     default:               return <LogoImg src={claudeLogo} alt={id} />;
@@ -955,10 +1073,16 @@ export function AiClientsSection() {
                     "size-1.5 shrink-0 rounded-full " +
                     (c.connected ? "bg-[var(--color-ok)]" : c.installed ? "bg-[#e0a33c]" : "bg-[var(--color-border)]")
                   } />
-                  {c.connected ? "Connecté au cerveau Lucid" : c.installed ? "Détecté — pas encore connecté" : "Non détecté sur cette machine"}
+                  {!c.supported
+                    ? "Connexion locale impossible — ChatGPT n'accepte que des serveurs distants (HTTPS)"
+                    : c.connected ? "Connecté au cerveau Lucid" : c.installed ? "Détecté — pas encore connecté" : "Non détecté sur cette machine"}
                 </p>
               </div>
-              {c.connected ? (
+              {!c.supported ? (
+                <span className="shrink-0 rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-xs text-[var(--color-muted)]">
+                  Non disponible
+                </span>
+              ) : c.connected ? (
                 <button
                   onClick={() => handle(c.id, false)}
                   disabled={busy === c.id}

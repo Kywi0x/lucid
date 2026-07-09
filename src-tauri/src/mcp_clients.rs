@@ -12,6 +12,9 @@ pub struct AiClientStatus {
     pub name: String,
     pub installed: bool,
     pub connected: bool,
+    /// false = le client n'accepte pas de serveur MCP local (ex. ChatGPT :
+    /// OpenAI n'autorise que des serveurs distants HTTPS). L'UI l'explique.
+    pub supported: bool,
 }
 
 /// Binaire lucid_mcp : à côté de l'exécutable courant
@@ -31,15 +34,18 @@ pub fn mcp_binary_path() -> Result<PathBuf, String> {
 struct ClientDesc {
     id: &'static str,
     name: &'static str,
-    /// Message affiché après connexion.
+    /// Message affiché après connexion (ou raison si `supported: false`).
     hint: &'static str,
+    /// false = pas de connexion MCP locale possible (voir AiClientStatus).
+    supported: bool,
 }
 
 const CLIENTS: &[ClientDesc] = &[
-    ClientDesc { id: "claude-desktop", name: "Claude Desktop", hint: "Redémarre Claude Desktop (quitte complètement puis relance)." },
-    ClientDesc { id: "claude-code",    name: "Claude Code",    hint: "Ouvre une nouvelle session `claude` dans un terminal." },
-    ClientDesc { id: "cursor",         name: "Cursor",         hint: "Redémarre Cursor." },
-    ClientDesc { id: "codex",          name: "Codex (OpenAI)", hint: "Redémarre Codex (app ou CLI)." },
+    ClientDesc { id: "claude-desktop", name: "Claude Desktop", hint: "Redémarre Claude Desktop (quitte complètement puis relance).", supported: true },
+    ClientDesc { id: "claude-code",    name: "Claude Code",    hint: "Ouvre une nouvelle session `claude` dans un terminal.", supported: true },
+    ClientDesc { id: "chatgpt",        name: "ChatGPT",        hint: "ChatGPT n'accepte que des serveurs MCP distants (HTTPS) — impossible de brancher un serveur local sans envoyer tes données en ligne. En attendant : importe ton export ZIP ChatGPT dans Sources.", supported: false },
+    ClientDesc { id: "cursor",         name: "Cursor",         hint: "Redémarre Cursor.", supported: true },
+    ClientDesc { id: "codex",          name: "Codex (OpenAI)", hint: "Redémarre Codex (app ou CLI).", supported: true },
 ];
 
 fn config_path(id: &str) -> Option<PathBuf> {
@@ -63,6 +69,7 @@ fn is_installed(id: &str) -> bool {
             || local("AnthropicClaude")
             || config_path(id).is_some_and(|p| p.exists()),
         "claude-code"    => config_path(id).is_some_and(|p| p.exists()),
+        "chatgpt"        => app("/Applications/ChatGPT.app") || local("Programs/ChatGPT"),
         "cursor"         => app("/Applications/Cursor.app")
             || local("Programs/cursor")
             || dirs::home_dir().is_some_and(|h| h.join(".cursor").exists()),
@@ -185,11 +192,15 @@ pub fn status() -> Vec<AiClientStatus> {
         connected: config_path(c.id).is_some_and(|p| {
             if c.id == "codex" { toml_has_lucid(&p) } else { has_lucid(&p) }
         }),
+        supported: c.supported,
     }).collect()
 }
 
 pub fn connect(id: &str) -> Result<String, String> {
     let desc = CLIENTS.iter().find(|c| c.id == id).ok_or_else(|| format!("Client inconnu : {id}"))?;
+    if !desc.supported {
+        return Err(desc.hint.into());
+    }
     let bin = mcp_binary_path()?;
     let cfg = config_path(id).ok_or("Dossier utilisateur introuvable.")?;
     if id == "codex" {

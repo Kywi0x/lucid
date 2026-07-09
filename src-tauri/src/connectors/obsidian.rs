@@ -70,7 +70,7 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn mtime_iso(path: &Path) -> Option<String> {
+pub(crate) fn mtime_iso(path: &Path) -> Option<String> {
     use std::time::UNIX_EPOCH;
     let secs = path.metadata().ok()?.modified().ok()?
         .duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -79,10 +79,10 @@ fn mtime_iso(path: &Path) -> Option<String> {
 }
 
 /// Splits "04 Stack/ADR/note.md" → (["04 Stack", "ADR"], "note")
-fn rel_to_parts(rel: &str) -> (Vec<String>, String) {
+pub(crate) fn rel_to_parts(rel: &str) -> (Vec<String>, String) {
     let parts: Vec<&str> = rel.split('/').collect();
     let title = parts.last()
-        .map(|f| f.trim_end_matches(".md").to_string())
+        .map(|f| Path::new(f).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| f.to_string()))
         .unwrap_or_else(|| rel.to_string());
     let container = parts[..parts.len().saturating_sub(1)]
         .iter().map(|s| s.to_string()).collect();
