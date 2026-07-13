@@ -74,7 +74,7 @@ async function load() {
       { headers: { apikey: SUPABASE_ANON_KEY, authorization: `Bearer ${SUPABASE_ANON_KEY}` } });
     const rows = await r.json();
     if (!r.ok || !rows.length) { status.textContent = "Ce space n'existe pas (ou n'est plus partagé)."; return; }
-    status.hidden = true;
+    status.remove(); // hidden ne suffit pas : son display:grid CSS gagnerait
     start(rows[0]);
   } catch (e) { status.textContent = "Impossible de charger ce space : " + e.message; }
 }
