@@ -23,14 +23,21 @@
     #title h1 { margin: 0; font-size: 15px; letter-spacing: -.01em; }
     #title p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
     #panel {
-      position: fixed; top: 12px; right: 12px; bottom: 12px; width: min(420px, 90vw); z-index: 3;
+      position: fixed; top: 12px; right: 12px; bottom: 12px; left: auto;
+      width: min(440px, calc(100vw - 24px)); z-index: 3;
       background: var(--card); border: 1px solid var(--border); border-radius: 16px;
-      box-shadow: 0 16px 48px rgba(0,0,0,.18); padding: 20px 22px; overflow-y: auto;
-      display: none; transition: width .25s ease;
+      box-shadow: 0 16px 48px rgba(0,0,0,.18); padding: 24px 26px; overflow-y: auto;
+      display: none; transition: all .25s ease;
     }
     #panel.open { display: block; }
-    #panel.wide { width: min(880px, calc(100vw - 24px)); }
-    #panel.wide .inner { max-width: 720px; margin: 0 auto; }
+    /* Pleine page façon Notion : le panneau couvre tout, colonne de lecture centrée. */
+    #panel.wide { left: 12px; width: auto; padding: 48px 24px; }
+    #panel.wide .inner { max-width: 740px; margin: 0 auto; }
+    #panel.wide .body { font-size: 14px; }
+    @media (max-width: 640px) {
+      #panel, #panel.wide { top: 8px; right: 8px; bottom: 8px; left: 8px; width: auto; padding: 20px 16px; }
+      #title { max-width: calc(100vw - 32px); }
+    }
     #panel h2 { margin: 0 32px 6px 0; font-size: 16px; }
     #panel .kw { font-size: 11px; color: var(--muted); margin-bottom: 12px; }
     #panel .body { font-size: 13px; line-height: 1.55; word-wrap: break-word; }
