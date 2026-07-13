@@ -62,13 +62,13 @@
     #p-crumb a { color: var(--muted); text-decoration: none; }
     #p-crumb a:hover { color: var(--accent); }
     #p-crumb .sep { opacity: .5; margin: 0 4px; }
-    .kids-h { margin: 20px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
-    .kid { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; padding: 8px 11px;
-      border: 1px solid var(--border); background: none; border-radius: 10px; margin: 4px 0; cursor: pointer;
-      color: var(--fg); font-size: 13px; font-family: inherit; }
-    .kid:hover { background: var(--bg); border-color: var(--accent); }
-    .kid .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-    .kid .cnt { margin-left: auto; font-size: 10px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+    /* Pages enfants — même design que NodeDetail dans l'app : rangées nues et compactes. */
+    .kids-h { margin: 16px 0 6px; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+    .kid { display: flex; align-items: center; width: 100%; text-align: left; padding: 6px 8px;
+      border: 0; background: none; border-radius: 6px; margin: 1px 0; cursor: pointer;
+      color: var(--fg); font-size: 12px; font-family: inherit;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kid:hover { background: var(--bg); color: var(--accent); }
     #close, #expand { position: absolute; top: 12px; border: 0; background: none;
       color: var(--muted); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 8px; }
     #close { right: 12px; }
@@ -236,17 +236,12 @@ function start(row) {
     const ids = kids.get(n.id) ?? [];
     if (ids.length) {
       const h = document.createElement("p"); h.className = "kids-h";
-      h.textContent = `Sous-pages (${ids.length})`;
+      h.textContent = `Pages enfants (${ids.length})`;
       kidsEl.appendChild(h);
       ids.forEach((id) => {
         const k = byId.get(id);
         const btn = document.createElement("button"); btn.className = "kid";
-        const dot = document.createElement("span"); dot.className = "dot";
-        dot.style.background = P.get(id)?.color ?? "var(--accent)";
-        btn.appendChild(dot);
-        btn.appendChild(document.createTextNode(k.label));
-        const sub = kids.get(id)?.length ?? 0;
-        if (sub) { const c = document.createElement("span"); c.className = "cnt"; c.textContent = sub; btn.appendChild(c); }
+        btn.textContent = k.label;
         btn.onclick = () => openPanel(k);
         kidsEl.appendChild(btn);
       });
