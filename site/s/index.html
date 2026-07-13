@@ -58,6 +58,17 @@
     .body hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
     .body a { color: var(--accent); }
     .body .wik { color: var(--accent); }
+    #p-crumb { font-size: 11px; color: var(--muted); margin: 0 24px 8px 0; }
+    #p-crumb a { color: var(--muted); text-decoration: none; }
+    #p-crumb a:hover { color: var(--accent); }
+    #p-crumb .sep { opacity: .5; margin: 0 4px; }
+    .kids-h { margin: 20px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
+    .kid { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; padding: 8px 11px;
+      border: 1px solid var(--border); background: none; border-radius: 10px; margin: 4px 0; cursor: pointer;
+      color: var(--fg); font-size: 13px; font-family: inherit; }
+    .kid:hover { background: var(--bg); border-color: var(--accent); }
+    .kid .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+    .kid .cnt { margin-left: auto; font-size: 10px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
     #close, #expand { position: absolute; top: 12px; border: 0; background: none;
       color: var(--muted); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 8px; }
     #close { right: 12px; }
@@ -77,7 +88,7 @@
   <div id="status">Chargement…</div>
   <div id="title" hidden><h1 id="t-name"></h1><p id="t-meta"></p></div>
   <canvas id="canvas"></canvas>
-  <div id="panel"><button id="expand" title="Agrandir / réduire">⤢</button><button id="close">✕</button><div class="inner"><h2 id="p-title"></h2><div class="kw" id="p-kw"></div><div class="body" id="p-body"></div></div></div>
+  <div id="panel"><button id="expand" title="Agrandir / réduire">⤢</button><button id="close">✕</button><div class="inner"><div id="p-crumb"></div><h2 id="p-title"></h2><div class="kw" id="p-kw"></div><div class="body" id="p-body"></div><div id="p-kids"></div></div></div>
   <a id="cta" href="../">✦ Créé avec <b>Lucid</b> — construis ton second cerveau</a>
 
 <script>
@@ -201,10 +212,51 @@ function start(row) {
   }, { passive: false });
 
   function openPanel(n) {
+    // Fil d'Ariane : remonter la chaîne des parents (cliquables).
+    const crumbEl = document.getElementById("p-crumb");
+    crumbEl.textContent = "";
+    const chain = [];
+    for (let cur = n; cur.parent_id && byId.has(cur.parent_id);) { cur = byId.get(cur.parent_id); chain.unshift(cur); }
+    chain.forEach((a) => {
+      const link = document.createElement("a");
+      link.href = "#"; link.textContent = a.label;
+      link.onclick = (e) => { e.preventDefault(); openPanel(a); };
+      crumbEl.appendChild(link);
+      const sep = document.createElement("span"); sep.className = "sep"; sep.textContent = "/";
+      crumbEl.appendChild(sep);
+    });
+
     document.getElementById("p-title").textContent = n.label;
     document.getElementById("p-kw").textContent = (n.keywords ?? []).join(" · ");
     document.getElementById("p-body").innerHTML = md(n.content || n.summary || "*(page sans contenu)*");
+
+    // Sommaire : les sous-pages, navigables (labels insérés en texte, pas en HTML).
+    const kidsEl = document.getElementById("p-kids");
+    kidsEl.textContent = "";
+    const ids = kids.get(n.id) ?? [];
+    if (ids.length) {
+      const h = document.createElement("p"); h.className = "kids-h";
+      h.textContent = `Sous-pages (${ids.length})`;
+      kidsEl.appendChild(h);
+      ids.forEach((id) => {
+        const k = byId.get(id);
+        const btn = document.createElement("button"); btn.className = "kid";
+        const dot = document.createElement("span"); dot.className = "dot";
+        dot.style.background = P.get(id)?.color ?? "var(--accent)";
+        btn.appendChild(dot);
+        btn.appendChild(document.createTextNode(k.label));
+        const sub = kids.get(id)?.length ?? 0;
+        if (sub) { const c = document.createElement("span"); c.className = "cnt"; c.textContent = sub; btn.appendChild(c); }
+        btn.onclick = () => openPanel(k);
+        kidsEl.appendChild(btn);
+      });
+    }
+
+    // Recentrer la constellation sur la page ouverte.
+    const pp = P.get(n.id);
+    if (pp) { cam.x = pp.x; cam.y = pp.y; hover = n.id; draw(); }
     document.getElementById("panel").classList.add("open");
+    document.getElementById("panel").scrollTop = 0;
   }
   document.getElementById("close").onclick = () => document.getElementById("panel").classList.remove("open", "wide");
   document.getElementById("expand").onclick = () => document.getElementById("panel").classList.toggle("wide");
