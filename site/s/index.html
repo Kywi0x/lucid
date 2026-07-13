@@ -31,8 +31,24 @@
     #panel.open { display: block; }
     #panel h2 { margin: 0 32px 6px 0; font-size: 16px; }
     #panel .kw { font-size: 11px; color: var(--muted); margin-bottom: 12px; }
-    #panel .body { font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
-    #panel .body h3 { font-size: 13px; margin: 14px 0 4px; }
+    #panel .body { font-size: 13px; line-height: 1.55; word-wrap: break-word; }
+    .body h1, .body h2, .body h3 { font-size: 14px; margin: 16px 0 6px; }
+    .body h1 { font-size: 15px; }
+    .body p { margin: 6px 0; }
+    .body ul, .body ol { margin: 6px 0; padding-left: 20px; }
+    .body li { margin: 2px 0; }
+    .body li.task { list-style: none; margin-left: -20px; }
+    .body li.task input { margin-right: 6px; accent-color: var(--accent); }
+    .body table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 12px; }
+    .body th, .body td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+    .body th { background: var(--bg); }
+    .body code { background: var(--bg); border: 1px solid var(--border); padding: 1px 5px; border-radius: 5px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+    .body pre { background: var(--bg); border: 1px solid var(--border); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+    .body pre code { border: 0; padding: 0; background: none; }
+    .body blockquote { border-left: 3px solid var(--accent); margin: 8px 0; padding: 2px 12px; color: var(--muted); }
+    .body hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+    .body a { color: var(--accent); }
+    .body .wik { color: var(--accent); }
     #close { position: absolute; top: 12px; right: 12px; border: 0; background: none;
       color: var(--muted); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 8px; }
     #close:hover { background: var(--bg); }
@@ -176,11 +192,68 @@ function start(row) {
   function openPanel(n) {
     document.getElementById("p-title").textContent = n.label;
     document.getElementById("p-kw").textContent = (n.keywords ?? []).join(" · ");
-    // ponytail: rendu texte brut (les # et ** restent visibles) — un vrai parseur md si besoin
-    document.getElementById("p-body").textContent = n.content || n.summary || "(page sans contenu)";
+    document.getElementById("p-body").innerHTML = md(n.content || n.summary || "*(page sans contenu)*");
     document.getElementById("panel").classList.add("open");
   }
   document.getElementById("close").onclick = () => document.getElementById("panel").classList.remove("open");
+}
+
+// ── Mini markdown → HTML, sans dépendance. Tout est échappé AVANT transformation
+//    (le contenu vient de tiers) ; seuls les liens http(s) deviennent des <a>. ──
+function md(src) {
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const inline = s => s
+    .replace(/\\([#*_|[\]])/g, "$1")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,;:)!?]|$)/g, "$1<em>$2</em>")
+    .replace(/\[\[([^\]]+)\]\]/g, '<span class="wik">$1</span>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  const lines = esc(src).split("\n");
+  let out = "", list = null, para = [], code = false, table = [];
+  const closePara = () => { if (para.length) { out += `<p>${inline(para.join(" "))}</p>`; para = []; } };
+  const closeList = () => { if (list) { out += `</${list}>`; list = null; } };
+  const closeTable = () => {
+    if (!table.length) return;
+    const cells = l => l.replace(/^\||\|$/g, "").split("|").map(c => inline(c.trim()));
+    const sep = table.length > 1 && /^[\s\-|:]+$/.test(table[1]);
+    let t = "<table>";
+    if (sep) t += "<thead><tr>" + cells(table[0]).map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
+    t += "<tbody>" + table.slice(sep ? 2 : 0).map(r => "<tr>" + cells(r).map(c => `<td>${c}</td>`).join("") + "</tr>").join("") + "</tbody></table>";
+    out += t; table = [];
+  };
+  const flush = () => { closePara(); closeList(); closeTable(); };
+
+  for (const raw of lines) {
+    const l = raw.trimEnd();
+    if (code) { if (/^```/.test(l)) { out += "</code></pre>"; code = false; } else out += l + "\n"; continue; }
+    if (/^```/.test(l)) { flush(); out += "<pre><code>"; code = true; continue; }
+    if (/^\s*\|/.test(l)) { closePara(); closeList(); table.push(l.trim()); continue; }
+    closeTable();
+    let m;
+    if (!l.trim()) { flush(); continue; }
+    if ((m = l.match(/^(#{1,6})\s+(.*)/))) { flush(); out += `<h${Math.min(m[1].length, 3)}>${inline(m[2])}</h${Math.min(m[1].length, 3)}>`; continue; }
+    if (/^(---|\*\*\*)\s*$/.test(l)) { flush(); out += "<hr>"; continue; }
+    if ((m = l.match(/^\s*&gt;\s?(.*)/))) { flush(); out += `<blockquote>${inline(m[1])}</blockquote>`; continue; }
+    if ((m = l.match(/^\s*[-*]\s+\[([ xX])\]\s+(.*)/))) {
+      closePara(); if (list !== "ul") { closeList(); out += "<ul>"; list = "ul"; }
+      out += `<li class="task"><input type="checkbox" disabled${m[1].trim() ? " checked" : ""}>${inline(m[2])}</li>`; continue;
+    }
+    if ((m = l.match(/^\s*[-*]\s+(.*)/))) {
+      closePara(); if (list !== "ul") { closeList(); out += "<ul>"; list = "ul"; }
+      out += `<li>${inline(m[1])}</li>`; continue;
+    }
+    if ((m = l.match(/^\s*\d+[.)]\s+(.*)/))) {
+      closePara(); if (list !== "ol") { closeList(); out += "<ol>"; list = "ol"; }
+      out += `<li>${inline(m[1])}</li>`; continue;
+    }
+    closeList();
+    para.push(l.trim());
+  }
+  if (code) out += "</code></pre>";
+  flush();
+  return out;
 }
 load();
 </script>
