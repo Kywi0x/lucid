@@ -26,9 +26,11 @@
       position: fixed; top: 12px; right: 12px; bottom: 12px; width: min(420px, 90vw); z-index: 3;
       background: var(--card); border: 1px solid var(--border); border-radius: 16px;
       box-shadow: 0 16px 48px rgba(0,0,0,.18); padding: 20px 22px; overflow-y: auto;
-      display: none;
+      display: none; transition: width .25s ease;
     }
     #panel.open { display: block; }
+    #panel.wide { width: min(880px, calc(100vw - 24px)); }
+    #panel.wide .inner { max-width: 720px; margin: 0 auto; }
     #panel h2 { margin: 0 32px 6px 0; font-size: 16px; }
     #panel .kw { font-size: 11px; color: var(--muted); margin-bottom: 12px; }
     #panel .body { font-size: 13px; line-height: 1.55; word-wrap: break-word; }
@@ -49,9 +51,11 @@
     .body hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
     .body a { color: var(--accent); }
     .body .wik { color: var(--accent); }
-    #close { position: absolute; top: 12px; right: 12px; border: 0; background: none;
+    #close, #expand { position: absolute; top: 12px; border: 0; background: none;
       color: var(--muted); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 8px; }
-    #close:hover { background: var(--bg); }
+    #close { right: 12px; }
+    #expand { right: 44px; font-size: 13px; }
+    #close:hover, #expand:hover { background: var(--bg); }
     #cta {
       position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 2;
       display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px;
@@ -66,7 +70,7 @@
   <div id="status">Chargement…</div>
   <div id="title" hidden><h1 id="t-name"></h1><p id="t-meta"></p></div>
   <canvas id="canvas"></canvas>
-  <div id="panel"><button id="close">✕</button><h2 id="p-title"></h2><div class="kw" id="p-kw"></div><div class="body" id="p-body"></div></div>
+  <div id="panel"><button id="expand" title="Agrandir / réduire">⤢</button><button id="close">✕</button><div class="inner"><h2 id="p-title"></h2><div class="kw" id="p-kw"></div><div class="body" id="p-body"></div></div></div>
   <a id="cta" href="../">✦ Créé avec <b>Lucid</b> — construis ton second cerveau</a>
 
 <script>
@@ -195,7 +199,8 @@ function start(row) {
     document.getElementById("p-body").innerHTML = md(n.content || n.summary || "*(page sans contenu)*");
     document.getElementById("panel").classList.add("open");
   }
-  document.getElementById("close").onclick = () => document.getElementById("panel").classList.remove("open");
+  document.getElementById("close").onclick = () => document.getElementById("panel").classList.remove("open", "wide");
+  document.getElementById("expand").onclick = () => document.getElementById("panel").classList.toggle("wide");
 }
 
 // ── Mini markdown → HTML, sans dépendance. Tout est échappé AVANT transformation
