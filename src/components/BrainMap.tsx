@@ -120,9 +120,13 @@ export function buildClusterColors(graph: BrainGraph, palette: string[]): Map<st
   const colors = new Map<string, string>();
   const root = graph.nodes.find((n) => n.kind === "root");
   if (!root) return colors;
-  let gci = 0;
+  // Couleur par hash stable de l'id : un cluster garde SA couleur quoi qu'il
+  // arrive autour (timeline, watch auto, régén). Collisions possibles — deux
+  // clusters voisins peuvent partager une teinte, prix de la stabilité.
   const walk = (n: BrainNode, inherited: string) => {
-    const c = n.kind === "group" ? palette[gci++ % palette.length] : inherited;
+    const c = n.kind === "group"
+      ? palette[Math.floor(stableHash(n.id) * palette.length) % palette.length]
+      : inherited;
     colors.set(n.id, c);
     for (const kid of childrenByParent.get(n.id) ?? []) walk(kid, c);
   };
@@ -339,12 +343,18 @@ export function BrainMap({
   // Refs partagés avec la boucle de rendu / les handlers (évite les closures périmées).
   const cam = useRef({ x: 0, y: 0, zoom: 1 });
   const camTarget = useRef({ x: 0, y: 0, zoom: 1 });
+  // Premier cadrage instantané ; les suivants (graphe qui grandit en live,
+  // régénération) glissent via le lerp caméra au lieu de sauter.
+  const didFit = useRef(false);
   const panelOff = useRef({ cur: 0, target: 0 });
   const needsFit = useRef(true);
   const dragOffsets = useRef(new Map<string, { dx: number; dy: number }>());
   const hovered = useRef<string | null>(null);
   // Naissance des nouvelles bulles : id → timestamp de spawn (cascade).
   const spawnAt = useRef(new Map<string, number>());
+  // Positions vivantes : chaque bulle glisse vers sa place cible (relayouts fluides,
+  // pas de téléportation quand des sœurs apparaissent — replay, watch auto, régén).
+  const livePos = useRef(new Map<string, { x: number; y: number }>());
   const prevIds = useRef<Set<string> | null>(null);
   const drag = useRef<{ mode: "node" | "pan"; id?: string; ids?: string[]; moved: number; sx: number; sy: number } | null>(null);
 
@@ -352,7 +362,7 @@ export function BrainMap({
   S.current = {
     infos, childrenOf, colorOf, neighbors, q, selectedId, theme, linkEdges,
     onSelect, onMoveNode, onImportFiles, onBackgroundClick, isGenesis, streamLabels, streamTotal, rootId,
-    busy, busyMessage,
+    busy, busyMessage, maxR,
   };
 
   // Refit caméra au chargement / à chaque régénération.
@@ -367,15 +377,21 @@ export function BrainMap({
   // moins d'animations.
   useEffect(() => {
     const ids = new Set(graph.nodes.map((n) => n.id));
+    // Purge les positions vivantes des nœuds disparus (scrub timeline arrière…).
+    for (const id of [...livePos.current.keys()]) {
+      if (!ids.has(id)) livePos.current.delete(id);
+    }
     const prev = prevIds.current;
     prevIds.current = ids;
     if (!prev || prev.size === 0) return;
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const fresh = [...ids].filter((id) => !prev.has(id));
-    // Ajout incrémental seulement (une régénération remplace tout → genesis gère).
-    if (fresh.length === 0 || fresh.length > 80) return;
+    if (fresh.length === 0) return;
+    // Cascade bornée : peu de nœuds → 90 ms d'écart ; gros lot (replay, scrub,
+    // grosse sync) → tout le monde naît dans une fenêtre de 600 ms max.
+    const step = Math.min(90, 600 / fresh.length);
     const now = performance.now();
-    fresh.forEach((id, i) => spawnAt.current.set(id, now + i * 90));
+    fresh.forEach((id, i) => spawnAt.current.set(id, now + i * step));
   }, [graph]);
 
   // Décalage caméra quand le panneau détail est ouvert (lerpé dans draw()).
@@ -404,13 +420,14 @@ export function BrainMap({
     let W = 0, H = 0, dpr = 1;
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-    const ro = new ResizeObserver(() => {
+    const resize = () => {
       const el = wrapRef.current!;
       dpr = Math.min(window.devicePixelRatio || 1, 2);
       W = el.clientWidth; H = el.clientHeight;
       canvas.width = W * dpr; canvas.height = H * dpr;
       canvas.style.width = W + "px"; canvas.style.height = H + "px";
-    });
+    };
+    const ro = new ResizeObserver(resize);
     ro.observe(wrapRef.current!);
 
     // Progression de naissance d'un nœud : 1 = né, 0 = pas encore, entre = en vol.
@@ -422,24 +439,44 @@ export function BrainMap({
       return Math.max(0, el);
     };
 
-    const pos = (info: NodeInfo): { x: number; y: number } => {
-      const o = dragOffsets.current.get(info.id) ?? { dx: 0, dy: 0 };
-      let x = info.finalX + o.dx, y = info.finalY + o.dy;
-      const k = spawnK(info.id);
-      if (k < 1) {
-        // Naît depuis son parent (lui-même possiblement en vol → chaînes fluides).
-        const par = info.parentId ? S.current.infos.get(info.parentId) as NodeInfo | undefined : undefined;
-        if (par) {
-          const pp = pos(par);
-          const e = 1 - Math.pow(1 - k, 3); // easeOutCubic
-          x = pp.x + (x - pp.x) * e;
-          y = pp.y + (y - pp.y) * e;
+    // Position affichée = position vivante (avancée une fois par frame dans draw()).
+    const pos = (info: NodeInfo): { x: number; y: number } =>
+      livePos.current.get(info.id) ?? { x: info.finalX, y: info.finalY };
+
+    // Alpha de naissance : 0 avant le spawn, fondu rapide ensuite. Les filaments
+    // le suivent aussi — jamais de trait vers une bulle pas encore née.
+    const spawnA = (id: string): number => {
+      const k = spawnK(id);
+      return k <= 0 ? 0 : Math.min(1, k * 2.5);
+    };
+
+    // Avance chaque position vivante vers sa cible ; les nouvelles bulles
+    // naissent sur leur parent puis glissent vers leur place.
+    const advancePositions = () => {
+      const s = S.current;
+      const firstLayout = livePos.current.size === 0;
+      const k = reduce ? 1 : 0.16;
+      for (const info of s.infos.values() as Iterable<NodeInfo>) {
+        const o = dragOffsets.current.get(info.id) ?? { dx: 0, dy: 0 };
+        const tx = info.finalX + o.dx, ty = info.finalY + o.dy;
+        let lp = livePos.current.get(info.id);
+        if (!lp) {
+          const par = info.parentId ? livePos.current.get(info.parentId) : undefined;
+          lp = firstLayout || !par ? { x: tx, y: ty } : { x: par.x, y: par.y };
+          livePos.current.set(info.id, lp);
         }
+        lp.x += (tx - lp.x) * k;
+        lp.y += (ty - lp.y) * k;
+        // Snap à l'arrivée : sans lui le lerp n'atteint jamais la cible et le
+        // texte, redessiné en sous-pixel à chaque frame, scintille en continu.
+        if (Math.abs(tx - lp.x) < 0.1 && Math.abs(ty - lp.y) < 0.1) { lp.x = tx; lp.y = ty; }
       }
-      return { x, y };
     };
 
     const draw = (ts: number) => {
+      // Le DPR change sans resize CSS (fenêtre déplacée entre écrans, création
+      // avant affectation à l'écran Retina) → re-dimensionner le backing store.
+      if (Math.min(window.devicePixelRatio || 1, 2) !== dpr && wrapRef.current) resize();
       const s = S.current;
       const time = reduce ? 0 : ts / 1000;
       const c = cam.current, ct = camTarget.current;
@@ -447,22 +484,28 @@ export function BrainMap({
       // Décalage du centre quand le panneau détail est ouvert (suit le slide)
       const po = panelOff.current;
       po.cur += (po.target - po.cur) * 0.14;
+      if (Math.abs(po.target - po.cur) < 0.1) po.cur = po.target;
       const CX = (W - po.cur) / 2;
 
       if (needsFit.current && W > 0) {
-        const fit = Math.min(1, (Math.min(W - po.target, H) / 2 * 0.88) / maxR);
-        c.x = 0; c.y = 0; c.zoom = fit;
+        const fit = Math.min(1, (Math.min(W - po.target, H) / 2 * 0.88) / s.maxR);
+        if (!didFit.current) { c.x = 0; c.y = 0; c.zoom = fit; didFit.current = true; }
         ct.x = 0; ct.y = 0; ct.zoom = fit;
         needsFit.current = false;
       }
-      // lerp caméra (pour le focus animé)
+      // lerp caméra (pour le focus animé) + snap à l'arrivée (stabilité sous-pixel)
       c.x += (ct.x - c.x) * 0.14; c.y += (ct.y - c.y) * 0.14; c.zoom += (ct.zoom - c.zoom) * 0.14;
+      if (Math.abs(ct.x - c.x) < 0.1) c.x = ct.x;
+      if (Math.abs(ct.y - c.y) < 0.1) c.y = ct.y;
+      if (Math.abs(ct.zoom - c.zoom) < 0.0005) c.zoom = ct.zoom;
 
       const sx = (wx: number) => CX + (wx - c.x) * c.zoom;
       const sy = (wy: number) => H / 2 + (wy - c.y) * c.zoom;
       const t = s.theme as CanvasTheme;
       // Fondu des feuilles autour du seuil de zoom (plus de pop)
       const leafA = Math.max(0, Math.min(1, (c.zoom - (LEAF_ZOOM - LEAF_FADE / 2)) / LEAF_FADE));
+
+      advancePositions();
 
       // Fond
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -519,11 +562,13 @@ export function BrainMap({
         const parent = info.parentId ? s.infos.get(info.parentId) : null;
         if (!parent) continue;
         if (!visible(info) || !visible(parent)) continue;
+        const birth = Math.min(spawnA(info.id), spawnA(parent.id));
+        if (birth <= 0) continue;
         const a = pos(parent), b = pos(info);
         const conn = !!hv && (info.id === hv || info.parentId === hv);
         const fade = isLeafKind(info.node.kind) ? leafA : 1;
         ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-        ctx.globalAlpha = (hv ? (conn ? 1 : 0.15) : 1) * fade;
+        ctx.globalAlpha = (hv ? (conn ? 1 : 0.15) : 1) * fade * birth;
         ctx.strokeStyle = conn ? hexA(s.colorOf.get(info.id)!, 0.7) : t.wire;
         ctx.lineWidth = (conn ? 1.6 : 1) / c.zoom;
         ctx.stroke();
@@ -534,6 +579,8 @@ export function BrainMap({
       for (const e of s.linkEdges as { source: string; target: string }[]) {
         const ia = s.infos.get(e.source), ib = s.infos.get(e.target);
         if (!ia || !ib || !visible(ia) || !visible(ib)) continue;
+        const birth = Math.min(spawnA(e.source), spawnA(e.target));
+        if (birth <= 0) continue;
         const a = pos(ia), b = pos(ib);
         const conn = !!hv && (e.source === hv || e.target === hv);
         // Arc perpendiculaire léger pour se distinguer des filaments de l'arbre.
@@ -545,7 +592,7 @@ export function BrainMap({
         ctx.moveTo(a.x, a.y);
         ctx.quadraticCurveTo(mx - (dy / d) * bow, my + (dx / d) * bow, b.x, b.y);
         ctx.setLineDash([5 / c.zoom, 4 / c.zoom]);
-        ctx.globalAlpha = hv ? (conn ? 0.95 : 0.1) : 0.4;
+        ctx.globalAlpha = (hv ? (conn ? 0.95 : 0.1) : 0.4) * birth;
         ctx.strokeStyle = hexA(s.colorOf.get(e.source) ?? "#7f8aa8", conn ? 0.9 : 0.5);
         ctx.lineWidth = (conn ? 1.6 : 1) / c.zoom;
         ctx.stroke();
@@ -650,11 +697,12 @@ export function BrainMap({
         const show = always || isHover || (!!hv && near!(info.id)) || info.id === s.selectedId;
         if (!show) continue;
         const p = pos(info);
-        const px = sx(p.x), py = sy(p.y);
+        // Texte calé sur la grille de pixels : net à l'arrêt comme en vol.
+        const px = Math.round(sx(p.x)), py = sy(p.y);
         const fs = isRoot ? 12 : isContainer ? 10.5 : 9.5;
         ctx.font = `500 ${fs}px ui-monospace, SFMono-Regular, Menlo, monospace`;
         ctx.textAlign = "center"; ctx.textBaseline = "middle";
-        const ly = py + info.r * c.zoom + (isRoot ? 18 : 12);
+        const ly = Math.round(py + info.r * c.zoom + (isRoot ? 18 : 12));
         ctx.globalAlpha = isLeaf ? leafA : 1;
         ctx.shadowColor = t.dark ? "rgba(0,0,0,0.7)" : "rgba(245,247,251,0.9)";
         ctx.shadowBlur = 4;
@@ -804,19 +852,22 @@ export function BrainMap({
     };
     let unlistenDrop: (() => void) | undefined;
     let dropDisposed = false;
-    getCurrentWebview().onDragDropEvent((ev) => {
-      if (!S.current.onImportFiles) return;
-      const dpr = window.devicePixelRatio || 1;
-      if (ev.payload.type === "over") {
-        hovered.current = fileDropTarget(ev.payload.position.x / dpr, ev.payload.position.y / dpr);
-      } else if (ev.payload.type === "drop") {
-        const target = fileDropTarget(ev.payload.position.x / dpr, ev.payload.position.y / dpr);
-        hovered.current = null;
-        S.current.onImportFiles(ev.payload.paths, target);
-      } else if (ev.payload.type === "leave") {
-        hovered.current = null;
-      }
-    }).then((un) => { if (dropDisposed) un(); else unlistenDrop = un; });
+    // Drag & drop OS : uniquement dans Tauri (le viewer web réutilise ce composant).
+    if ("__TAURI_INTERNALS__" in window) {
+      getCurrentWebview().onDragDropEvent((ev) => {
+        if (!S.current.onImportFiles) return;
+        const dpr = window.devicePixelRatio || 1;
+        if (ev.payload.type === "over") {
+          hovered.current = fileDropTarget(ev.payload.position.x / dpr, ev.payload.position.y / dpr);
+        } else if (ev.payload.type === "drop") {
+          const target = fileDropTarget(ev.payload.position.x / dpr, ev.payload.position.y / dpr);
+          hovered.current = null;
+          S.current.onImportFiles(ev.payload.paths, target);
+        } else if (ev.payload.type === "leave") {
+          hovered.current = null;
+        }
+      }).then((un) => { if (dropDisposed) un(); else unlistenDrop = un; });
+    }
 
     return () => {
       cancelAnimationFrame(raf);
@@ -830,7 +881,10 @@ export function BrainMap({
       dropDisposed = true;
       unlistenDrop?.();
     };
-  }, [maxR]); // relance si le graphe (donc maxR) change
+    // Monté UNE fois : tout l'état vivant passe par S.current / refs. Redémarrer
+    // cette boucle (canvas, listeners, drag&drop) à chaque évolution du graphe
+    // provoquait 1-2 frames vides → clignotement à chaque recalcul (timeline, watch).
+  }, []);
 
   // ── Rendu React (canvas + overlays) ──────────────────────────────────────────
   return (

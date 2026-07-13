@@ -1,12 +1,18 @@
 name: Deploy download page (GitHub Pages)
 
-# Publie UNIQUEMENT site/ (la page de download) sur GitHub Pages, et active Pages
-# tout seul au premier run (enablement: true). URL : https://kywi0x.github.io/lucid/
+# Publie la landing (site/) + le viewer de spaces partagés buildé depuis les
+# composants React de l'app (viewer.html → /s/). Active Pages tout seul au
+# premier run (enablement: true). URL : https://kywi0x.github.io/lucid/
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
+      - "src/**"
+      - "viewer.html"
+      - "vite.viewer.config.ts"
+      - "package.json"
+      - "package-lock.json"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -27,11 +33,26 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Build viewer (mêmes composants que l'app)
+        run: |
+          npm ci
+          npm run build:viewer
+      - name: Assemble le site (landing + viewer sous /s/)
+        run: |
+          mkdir -p _site/s/
+          cp -r site/. _site/
+          rm -rf _site/s && mkdir _site/s
+          cp dist-viewer/viewer.html _site/s/index.html
+          cp -r dist-viewer/assets _site/s/assets
       - uses: actions/configure-pages@v5
         with:
           enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: _site
       - id: deploy
         uses: actions/deploy-pages@v4
