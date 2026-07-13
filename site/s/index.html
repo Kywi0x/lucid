@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lucid — space partagé</title>
+  <style>
+    :root {
+      --bg: #f5f7fb; --fg: #1b2130; --muted: #5c6577; --card: #ffffff;
+      --border: #e4e7ec; --accent: #6a52e8; --wire: rgba(40,60,100,0.16);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0a0d13; --fg: #e7ecf4; --muted: #8a93a6; --card: #10131b;
+        --border: #262a32; --accent: #9d8cff; --wire: rgba(163,178,210,0.18);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    #canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+    #title { position: fixed; top: 16px; left: 20px; z-index: 2; }
+    #title h1 { margin: 0; font-size: 15px; letter-spacing: -.01em; }
+    #title p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
+    #panel {
+      position: fixed; top: 12px; right: 12px; bottom: 12px; width: min(420px, 90vw); z-index: 3;
+      background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+      box-shadow: 0 16px 48px rgba(0,0,0,.18); padding: 20px 22px; overflow-y: auto;
+      display: none;
+    }
+    #panel.open { display: block; }
+    #panel h2 { margin: 0 32px 6px 0; font-size: 16px; }
+    #panel .kw { font-size: 11px; color: var(--muted); margin-bottom: 12px; }
+    #panel .body { font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
+    #panel .body h3 { font-size: 13px; margin: 14px 0 4px; }
+    #close { position: absolute; top: 12px; right: 12px; border: 0; background: none;
+      color: var(--muted); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 8px; }
+    #close:hover { background: var(--bg); }
+    #cta {
+      position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 2;
+      display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px;
+      background: var(--card); border: 1px solid var(--border); box-shadow: 0 6px 24px rgba(0,0,0,.12);
+      font-size: 12px; color: var(--muted); text-decoration: none;
+    }
+    #cta b { color: var(--accent); font-weight: 600; }
+    #status { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); z-index: 1; }
+  </style>
+</head>
+<body>
+  <div id="status">Chargement…</div>
+  <div id="title" hidden><h1 id="t-name"></h1><p id="t-meta"></p></div>
+  <canvas id="canvas"></canvas>
+  <div id="panel"><button id="close">✕</button><h2 id="p-title"></h2><div class="kw" id="p-kw"></div><div class="body" id="p-body"></div></div>
+  <a id="cta" href="../">✦ Créé avec <b>Lucid</b> — construis ton second cerveau</a>
+
+<script>
+// ── Config Supabase (clé anon publique par design — remplir avant déploiement) ──
+const SUPABASE_URL = "https://ahvlnejmuouibvjdical.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFodmxuZWptdW91aWJ2amRpY2FsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjQyMDMsImV4cCI6MjA5ODc0MDIwM30.3yAQya7_YflJteExoXttZHjDp2cqaXNfJAz3n8R6j5o";
+
+const PALETTE = matchMedia("(prefers-color-scheme: dark)").matches
+  ? ["#8f86e8","#5fb39a","#c2906b","#c77e9e","#6e9fcc","#b8a05c","#9a7cc4","#62aba6","#c07a72","#7580c8"]
+  : ["#6a5fd1","#3c8f76","#a96f44","#b25e85","#4b7fb0","#8f7a35","#7d5ba6","#3f8a85","#a55a50","#5563af"];
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function hash(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193); return (h >>> 0) / 0xffffffff; }
+
+async function load() {
+  const id = new URLSearchParams(location.search).get("id");
+  const status = document.getElementById("status");
+  if (!id) { status.textContent = "Lien invalide (id manquant)."; return; }
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/shared_spaces?id=eq.${encodeURIComponent(id)}&select=title,data,updated_at`,
+      { headers: { apikey: SUPABASE_ANON_KEY, authorization: `Bearer ${SUPABASE_ANON_KEY}` } });
+    const rows = await r.json();
+    if (!r.ok || !rows.length) { status.textContent = "Ce space n'existe pas (ou n'est plus partagé)."; return; }
+    status.hidden = true;
+    start(rows[0]);
+  } catch (e) { status.textContent = "Impossible de charger ce space : " + e.message; }
+}
+
+function start(row) {
+  const { nodes, edges } = row.data;
+  document.getElementById("title").hidden = false;
+  document.getElementById("t-name").textContent = row.data.title || row.title;
+  document.getElementById("t-meta").textContent =
+    `${nodes.filter(n => n.kind !== "root").length} pages · mis à jour le ${new Date(row.updated_at).toLocaleDateString("fr-FR")}`;
+  document.title = `${row.title} — Lucid`;
+
+  // ── Layout radial : racine au centre, enfants en orbite autour du parent ──
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const kids = new Map();
+  nodes.forEach(n => { if (n.parent_id && byId.has(n.parent_id)) (kids.get(n.parent_id) ?? kids.set(n.parent_id, []).get(n.parent_id)).push(n.id); });
+  const root = nodes.find(n => !n.parent_id || !byId.has(n.parent_id)) ?? nodes[0];
+  const P = new Map(); // id → {x,y,r,color}
+  const radiusOf = k => k === "root" ? 18 : (k === "container" || k === "espace" || k === "group") ? 7 : 4.5;
+  function place(id, x, y, angle, depth, color) {
+    const n = byId.get(id);
+    const c = depth === 1 ? PALETTE[Math.floor(hash(id) * PALETTE.length) % PALETTE.length] : color;
+    P.set(id, { x, y, r: radiusOf(n.kind), color: depth === 0 ? css("--accent") : c });
+    const ch = kids.get(id) ?? [];
+    if (!ch.length) return;
+    const R = depth === 0 ? Math.max(120, ch.length * 26) : 60 + ch.length * 7;
+    const spread = depth === 0 ? Math.PI * 2 : Math.min(Math.PI * .9, .35 * ch.length);
+    ch.forEach((k, i) => {
+      const a = depth === 0 ? (i / ch.length) * Math.PI * 2 : angle - spread / 2 + (ch.length < 2 ? .5 : i / (ch.length - 1)) * spread;
+      const j = (hash(k + "j") - .5) * .1;
+      place(k, x + R * Math.cos(a + j), y + R * Math.sin(a + j), a, depth + 1, c);
+    });
+  }
+  place(root.id, 0, 0, -Math.PI / 2, 0, css("--accent"));
+
+  // ── Rendu + interactions (pan / zoom / hover / clic) ──
+  const cv = document.getElementById("canvas"), ctx = cv.getContext("2d");
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  let W, H; const fit = () => { W = innerWidth; H = innerHeight; cv.width = W * dpr; cv.height = H * dpr; };
+  fit(); addEventListener("resize", () => { fit(); draw(); });
+  let maxR = 1; P.forEach(p => maxR = Math.max(maxR, Math.hypot(p.x, p.y) + 40));
+  const cam = { x: 0, y: 0, z: Math.min(1, Math.min(W, H) / 2 * .85 / maxR) };
+  let hover = null;
+
+  const sx = wx => W / 2 + (wx - cam.x) * cam.z, sy = wy => H / 2 + (wy - cam.y) * cam.z;
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = css("--bg"); ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = css("--wire");
+    for (let x = ((sx(0) % 30) + 30) % 30; x < W; x += 30) for (let y = ((sy(0) % 30) + 30) % 30; y < H; y += 30)
+      { ctx.beginPath(); ctx.arc(x, y, .8, 0, 7); ctx.fill(); }
+    ctx.strokeStyle = css("--wire"); ctx.lineWidth = 1;
+    P.forEach((p, id) => {
+      const n = byId.get(id); if (!n.parent_id) return;
+      const pp = P.get(n.parent_id); if (!pp) return;
+      ctx.beginPath(); ctx.moveTo(sx(pp.x), sy(pp.y)); ctx.lineTo(sx(p.x), sy(p.y)); ctx.stroke();
+    });
+    P.forEach((p, id) => {
+      const r = p.r * cam.z * (id === hover ? 1.3 : 1);
+      ctx.beginPath(); ctx.arc(sx(p.x), sy(p.y), Math.max(2, r * .55), 0, 7);
+      ctx.fillStyle = p.color; ctx.fill();
+      ctx.beginPath(); ctx.arc(sx(p.x), sy(p.y), Math.max(3.2, r), 0, 7);
+      ctx.strokeStyle = p.color + "66"; ctx.stroke();
+      const n = byId.get(id);
+      const isBig = n.kind === "root" || (kids.get(id) ?? []).length > 0;
+      if (isBig || id === hover || cam.z > .8) {
+        ctx.font = `500 ${n.kind === "root" ? 12 : 10}px ui-monospace, Menlo, monospace`;
+        ctx.textAlign = "center";
+        ctx.fillStyle = id === hover ? css("--fg") : css("--muted");
+        ctx.fillText(n.label, sx(p.x), sy(p.y) + Math.max(3.2, r) + 12);
+      }
+    });
+  }
+  draw();
+
+  const pick = (mx, my) => { let best = null, bd = 18; P.forEach((p, id) => { const d = Math.hypot(sx(p.x) - mx, sy(p.y) - my); if (d < bd) { bd = d; best = id; } }); return best; };
+  let drag = null;
+  cv.addEventListener("mousedown", e => drag = { x: e.clientX, y: e.clientY, moved: 0 });
+  addEventListener("mousemove", e => {
+    if (drag) { cam.x -= (e.clientX - drag.x) / cam.z; cam.y -= (e.clientY - drag.y) / cam.z; drag.moved += Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y); drag.x = e.clientX; drag.y = e.clientY; }
+    else hover = pick(e.clientX, e.clientY);
+    cv.style.cursor = drag ? "grabbing" : hover ? "pointer" : "grab";
+    draw();
+  });
+  addEventListener("mouseup", e => {
+    if (drag && drag.moved < 5) {
+      const id = pick(e.clientX, e.clientY);
+      if (id) openPanel(byId.get(id)); else document.getElementById("panel").classList.remove("open");
+    }
+    drag = null;
+  });
+  cv.addEventListener("wheel", e => {
+    e.preventDefault();
+    const k = Math.exp(-e.deltaY * .0015);
+    cam.z = Math.min(4, Math.max(.05, cam.z * k));
+    draw();
+  }, { passive: false });
+
+  function openPanel(n) {
+    document.getElementById("p-title").textContent = n.label;
+    document.getElementById("p-kw").textContent = (n.keywords ?? []).join(" · ");
+    // ponytail: rendu texte brut (les # et ** restent visibles) — un vrai parseur md si besoin
+    document.getElementById("p-body").textContent = n.content || n.summary || "(page sans contenu)";
+    document.getElementById("panel").classList.add("open");
+  }
+  document.getElementById("close").onclick = () => document.getElementById("panel").classList.remove("open");
+}
+load();
+</script>
+</body>
+</html>
