@@ -30,11 +30,12 @@ interface Props {
   onNodeRenamed?: (nodeId: string, label: string) => void;
 }
 
-const ICON = {
+// Exportés : réutilisés par le viewer public (src/viewer) — présentation pure.
+export const ICON = {
   root: Brain, group: FolderGit2, espace: FolderGit2, container: FolderGit2,
   page: FileText, leaf: FileText, concept: FileText, source: FileText,
 } as const;
-const KIND_LABEL = {
+export const KIND_LABEL = {
   root: "Lucid", group: "Espace", espace: "Espace", container: "Espace",
   page: "Page", leaf: "Page", concept: "Page", source: "Page",
 } as const;
@@ -59,7 +60,7 @@ function ConnectorLogo({ connector }: { connector: string }) {
 
 /** Arborescence du projet (depuis le plus haut parent hors racine) : branches
  *  repliables, chemin vers la page courante déplié, page courante surlignée. */
-function ProjectTree({ node, graph, ancestors, onSelect }: {
+export function ProjectTree({ node, graph, ancestors, onSelect }: {
   node: BrainNode;
   graph: BrainGraph;
   ancestors: BrainNode[];
@@ -146,7 +147,7 @@ async function downloadNode(node: BrainNode) {
   if (path) await exportNodeMd(node.id, path);
 }
 
-function useAncestors(node: BrainNode, graph: BrainGraph | null): BrainNode[] {
+export function useAncestors(node: BrainNode, graph: BrainGraph | null): BrainNode[] {
   return useMemo(() => {
     if (!graph) return [];
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
