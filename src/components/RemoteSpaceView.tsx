@@ -4,6 +4,7 @@ import { BrainMap } from "@/components/BrainMap";
 import { ReadOnlyDetail } from "@/components/ReadOnlyDetail";
 import { fetchSharedSpace, sharedSpaceUrl } from "@/lib/share";
 import { payloadToGraph } from "@/lib/shared-space";
+import { supabase } from "@/lib/supabase";
 import type { BrainGraph, BrainNode } from "@/lib/types";
 import { cn, copyText } from "@/lib/utils";
 
@@ -18,9 +19,28 @@ export function RemoteSpaceView({ spaceId, onClose }: { spaceId: string; onClose
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    fetchSharedSpace(spaceId)
-      .then((row) => { setTitle(row.title); setGraph(payloadToGraph(row.data)); })
-      .catch((e) => setError(String(e instanceof Error ? e.message : e)));
+    let cancelled = false;
+    const load = () =>
+      fetchSharedSpace(spaceId)
+        .then((row) => { if (!cancelled) { setTitle(row.title); setGraph(payloadToGraph(row.data)); } })
+        .catch((e) => { if (!cancelled) setError(String(e instanceof Error ? e.message : e)); });
+    load();
+
+    // Live : le propriétaire republie → les nouvelles bulles poussent toutes
+    // seules ; il dé-publie (ou me retire) → le space se ferme proprement.
+    if (!supabase) return;
+    const ch = supabase
+      .channel(`shared-${spaceId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "shared_spaces", filter: `id=eq.${spaceId}` },
+        (payload) => {
+          if (payload.eventType === "DELETE") setError("Ce space n'est plus partagé.");
+          else load(); // UPDATE : refetch (le RLS re-vérifie mon accès au passage)
+        },
+      )
+      .subscribe();
+    return () => { cancelled = true; supabase!.removeChannel(ch); };
   }, [spaceId]);
 
   async function copyLink() {

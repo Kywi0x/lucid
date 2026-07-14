@@ -16,3 +16,7 @@ create policy "lecture selon visibilite"
     or auth.uid() = owner
     or lower(coalesce(auth.jwt() ->> 'email', '')) = any (allowed_emails)
   );
+
+-- Live (realtime) : diffuse les changements de la table aux clients abonnés
+-- (app RemoteSpaceView + viewer web). Sans ça, pas de mise à jour en direct.
+alter publication supabase_realtime add table public.shared_spaces;
