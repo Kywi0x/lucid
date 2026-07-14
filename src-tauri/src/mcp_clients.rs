@@ -51,13 +51,37 @@ const CLIENTS: &[ClientDesc] = &[
 fn config_path(id: &str) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     match id {
-        // config_dir = ~/Library/Application Support (Mac) / %APPDATA% Roaming (Windows)
-        "claude-desktop" => Some(dirs::config_dir()?.join("Claude").join("claude_desktop_config.json")),
+        // config_dir = ~/Library/Application Support (Mac) / %APPDATA% Roaming (Windows).
+        // Windows a deux packagings : installeur classique (%APPDATA%\Claude) et
+        // MSIX/Store, dont l'AppData est virtualisé sous Packages\Claude_<hash>.
+        "claude-desktop" => {
+            let classic = dirs::config_dir()?.join("Claude");
+            let dir = if classic.exists() {
+                classic
+            } else if let Some(msix) = msix_claude_roaming() {
+                msix
+            } else {
+                classic // défaut : sera créé à la connexion
+            };
+            Some(dir.join("claude_desktop_config.json"))
+        }
         "claude-code"    => Some(home.join(".claude.json")),
         "cursor"         => Some(home.join(".cursor/mcp.json")),
         "codex"          => Some(home.join(".codex/config.toml")),
         _ => None,
     }
+}
+
+/// Dossier « Roaming\Claude » virtualisé du Claude Desktop MSIX (Store) :
+/// ces apps écrivent leur %APPDATA% sous Packages\Claude_<hash>\LocalCache\Roaming.
+fn msix_claude_roaming() -> Option<PathBuf> {
+    let packages = dirs::data_local_dir()?.join("Packages");
+    for e in std::fs::read_dir(packages).ok()?.flatten() {
+        if e.file_name().to_string_lossy().starts_with("Claude_") {
+            return Some(e.path().join("LocalCache").join("Roaming").join("Claude"));
+        }
+    }
+    None
 }
 
 fn is_installed(id: &str) -> bool {
@@ -66,8 +90,15 @@ fn is_installed(id: &str) -> bool {
     let local = |sub: &str| dirs::data_local_dir().is_some_and(|d| d.join(sub).exists());
     match id {
         "claude-desktop" => app("/Applications/Claude.app")
-            || local("AnthropicClaude")
-            || config_path(id).is_some_and(|p| p.exists()),
+            || local("AnthropicClaude")            // installeur Windows historique
+            || local("Claude")                     // variantes du dossier d'install
+            || local("Claude-3p")                  // packaging Windows récent
+            || local("Programs/Claude")            // electron-builder par défaut
+            || local("Programs/claude-desktop")
+            || msix_claude_roaming().is_some()     // packaging MSIX / Store
+            // %APPDATA%\Claude est créé au 1er lancement de Claude Desktop — la
+            // config MCP, elle, n'existe pas tant qu'on n'en a jamais ajouté.
+            || config_path(id).is_some_and(|p| p.exists() || p.parent().is_some_and(|d| d.exists())),
         "claude-code"    => config_path(id).is_some_and(|p| p.exists()),
         "chatgpt"        => app("/Applications/ChatGPT.app") || local("Programs/ChatGPT"),
         "cursor"         => app("/Applications/Cursor.app")
