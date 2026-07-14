@@ -60,7 +60,20 @@ export function ViewerApp() {
     const { data: sub } = supa.auth.onAuthStateChange((ev) => {
       if (ev === "SIGNED_IN" || ev === "SIGNED_OUT") load();
     });
-    return () => { cancelled = true; sub.subscription.unsubscribe(); };
+    // Live : republication → mise à jour sous les yeux du lecteur ;
+    // dé-publication / retrait d'accès → gate.
+    const ch = supa
+      .channel(`shared-${id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "shared_spaces", filter: `id=eq.${id}` },
+        (payload) => {
+          if (payload.eventType === "DELETE") { setSpace(null); setDenied(true); }
+          else load();
+        },
+      )
+      .subscribe();
+    return () => { cancelled = true; sub.subscription.unsubscribe(); supa.removeChannel(ch); };
   }, []);
 
   if (error) {
