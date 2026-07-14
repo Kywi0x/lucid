@@ -18,6 +18,8 @@ const lowlight = createLowlight(common);
 import {
   Bold, Italic, Heading2, Heading3, List, ListOrdered, CheckSquare,
   Code, Table as TableIcon, RowsIcon, Columns3, Trash2, Plus, FileText, Sparkles, Loader2,
+  Link2, TextQuote, Minus, ChevronRight, Info, GitBranch, SquareStack, Highlighter,
+  type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AiDraft } from "./AiDraft";
@@ -34,9 +36,17 @@ interface Props {
   linkTargets?: string[];
   /** Clic sur un wikilink [[label]] → navigation vers la page. */
   onNavigate?: (label: string) => void;
+  /** Transclusion ![[label]] → titre + extrait de la page (null = introuvable). */
+  resolveEmbed?: (label: string) => { title: string; excerpt: string } | null;
 }
 
-type SlashItem = { key: string; label: string; hint: string; action: "page" | "ia" };
+type SlashItem = {
+  key: string;
+  label: string;
+  hint: string;
+  // "page"/"ia"/"link"/"mermaid" = flux spéciaux ; fonction = commande de bloc Tiptap.
+  action: "page" | "ia" | "link" | "mermaid" | ((ed: import("@tiptap/core").Editor) => void);
+};
 
 function Btn({
   active, onClick, title, children,
@@ -71,12 +81,49 @@ const FLOAT_CLASS =
   "flex items-center gap-0.5 rounded-xl border border-[var(--color-border)] " +
   "bg-[var(--color-surface)] shadow-md px-1.5 py-1";
 
+// Menu « / » façon Notion : flux spéciaux + tous les blocs (les clés servent
+// au filtrage en tapant — sans accents, ex. « /tab », « /tit », « /tac »).
 const SLASH_ITEMS: SlashItem[] = [
-  { key: "page", label: "Page", hint: "Sous-page vierge rattachée à celle-ci", action: "page" },
-  { key: "ia",   label: "IA — rédiger", hint: "Générer du contenu avec l'IA", action: "ia" },
+  { key: "page",       label: "Page",             hint: "Sous-page vierge rattachée à celle-ci", action: "page" },
+  { key: "ia",         label: "IA — rédiger",     hint: "Générer du contenu avec l'IA", action: "ia" },
+  { key: "lien",       label: "Lier une page",    hint: "Lien [[…]] vers une autre page", action: "link" },
+  { key: "titre",      label: "Titre",            hint: "Grande section (H2)", action: (ed) => ed.chain().focus().toggleHeading({ level: 2 }).run() },
+  { key: "titre3",     label: "Sous-titre",       hint: "Sous-section (H3)", action: (ed) => ed.chain().focus().toggleHeading({ level: 3 }).run() },
+  { key: "puces",      label: "Liste à puces",    hint: "Liste simple", action: (ed) => ed.chain().focus().toggleBulletList().run() },
+  { key: "numeros",    label: "Liste numérotée",  hint: "Liste ordonnée", action: (ed) => ed.chain().focus().toggleOrderedList().run() },
+  { key: "taches",     label: "Liste de tâches",  hint: "Cases à cocher", action: (ed) => ed.chain().focus().toggleTaskList().run() },
+  { key: "tableau",    label: "Tableau",          hint: "3 × 3 avec en-tête", action: (ed) => ed.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run() },
+  { key: "citation",   label: "Citation",         hint: "Bloc de citation", action: (ed) => ed.chain().focus().toggleBlockquote().run() },
+  { key: "code",       label: "Bloc de code",     hint: "Code avec coloration", action: (ed) => ed.chain().focus().toggleCodeBlock().run() },
+  { key: "separateur", label: "Séparateur",       hint: "Ligne horizontale", action: (ed) => ed.chain().focus().setHorizontalRule().run() },
+  // ⚠️ insertContent(string) est intercepté par tiptap-markdown (parsé en md) :
+  // toujours passer du JSON ProseMirror ou insertText pour les blocs.
+  { key: "pliable",    label: "Bloc repliable",   hint: "Section pliable façon toggle", action: (ed) =>
+      ed.chain().focus().insertContent({
+        type: "blockquote",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "[!note]- Titre" }] },
+          { type: "paragraph", content: [{ type: "text", text: "Contenu replié…" }] },
+        ],
+      }).run() },
+  { key: "encart",     label: "Encart",           hint: "Info, astuce, attention… ([!info])", action: (ed) =>
+      ed.chain().focus().insertContent({
+        type: "blockquote",
+        content: [{ type: "paragraph", content: [{ type: "text", text: "[!info] " }] }],
+      }).run() },
+  { key: "diagramme",  label: "Diagramme",         hint: "Décris-le, l'IA dessine (Mermaid)", action: "mermaid" },
+  { key: "incorporer", label: "Incorporer une page", hint: "Aperçu ![[…]] d'une autre page", action: (ed) =>
+      ed.chain().focus().command(({ tr }) => { tr.insertText("![["); return true; }).run() },
 ];
 
-export function MarkdownEditor({ content, onChange, placeholder = "Écris quelque chose…", onSlashPage, onGenerate, linkTargets, onNavigate }: Props) {
+const SLASH_ICON: Record<string, LucideIcon> = {
+  page: FileText, ia: Sparkles, lien: Link2, titre: Heading2, titre3: Heading3,
+  puces: List, numeros: ListOrdered, taches: CheckSquare, tableau: TableIcon,
+  citation: TextQuote, code: Code, separateur: Minus,
+  pliable: ChevronRight, encart: Info, diagramme: GitBranch, incorporer: SquareStack,
+};
+
+export function MarkdownEditor({ content, onChange, placeholder = "Écris quelque chose…", onSlashPage, onGenerate, linkTargets, onNavigate, resolveEmbed }: Props) {
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
@@ -88,8 +135,8 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
   // Menu slash (/page, /ia)
   const edRef = useRef<import("@tiptap/core").Editor | null>(null);
   const slashRef = useRef<{ len: number; items: SlashItem[]; index: number } | null>(null);
-  const cbRef = useRef({ onSlashPage, onGenerate, onNavigate, linkTargets });
-  cbRef.current = { onSlashPage, onGenerate, onNavigate, linkTargets };
+  const cbRef = useRef({ onSlashPage, onGenerate, onNavigate, linkTargets, resolveEmbed });
+  cbRef.current = { onSlashPage, onGenerate, onNavigate, linkTargets, resolveEmbed };
   const [slash, setSlash] = useState<{ left: number; top: number; items: SlashItem[]; index: number } | null>(null);
 
   // Autocomplétion wikilink ([[…)
@@ -135,6 +182,7 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
 
   // Popover de consigne pour /ia
   const [prompt, setPrompt] = useState<{ left: number; top: number; pos: number } | null>(null);
+  const [promptMode, setPromptMode] = useState<"libre" | "mermaid">("libre");
   const [promptText, setPromptText] = useState("");
   const [promptChildren, setPromptChildren] = useState(false);
   const [promptLoading, setPromptLoading] = useState(false);
@@ -154,9 +202,29 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
     closeSlash();
     if (item.action === "page") { cbRef.current.onSlashPage?.(); }
     else if (item.action === "ia" && cbRef.current.onGenerate) {
+      setPromptMode("libre");
       setPromptText(""); setPromptError(null); setPromptChildren(false);
       setPrompt({ left: at.left, top: at.top, pos });
     }
+    else if (item.action === "mermaid") {
+      if (cbRef.current.onGenerate) {
+        // Personne n'écrit du Mermaid à la main : on décrit, l'IA locale dessine.
+        setPromptMode("mermaid");
+        setPromptText(""); setPromptError(null); setPromptChildren(false);
+        setPrompt({ left: at.left, top: at.top, pos });
+      } else {
+        // Sans IA : squelette éditable (pas d'échec silencieux).
+        ed.chain().focus().insertContent({
+          type: "codeBlock", attrs: { language: "mermaid" },
+          content: [{ type: "text", text: "graph TD\n  A[Idée] --> B[Décision]\n  B --> C[Action]" }],
+        }).run();
+      }
+    }
+    else if (item.action === "link") {
+      // Insère « [[ » : l'autocomplétion wikilink existante prend le relais.
+      ed.chain().focus().command(({ tr }) => { tr.insertText("[["); return true; }).run();
+    }
+    else if (typeof item.action === "function") { item.action(ed); }
   }
 
   function moveSlash(delta: number) {
@@ -173,7 +241,7 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
     if (!sel.empty || !wrap) { closeSlash(); return; }
     const start = sel.$from.start();
     const before = ed.state.doc.textBetween(start, sel.from, "\n", "￼");
-    const m = /(?:^|\s)\/([a-zA-Z]*)$/.exec(before);
+    const m = /(?:^|\s)\/([a-zA-Z0-9]*)$/.exec(before);
     if (!m) { closeSlash(); return; }
     const query = m[1].toLowerCase();
     let items = SLASH_ITEMS.filter((i) => i.key.startsWith(query));
@@ -192,7 +260,10 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
     if (!text || promptLoading || !ed || !prompt || !cbRef.current.onGenerate) return;
     setPromptLoading(true); setPromptError(null);
     try {
-      const md = await cbRef.current.onGenerate(text, promptChildren);
+      const instruction = promptMode === "mermaid"
+        ? `Réponds UNIQUEMENT par un bloc de code \`\`\`mermaid (syntaxe graph TD, labels courts en français) représentant : ${text}. Aucun texte avant ni après le bloc.`
+        : text;
+      const md = await cbRef.current.onGenerate(instruction, promptChildren);
       ed.chain().focus().setTextSelection(prompt.pos).run();
       // @ts-expect-error commande custom AiDraft
       ed.commands.insertAiDraft(md);
@@ -210,7 +281,10 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
       // Blocs de code avec coloration syntaxique (```lang — GFM standard)
       CodeBlockLowlight.configure({ lowlight, languageClassPrefix: "language-" }),
       // Wikilinks [[…]] + callouts [!info] : décorations pures, le .md reste intact
-      MdDecorations.configure({ onNavigate: (label: string) => cbRef.current.onNavigate?.(label) }),
+      MdDecorations.configure({
+        onNavigate: (label: string) => cbRef.current.onNavigate?.(label),
+        resolveEmbed: (label: string) => cbRef.current.resolveEmbed?.(label) ?? null,
+      }),
       // Images collées : stockées en local (assets/), markdown standard ![](…)
       LucidImage,
       Table.configure({ resizable: true }),
@@ -327,6 +401,25 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
         <Btn active={editor.isActive("code")} onClick={() => editor.chain().focus().toggleCode().run()} title="Code">
           <Code className="size-3.5" />
         </Btn>
+        <Btn
+          active={false}
+          onClick={() => {
+            // Surlignage ==texte== : syntaxe Obsidian, stockée telle quelle dans
+            // le .md (le rendu vient d'une décoration). Re-clic = retire.
+            const { from, to } = editor.state.selection;
+            const text = editor.state.doc.textBetween(from, to, "\n");
+            if (!text) return;
+            const wrapped = text.startsWith("==") && text.endsWith("==") && text.length > 4
+              ? text.slice(2, -2)
+              : `==${text}==`;
+            // insertText (pas insertContent) : le texte sélectionné peut contenir
+            // des caractères markdown qui seraient re-parsés et mangés.
+            editor.chain().focus().command(({ tr }) => { tr.insertText(wrapped, from, to); return true; }).run();
+          }}
+          title="Surligner (==texte==)"
+        >
+          <Highlighter className="size-3.5" />
+        </Btn>
         <span className="mx-0.5 h-4 w-px bg-[var(--color-border)]" />
         <Btn active={editor.isActive("heading", { level: 2 })} onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()} title="Titre H2">
           <Heading2 className="size-3.5" />
@@ -403,7 +496,7 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
       {slash && (
         <div
           style={{ position: "absolute", left: slash.left, top: slash.top, zIndex: 40 }}
-          className="min-w-[220px] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] p-1"
+          className="max-h-80 min-w-[220px] overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] p-1"
         >
           {slash.items.map((item, i) => (
             <button
@@ -416,7 +509,7 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
               )}
             >
               <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-[var(--color-surface-2)] text-[var(--color-accent)]">
-                {item.action === "ia" ? <Sparkles className="size-3.5" /> : <FileText className="size-3.5" />}
+                {(() => { const I = SLASH_ICON[item.key] ?? FileText; return <I className="size-3.5" />; })()}
               </span>
               <span className="min-w-0">
                 <span className="block text-sm text-[var(--color-text)]">{item.label}</span>
@@ -434,8 +527,12 @@ export function MarkdownEditor({ content, onChange, placeholder = "Écris quelqu
           className="w-[320px] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] p-2.5"
         >
           <div className="mb-2 flex items-center gap-1.5">
-            <Sparkles className="size-3.5 text-[var(--color-accent)]" />
-            <span className="text-xs font-semibold text-[var(--color-text)]">Rédiger avec l'IA</span>
+            {promptMode === "mermaid"
+              ? <GitBranch className="size-3.5 text-[var(--color-accent)]" />
+              : <Sparkles className="size-3.5 text-[var(--color-accent)]" />}
+            <span className="text-xs font-semibold text-[var(--color-text)]">
+              {promptMode === "mermaid" ? "Décris ton diagramme" : "Rédiger avec l'IA"}
+            </span>
           </div>
           <textarea
             autoFocus

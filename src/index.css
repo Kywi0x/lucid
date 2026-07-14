@@ -545,16 +545,91 @@ body {
   margin-right: 0.4em;
 }
 .prose-lucid .callout-info     { border-left-color: #4c9aff; background: color-mix(in srgb, #4c9aff 9%, transparent); }
-.prose-lucid .callout-info .callout-marker     { background: color-mix(in srgb, #4c9aff 22%, transparent); color: #4c9aff; }
+.prose-lucid .callout-info :is(.callout-marker, .callout-badge)     { background: color-mix(in srgb, #4c9aff 22%, transparent); color: #4c9aff; }
 .prose-lucid .callout-tip      { border-left-color: #3fb96b; background: color-mix(in srgb, #3fb96b 9%, transparent); }
-.prose-lucid .callout-tip .callout-marker      { background: color-mix(in srgb, #3fb96b 22%, transparent); color: #3fb96b; }
+.prose-lucid .callout-tip :is(.callout-marker, .callout-badge)      { background: color-mix(in srgb, #3fb96b 22%, transparent); color: #3fb96b; }
 .prose-lucid .callout-warning  { border-left-color: #e0a33c; background: color-mix(in srgb, #e0a33c 10%, transparent); }
-.prose-lucid .callout-warning .callout-marker  { background: color-mix(in srgb, #e0a33c 24%, transparent); color: #e0a33c; }
+.prose-lucid .callout-warning :is(.callout-marker, .callout-badge)  { background: color-mix(in srgb, #e0a33c 24%, transparent); color: #e0a33c; }
 .prose-lucid .callout-danger   { border-left-color: #e5484d; background: color-mix(in srgb, #e5484d 9%, transparent); }
-.prose-lucid .callout-danger .callout-marker   { background: color-mix(in srgb, #e5484d 22%, transparent); color: #e5484d; }
+.prose-lucid .callout-danger :is(.callout-marker, .callout-badge)   { background: color-mix(in srgb, #e5484d 22%, transparent); color: #e5484d; }
 .prose-lucid .callout-question { border-left-color: #9d7cd8; background: color-mix(in srgb, #9d7cd8 9%, transparent); }
-.prose-lucid .callout-question .callout-marker { background: color-mix(in srgb, #9d7cd8 22%, transparent); color: #9d7cd8; }
+.prose-lucid .callout-question :is(.callout-marker, .callout-badge) { background: color-mix(in srgb, #9d7cd8 22%, transparent); color: #9d7cd8; }
 .prose-lucid blockquote.callout { color: var(--color-text); }
+
+/* Callout repliable ([!type]- Obsidian) : badge cliquable + contenu masqué */
+.prose-lucid .callout .callout-marker { cursor: pointer; user-select: none; }
+.prose-lucid .callout .callout-marker::after { content: " ▾"; opacity: 0.7; }
+.prose-lucid .callout-folded .callout-marker::after { content: " ▸"; }
+.prose-lucid .callout-folded > *:not(:first-child) { display: none; }
+
+/* Badge « propre » (syntaxe masquée) : Note ▾ — hérite des couleurs par type */
+.prose-lucid .callout-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  font-size: 0.75em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border-radius: 6px;
+  padding: 0.16em 0.55em;
+  margin-right: 0.5em;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: baseline;
+}
+.prose-lucid .callout-badge::after { content: "▾"; font-size: 0.85em; opacity: 0.65; }
+.prose-lucid .callout-folded .callout-badge::after { content: "▸"; }
+
+/* ─── Surlignage ==texte== : marqueur, syntaxe stockée intacte ─── */
+.prose-lucid .md-hl {
+  background: color-mix(in srgb, #e8c547 32%, transparent);
+  border-radius: 3px;
+  padding: 0.02em 0.08em;
+}
+.prose-lucid .md-hl-marker { opacity: 0.35; font-size: 0.85em; }
+/* Live preview : syntaxe masquée quand le curseur est ailleurs (== , [[ ]], ![[ ]]) */
+.prose-lucid .md-syntax { display: none; }
+
+/* ─── Transclusion ![[Page]] : source discrète + carte d'aperçu ─── */
+.prose-lucid .md-embed-src { opacity: 0.55; font-size: 0.85em; }
+.prose-lucid .md-embed {
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-accent);
+  border-radius: 8px;
+  background: var(--color-surface-2);
+  padding: 0.6em 0.85em;
+  margin: 0.35em 0 0.6em;
+  cursor: pointer;
+  transition: border-color 0.12s;
+}
+.prose-lucid .md-embed:hover { border-color: var(--color-accent); }
+.prose-lucid .md-embed-title {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--color-accent);
+  margin-bottom: 0.15em;
+}
+.prose-lucid .md-embed-body {
+  font-size: 0.85em;
+  color: var(--color-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-line;
+}
+
+/* ─── Diagrammes Mermaid : rendu sous le bloc ```mermaid ─── */
+.prose-lucid .mermaid-preview {
+  margin: 0.35em 0 0.8em;
+  padding: 0.9em 0.75em;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-surface-2) 55%, transparent);
+  overflow-x: auto;
+  font-size: 0.8em;
+  color: var(--color-muted);
+}
+.prose-lucid .mermaid-preview svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
 
 /* ─── Coloration syntaxique (lowlight/hljs) — palette sur variables du thème ─── */
 .prose-lucid pre {

@@ -309,6 +309,14 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
     if (target) onSelect(target);
   }, [graph, onSelect]);
 
+  // Transclusion ![[Page]] : titre + extrait de la page incorporée.
+  const resolveEmbed = useCallback((label: string) => {
+    const t = graph?.nodes.find((n) => n.label.toLowerCase() === label.toLowerCase() && n.kind !== "pending");
+    if (!t) return null;
+    const text = (t.content || t.summary || "").replace(/^---[\s\S]*?---\s*/, ""); // sans frontmatter
+    return { title: t.label, excerpt: text.slice(0, 400) };
+  }, [graph]);
+
   // Dérivés du markdown (UI pure, rien de stocké) : progression des tâches + sommaire.
   const contentColRef = useRef<HTMLDivElement>(null);
 
@@ -721,7 +729,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
                 ) : (
                   <>
                     <Properties props={props} onChange={persistProps} />
-                    <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={aiOk === false ? undefined : generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+                    <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={aiOk === false ? undefined : generate} linkTargets={linkTargets} onNavigate={navigateToLabel} resolveEmbed={resolveEmbed} />
                   </>
                 )
               )}
@@ -777,7 +785,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
             ) : (
               <div className="space-y-3">
                 <Properties props={props} onChange={persistProps} />
-                <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={aiOk === false ? undefined : generate} linkTargets={linkTargets} onNavigate={navigateToLabel} />
+                <MarkdownEditor content={body} onChange={persistBody} placeholder="Écris… (tape / pour l'IA, [[ pour lier une page, colle une image)" onSlashPage={slashPage} onGenerate={aiOk === false ? undefined : generate} linkTargets={linkTargets} onNavigate={navigateToLabel} resolveEmbed={resolveEmbed} />
               </div>
             )
           )}
