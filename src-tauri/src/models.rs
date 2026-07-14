@@ -71,6 +71,10 @@ pub struct BrainNode {
     /// Timestamp ISO de la dernière synthèse IA manuelle.
     #[serde(default)]
     pub synthesized_at: Option<String>,
+    /// Date (YYYY-MM-DD) d'apparition de la source — feuilles et notes.
+    /// None = nœud structurel (root/conteneur), toujours visible dans la timeline.
+    #[serde(default)]
+    pub date: Option<String>,
     /// Corps markdown édité par l'utilisateur (jamais écrasé par l'IA).
     #[serde(default)]
     pub content: String,

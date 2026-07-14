@@ -40,6 +40,9 @@ import {
   obsidianSetVault,
   obsidianVaultPath,
   obsidianDisconnect,
+  claudeCodeAvailable,
+  claudeCodeDisconnect,
+  claudeCodeReconnect,
   listModels,
   setActiveModel,
   aiClientsStatus,
@@ -255,6 +258,18 @@ function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidi
           <div className="flex flex-col gap-1.5 px-4 py-3">
             {msg && (
               <p className="text-center text-[11px] text-[var(--color-muted)]">{msg}</p>
+            )}
+
+            {c.id === "claude-code" && (
+              c.connected ? (
+                <ActionBtn busy={busy} icon={<LogOut className="size-3.5" />} onClick={onDisconnect} danger>
+                  Déconnecter
+                </ActionBtn>
+              ) : (
+                <ActionBtn busy={busy} icon={<CheckCircle2 className="size-3.5" />} onClick={onConnect} primary>
+                  Connecter Claude Code
+                </ActionBtn>
+              )
             )}
 
             {(c.id === "claude-ai" || c.id === "chatgpt") && (
@@ -553,6 +568,27 @@ function ConnectorsSection({
     finally { set("local-folder", false); }
   }
 
+  async function handleClaudeCodeDisconnect() {
+    set("claude-code", true);
+    try {
+      await claudeCodeDisconnect();
+      msg("claude-code", "Déconnecté");
+      onRefresh();
+    } catch (e) { msg("claude-code", `Erreur : ${e}`); }
+    finally { set("claude-code", false); }
+  }
+
+  async function handleClaudeCodeConnect() {
+    set("claude-code", true);
+    try {
+      await claudeCodeReconnect();
+      const ok = await claudeCodeAvailable();
+      msg("claude-code", ok ? "Connecté !" : "Dossier ~/.claude/projects introuvable — Claude Code est-il installé ?");
+      onRefresh();
+    } catch (e) { msg("claude-code", `Erreur : ${e}`); }
+    finally { set("claude-code", false); }
+  }
+
   async function handleNotionConnect() {
     set("notion", true); msg("notion", "");
     try {
@@ -630,6 +666,7 @@ function ConnectorsSection({
           localFolder={localFolder}
           onClose={() => setModalId(null)}
           onConnect={
+            openModal.id === "claude-code" ? handleClaudeCodeConnect :
             openModal.id === "notion" ? handleNotionConnect :
             openModal.id === "obsidian" ? handleObsidianConnect :
             openModal.id === "local-folder" ? handleLocalFolderConnect :
@@ -641,6 +678,7 @@ function ConnectorsSection({
             handleGoogleSync
           }
           onDisconnect={
+            openModal.id === "claude-code" ? handleClaudeCodeDisconnect :
             openModal.id === "notion" ? handleNotionDisconnect :
             openModal.id === "obsidian" ? handleObsidianDisconnect :
             openModal.id === "local-folder" ? handleLocalFolderDisconnect :
@@ -935,9 +973,9 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
     <div className="h-full overflow-y-auto p-5">
       <p className="mb-1 text-sm font-semibold text-[var(--color-text)]">Compte</p>
       <p className="mb-4 text-xs leading-relaxed text-[var(--color-muted)]">
-        Optionnel — l'app fonctionne entièrement sans compte. Le compte sert à
+        Ton compte donne accès à l'app et permet de
         <strong> sauvegarder ton cerveau dans le cloud</strong> (~2 Mo chiffrés au repos)
-        et à le retrouver sur une autre machine.
+        et de le retrouver sur une autre machine.
       </p>
 
       {!session ? (

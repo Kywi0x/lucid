@@ -27,3 +27,28 @@ export function relativeDate(iso: string | null): string {
   const mo = Math.round(d / 30);
   return `il y a ${mo} mois`;
 }
+
+/** Copie dans le presse-papier. Le plugin Tauri d'abord (les API web —
+ *  navigator.clipboard ET execCommand — échouent en silence dans la WKWebView),
+ *  puis les replis web pour un éventuel contexte navigateur. */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    await writeText(text);
+    return true;
+  } catch { /* hors Tauri ou plugin absent → replis web */ }
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }
+}

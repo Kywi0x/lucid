@@ -65,6 +65,8 @@ export interface BrainNode {
   community?: number;
   parent_id?: string | null;
   synthesized_at?: string | null;
+  /** Date (YYYY-MM-DD) d'apparition — feuilles/notes ; absente = toujours visible (timeline). */
+  date?: string | null;
   content?: string;
   // Provenance (nœuds feuilles uniquement)
   connector?: string;

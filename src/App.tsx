@@ -27,6 +27,7 @@ import {
 import { NodeDetail } from "@/components/NodeDetail";
 import { NodePicker } from "@/components/NodePicker";
 import { StarterChecklist, type ChecklistItem } from "@/components/StarterChecklist";
+import { TimelineBar } from "@/components/TimelineBar";
 import { Onboarding } from "@/components/Onboarding";
 import {
   generateBrain,
@@ -52,6 +53,7 @@ import {
   type BrainProgress,
 } from "@/lib/api";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { ShareModal } from "@/components/ShareModal";
 import type { McpProposal, SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
 import type {
@@ -99,6 +101,10 @@ function App() {
   // (re-sync), on garde la carte affichée et on ajoute les nouveaux nœuds.
   const [genesisRun, setGenesisRun] = useState(false);
   const [progress, setProgress]   = useState<BrainProgress | null>(null);
+  // Graphe vivant : état provisoire réel émis par le pipeline pendant la génération.
+  const [partialGraph, setPartialGraph] = useState<BrainGraph | null>(null);
+  // Timeline : curseur temporel (epoch ms) ; null = timeline fermée.
+  const [timeCutoff, setTimeCutoff] = useState<number | null>(null);
   const [error, setError]         = useState<string | null>(null);
 
   const [selectedNode, setSelectedNode] = useState<BrainNode | null>(null);
@@ -218,6 +224,26 @@ function App() {
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
+  // Graphe vivant : le pipeline émet des graphes provisoires (nœuds allégés,
+  // toutes les props BrainNode requises sont présentes côté Rust).
+  useEffect(() => {
+    const unlisten = listen<{ nodes: BrainNode[]; edges: BrainGraph["edges"] }>(
+      "brain-partial",
+      (e) => setPartialGraph({ ...e.payload, markdown: "", report: "", generated_at: "" }),
+    );
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // Watch auto : le backend a régénéré tout seul (session Claude Code modifiée)
+  // → recharger le graphe ; les nouvelles bulles pop via l'animation en cascade.
+  useEffect(() => {
+    const unlisten = listen("brain-updated", () => {
+      readBrainGraph().then((g) => { if (g) setGraph(g); });
+      connectorsStatus().then(setConnectors);
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
   // `skipSync` : la sync a déjà été faite par le connecteur (bouton Synchroniser)
   // → on régénère seulement, sans re-synchroniser tous les connecteurs.
   async function handleGenerate(opts?: { skipSync?: boolean }) {
@@ -229,6 +255,8 @@ function App() {
     setError(null);
     setProgress(null);
     setStreamLabels([]);
+    setPartialGraph(null);
+    setTimeCutoff(null);
     try {
       // Sync tous les connecteurs connectés avant de régénérer.
       if (!opts?.skipSync) {
@@ -253,6 +281,7 @@ function App() {
     } finally {
       setGenerating(false);
       setProgress(null);
+      setPartialGraph(null);
     }
   }
 
@@ -332,21 +361,18 @@ function App() {
     setSpaces((prev) => [...prev, s]);
   }
 
+  // Modale de partage (public / privé sur invitation).
+  const [shareSpace, setShareSpace] = useState<Space | null>(null);
+
   async function handleSpaceRename(id: string, name: string) {
     await renameSpace(id, name);
     setSpaces((prev) => prev.map((s) => (s.id === id ? { ...s, name } : s)));
   }
 
   async function handleAddNodeToSpace(nodeId: string, spaceId: string) {
+    // Le backend ajoute le sous-arbre entier → on relit plutôt que de deviner.
     await addNodeToSpace(spaceId, nodeId);
-    // Optimistic update — pas d'aller-retour serveur
-    setSpaces((prev) =>
-      prev.map((s) =>
-        s.id === spaceId && s.node_ids !== null
-          ? { ...s, node_ids: [...new Set([...(s.node_ids ?? []), nodeId])] }
-          : s,
-      ),
-    );
+    setSpaces(await listSpaces());
   }
 
   async function refreshGraph() {
@@ -521,6 +547,54 @@ function App() {
     return { ...displayGraph, nodes, edges };
   }, [displayGraph, proposals]);
 
+  // ── Timeline : bornes temporelles du cerveau (nœuds datés) ──
+  const timeRange = useMemo(() => {
+    const ds = (graph?.nodes ?? [])
+      .filter((n) => n.date)
+      .map((n) => new Date(n.date!).getTime());
+    if (ds.length < 2) return null;
+    const min = Math.min(...ds), max = Math.max(...ds);
+    return min < max ? { min, max } : null;
+  }, [graph]);
+
+  // Curseur quantisé au jour : pendant le replay (rAF), le graphe filtré n'est
+  // recalculé qu'au franchissement d'un jour — pas à chaque frame.
+  const cutoffDate = timeCutoff === null ? null : new Date(timeCutoff).toISOString().slice(0, 10);
+
+  // Graphe filtré au curseur : une feuille/note datée n'existe qu'après sa date,
+  // un conteneur n'existe que s'il a au moins un descendant visible.
+  const timelineGraph = useMemo(() => {
+    if (!graphWithGhosts || cutoffDate === null) return graphWithGhosts;
+    const cutoff = cutoffDate;
+    const byId = new Map(graphWithGhosts.nodes.map((n) => [n.id, n]));
+    const kids = new Map<string, string[]>();
+    for (const n of graphWithGhosts.nodes) {
+      if (!n.parent_id) continue;
+      const a = kids.get(n.parent_id);
+      if (a) a.push(n.id); else kids.set(n.parent_id, [n.id]);
+    }
+    const memo = new Map<string, boolean>();
+    const vis = (id: string): boolean => {
+      const got = memo.get(id);
+      if (got !== undefined) return got;
+      const n = byId.get(id);
+      let v: boolean;
+      if (!n || n.kind === "root") v = true;
+      else if (n.date) v = n.date <= cutoff;
+      else {
+        const k = kids.get(id);
+        // Sans date : conteneur → suit ses enfants ; feuille/note ancienne → toujours là.
+        v = !k || k.length === 0 ? true : k.some(vis);
+      }
+      memo.set(id, v);
+      return v;
+    };
+    const nodes = graphWithGhosts.nodes.filter((n) => vis(n.id));
+    const set = new Set(nodes.map((n) => n.id));
+    const edges = graphWithGhosts.edges.filter((e) => set.has(e.source) && set.has(e.target));
+    return { ...graphWithGhosts, nodes, edges };
+  }, [graphWithGhosts, cutoffDate]);
+
   if (needsSetup) {
     return (
       <SetupScreen
@@ -540,12 +614,16 @@ function App() {
           {/* ── Canvas principal ── */}
           {view === "map" && (graph || generating) && (
             <BrainMap
-              graph={graphWithGhosts ?? { nodes: [], edges: [], markdown: "", report: "", generated_at: "" }}
-              onSelect={selectNode}
+              graph={
+                (generating && partialGraph) ||
+                timelineGraph ||
+                { nodes: [], edges: [], markdown: "", report: "", generated_at: "" }
+              }
+              onSelect={generating ? () => {} : selectNode}
               selectedId={selectedNode?.id ?? null}
               query={query}
               revealKey={revealKey}
-              streamLabels={generating && genesisRun ? streamLabels : []}
+              streamLabels={generating && genesisRun && !partialGraph ? streamLabels : []}
               busy={generating && !genesisRun}
               busyMessage={busyMessage}
               streamTotal={streamTotal}
@@ -598,6 +676,18 @@ function App() {
             </DockBtn>
           </div>
 
+          {/* ── Timeline temporelle — posée juste au-dessus de la barre d'outils ── */}
+          {view === "map" && graph && !generating && timeRange && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-[4.75rem] z-10 flex justify-center">
+              <TimelineBar
+                min={timeRange.min}
+                max={timeRange.max}
+                value={timeCutoff ?? timeRange.max}
+                onChange={(v) => setTimeCutoff(v >= timeRange.max ? null : v)}
+              />
+            </div>
+          )}
+
           {/* ── Panneau outil gauche ── */}
           {leftPanel && (
             <div className="panel absolute bottom-4 left-16 top-4 z-30 flex w-[360px] flex-col overflow-hidden rounded-2xl animate-slideInLeft">
@@ -606,6 +696,8 @@ function App() {
                   spaces={spaces}
                   activeSpaceId={activeSpaceId}
                   onSpaceSelect={setActiveSpaceId}
+                  onSpaceCreate={handleSpaceCreate}
+                  onSpaceShare={setShareSpace}
                   onClose={() => setLeftPanel(null)}
                 />
               ) : (
@@ -829,80 +921,89 @@ function App() {
                 </div>
               )}
 
-              {/* Données : régénérer + historique */}
-              <div className="ml-1 flex items-center gap-0.5 pl-3 border-l border-[var(--color-border)]">
-                {graph && (
-                  <button
-                    onClick={() => handleGenerate()}
-                    title="Régénérer le cerveau (sync des sources)"
-                    className="rounded-lg p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-                  >
-                    <RefreshCw className="size-4" />
-                  </button>
-                )}
-                <div className="relative">
-                  <button
-                    onClick={handleOpenHistory}
-                    title="Historique des snapshots"
-                    className={cn(
-                      "rounded-lg p-1.5 transition-colors",
-                      historyOpen
-                        ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                        : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
-                    )}
-                  >
-                    <History className="size-4" />
-                  </button>
-                  {historyOpen && (
-                    <div className="absolute bottom-full right-0 mb-2 w-72 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] overflow-hidden">
-                      <div className="px-3 py-2 border-b border-[var(--color-border)] text-xs font-semibold text-[var(--color-muted)] uppercase tracking-wider">
-                        Snapshots
-                      </div>
-                      {snapshots.length === 0 ? (
-                        <p className="px-3 py-4 text-xs text-[var(--color-muted)] text-center">
-                          Aucun snapshot — régénère le graphe pour en créer un.
-                        </p>
-                      ) : (
-                        <ul className="max-h-64 overflow-y-auto">
-                          {snapshots.map((s) => (
-                            <li key={s.id} className="flex items-center justify-between gap-2 px-3 py-2 hover:bg-[var(--color-surface-2)] transition-colors">
-                              <div className="min-w-0">
-                                <p className="text-xs font-medium text-[var(--color-text)] truncate">
-                                  {relativeTime(s.created_at)}
-                                </p>
-                                <p className="text-[10px] text-[var(--color-muted)]">{s.node_count} nœuds</p>
-                              </div>
-                              <button
-                                onClick={() => handleRestore(s.id)}
-                                disabled={restoring}
-                                title="Restaurer ce snapshot"
-                                className="shrink-0 flex items-center gap-1 rounded-lg px-2 py-1 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] transition-colors disabled:opacity-40"
-                              >
-                                <RotateCcw className="size-3" />
-                                Restaurer
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* App : paramètres + thème */}
-              <div className="ml-1 flex items-center gap-0.5 pl-3 border-l border-[var(--color-border)]">
-                <button
-                  onClick={() => setSettingsOpen(true)}
-                  title="Paramètres"
-                  className="rounded-lg p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-                >
-                  <Settings className="size-4" />
-                </button>
-                <ThemeToggle />
-              </div>
             </div>
           </div>
+
+          {/* ── Actions app (haut droite, façon Notion) : régénérer, snapshots,
+                 paramètres, thème. Masqué quand le panneau détail est ouvert. ── */}
+          {!selectedNode && (
+            <div className="absolute right-3 top-3 z-20 flex items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)]/75 px-1.5 py-1 shadow-[var(--shadow-float)] backdrop-blur-md">
+              {graph && (
+                <button
+                  onClick={() => handleGenerate()}
+                  title="Régénérer le cerveau (sync des sources)"
+                  className="rounded-full p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
+                >
+                  <RefreshCw className="size-4" />
+                </button>
+              )}
+              <div className="relative">
+                <button
+                  onClick={handleOpenHistory}
+                  title="Historique des snapshots"
+                  className={cn(
+                    "rounded-full p-1.5 transition-colors",
+                    historyOpen
+                      ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                      : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
+                  )}
+                >
+                  <History className="size-4" />
+                </button>
+                {historyOpen && (
+                  <div className="absolute right-0 top-full mt-2 w-72 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] overflow-hidden">
+                    <div className="px-3 py-2 border-b border-[var(--color-border)] text-xs font-semibold text-[var(--color-muted)] uppercase tracking-wider">
+                      Snapshots
+                    </div>
+                    {snapshots.length === 0 ? (
+                      <p className="px-3 py-4 text-xs text-[var(--color-muted)] text-center">
+                        Aucun snapshot — régénère le graphe pour en créer un.
+                      </p>
+                    ) : (
+                      <ul className="max-h-64 overflow-y-auto">
+                        {snapshots.map((s) => (
+                          <li key={s.id} className="flex items-center justify-between gap-2 px-3 py-2 hover:bg-[var(--color-surface-2)] transition-colors">
+                            <div className="min-w-0">
+                              <p className="text-xs font-medium text-[var(--color-text)] truncate">
+                                {relativeTime(s.created_at)}
+                              </p>
+                              <p className="text-[10px] text-[var(--color-muted)]">{s.node_count} nœuds</p>
+                            </div>
+                            <button
+                              onClick={() => handleRestore(s.id)}
+                              disabled={restoring}
+                              title="Restaurer ce snapshot"
+                              className="shrink-0 flex items-center gap-1 rounded-lg px-2 py-1 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] transition-colors disabled:opacity-40"
+                            >
+                              <RotateCcw className="size-3" />
+                              Restaurer
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => setSettingsOpen(true)}
+                title="Paramètres"
+                className="rounded-full p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
+              >
+                <Settings className="size-4" />
+              </button>
+              <ThemeToggle />
+            </div>
+          )}
+
+          {/* ── Modale Partage de space ── */}
+          {shareSpace && graph && (
+            <ShareModal
+              space={shareSpace}
+              subgraph={shareSpace.node_ids ? filterGraphBySpace(graph, shareSpace.node_ids) : graph}
+              onClose={() => setShareSpace(null)}
+            />
+          )}
 
           {/* ── Modale Paramètres ── */}
           {settingsOpen && (

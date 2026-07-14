@@ -11,8 +11,30 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Renvoie `~/.claude/projects` si le dossier existe.
+/// Fichier-drapeau : présent = connecteur désactivé par l'utilisateur.
+fn disabled_flag() -> Option<PathBuf> {
+    crate::ai::llama::app_data_dir().map(|d| d.join("claude_code_disabled"))
+}
+
+/// Désactive le connecteur (réversible via `reconnect`).
+pub fn disconnect() {
+    if let Some(p) = disabled_flag() {
+        let _ = fs::write(p, "");
+    }
+}
+
+/// Réactive le connecteur.
+pub fn reconnect() {
+    if let Some(p) = disabled_flag() {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// Renvoie `~/.claude/projects` si le dossier existe et que le connecteur est actif.
 pub fn projects_dir() -> Option<PathBuf> {
+    if disabled_flag().map(|p| p.exists()).unwrap_or(false) {
+        return None;
+    }
     let dir = dirs::home_dir()?.join(".claude").join("projects");
     if dir.is_dir() {
         Some(dir)

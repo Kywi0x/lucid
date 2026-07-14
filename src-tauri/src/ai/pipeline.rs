@@ -211,11 +211,14 @@ pub fn generate_brain(
     cache_path: Option<&Path>,
     mut progress: impl FnMut(Progress),
     mut on_node: impl FnMut(&str, usize, usize),
+    mut on_partial: impl FnMut(&[BrainNode], &[BrainEdge]),
 ) -> Result<BrainGraph, String> {
     let total = conversations.len();
     let mut containers: BTreeMap<String, ContainerAgg> = BTreeMap::new();
     let mut leaves: Vec<BrainNode> = Vec::new();
     let mut failures = 0usize;
+    // Graphe vivant : dernier état provisoire émis (None = jamais → émettre dès la 1re conv).
+    let mut last_partial: Option<std::time::Instant> = None;
 
     let mut cache: HashMap<String, Extraction> =
         cache_path.map(load_cache).unwrap_or_default();
@@ -343,6 +346,7 @@ pub fn generate_brain(
             community: 0,
             parent_id: Some(format!("p:{parent_key}")),
             synthesized_at: None,
+            date: if date.is_empty() { None } else { Some(date.clone()) },
             content: String::new(),
             connector: Some(conv.summary.source.clone()),
             source_id: Some(conv.summary.id.clone()),
@@ -355,6 +359,14 @@ pub fn generate_brain(
                 condense(conv)
             },
         });
+
+        // Graphe vivant : émet l'état provisoire pour l'UI. Throttlé à 300 ms —
+        // build_graph clone les feuilles (source_text compris), pas à chaque conv.
+        if last_partial.map_or(true, |t| t.elapsed().as_millis() >= 300) {
+            let (n, e) = build_graph(&containers, &leaves);
+            on_partial(&n, &e);
+            last_partial = Some(std::time::Instant::now());
+        }
     }
 
     if containers.is_empty() && leaves.is_empty() {
@@ -425,6 +437,7 @@ fn build_graph(
         community: 0,
         parent_id: None,
         synthesized_at: None,
+        date: None,
         content: String::new(),
         connector: None,
         source_id: None,
@@ -446,6 +459,7 @@ fn build_graph(
             community: 0,
             parent_id: Some(c.parent_id.clone()),
             synthesized_at: None,
+            date: None,
             content: String::new(),
             connector: None,
             source_id: None,

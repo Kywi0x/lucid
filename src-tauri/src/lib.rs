@@ -27,7 +27,7 @@ pub fn run_pipeline_demo(limit: usize) -> Result<BrainGraph, String> {
     let cache_path = ai::llama::app_data_dir().map(|d| d.join("brain_cache.json"));
     let graph = pipeline::generate_brain(engine.as_ref(), &convs, cache_path.as_deref(), |p| {
         eprintln!("[{}/{}] {}", p.current, p.total, p.label);
-    }, |_, _, _| {})?;
+    }, |_, _, _| {}, |_, _| {})?;
     if let Some(dir) = ai::llama::app_data_dir() {
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join("brain.md"), &graph.markdown);
@@ -162,6 +162,18 @@ fn load_conversation(project_slug: String, id: String, source: Option<String>) -
 #[tauri::command]
 fn claude_code_available() -> bool {
     connectors::claude_code::projects_dir().is_some()
+}
+
+/// Déconnecte Claude Code (flag local, réversible).
+#[tauri::command]
+fn claude_code_disconnect() {
+    connectors::claude_code::disconnect();
+}
+
+/// Reconnecte Claude Code (supprime le flag).
+#[tauri::command]
+fn claude_code_reconnect() {
+    connectors::claude_code::reconnect();
 }
 
 /// Indique si l'IA locale est prête (binaire llama.cpp + modèle présents).
@@ -783,6 +795,7 @@ fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, lab
         community: 0,
         parent_id: Some(parent_id.clone()),
         synthesized_at: None,
+        date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
         content,
         connector: source.as_ref().map(|(c, _)| c.to_string()),
         source_id: source.map(|(_, sid)| sid),
@@ -1269,6 +1282,7 @@ concis) et \"children\" (liste de sous-pages, même format, 2 niveaux maximum, \
                 community: 0,
                 parent_id: Some(parent.to_string()),
                 synthesized_at: None,
+                date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
                 content: spec.content.clone(),
                 connector: None,
                 source_id: None,
@@ -1600,7 +1614,10 @@ fn add_node_to_space(space_id: String, node_id: String) -> Result<(), String> {
     let mut spaces = load_spaces(&dir);
     let space = spaces.iter_mut().find(|s| s.id == space_id).ok_or("Espace introuvable.")?;
     let ids = space.node_ids.get_or_insert_with(Vec::new);
-    if !ids.contains(&node_id) { ids.push(node_id); }
+    // Un conteneur emmène toute sa descendance dans le space.
+    for id in subtree_ids(&dir, &node_id) {
+        if !ids.contains(&id) { ids.push(id); }
+    }
     save_spaces(&dir, &spaces);
     Ok(())
 }
@@ -1610,9 +1627,35 @@ fn remove_node_from_space(space_id: String, node_id: String) -> Result<(), Strin
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
     let mut spaces = load_spaces(&dir);
     let space = spaces.iter_mut().find(|s| s.id == space_id).ok_or("Espace introuvable.")?;
-    if let Some(ids) = &mut space.node_ids { ids.retain(|id| id != &node_id); }
+    if let Some(ids) = &mut space.node_ids {
+        let sub: std::collections::HashSet<String> = subtree_ids(&dir, &node_id).into_iter().collect();
+        ids.retain(|id| !sub.contains(id));
+    }
     save_spaces(&dir, &spaces);
     Ok(())
+}
+
+/// Ids du sous-arbre de `node_id` (lui inclus) d'après brain.json.
+/// brain.json illisible → juste le nœud (dégradé, pas d'échec).
+fn subtree_ids(dir: &std::path::Path, node_id: &str) -> Vec<String> {
+    let graph: Option<BrainGraph> = std::fs::read_to_string(dir.join("brain.json")).ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let Some(graph) = graph else { return vec![node_id.to_string()]; };
+    let mut kids: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for n in &graph.nodes {
+        if let Some(p) = &n.parent_id {
+            kids.entry(p.as_str()).or_default().push(n.id.as_str());
+        }
+    }
+    let mut out = vec![node_id.to_string()];
+    let mut q = vec![node_id];
+    while let Some(id) = q.pop() {
+        for c in kids.get(id).into_iter().flatten() {
+            out.push(c.to_string());
+            q.push(c);
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -1657,7 +1700,7 @@ fn demo_leaf(id: &str, parent: &str, label: &str, content: &str) -> BrainNode {
         // pourra tester la vraie synthèse manuelle sur ces pages.
         summary: String::new(),
         keywords: vec![], decisions: vec![], patterns: vec![], community: 1,
-        parent_id: Some(parent.into()), synthesized_at: None, content: content.into(),
+        parent_id: Some(parent.into()), synthesized_at: None, date: None, content: content.into(),
         connector: None, source_id: None, source_project: None, source_text: String::new(),
     }
 }
@@ -1669,7 +1712,7 @@ fn seed_demo() -> Result<BrainGraph, String> {
     let container = |id: &str, label: &str, weight: usize| BrainNode {
         id: id.into(), label: label.into(), kind: "container".into(), weight,
         summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
-        community: 1, parent_id: Some("root".into()), synthesized_at: None,
+        community: 1, parent_id: Some("root".into()), synthesized_at: None, date: None,
         content: String::new(), connector: None, source_id: None, source_project: None, source_text: String::new(),
     };
 
@@ -1678,7 +1721,7 @@ fn seed_demo() -> Result<BrainGraph, String> {
             id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 8,
             summary: "Contenu d'exemple — remplacé par tes vraies données au premier sync.".into(),
             keywords: vec![], decisions: vec![],
-            patterns: vec![], community: 0, parent_id: None, synthesized_at: None,
+            patterns: vec![], community: 0, parent_id: None, synthesized_at: None, date: None,
             content: String::new(), connector: None, source_id: None, source_project: None, source_text: String::new(),
         },
         container("demo-guide", "Prise en main", 2),
@@ -1825,10 +1868,24 @@ fn reset_demo() -> Result<(), String> {
     Ok(())
 }
 
+/// Une seule génération à la fois (bouton Générer vs watch auto).
+/// ponytail: lock global — suffisant tant qu'il n'y a qu'un cerveau par machine.
+static GEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Lance le pipeline IA : analyse toutes les conversations et construit le graphe.
 #[tauri::command]
 async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _gen = GEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        run_generation(&app)
+    })
+    .await
+    .map_err(|e| format!("Tâche d'analyse interrompue : {e}"))?
+}
+
+/// Cœur bloquant de la génération (commande Tauri + watch auto).
+fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
+    {
         // Sans IA locale la génération marche quand même (structure + texte source).
         let engine = LlamaEngine::detect().ok();
         let convs = load_all_conversations();
@@ -1891,6 +1948,16 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
                     serde_json::json!({ "label": label, "index": idx, "total": total }),
                 );
             },
+            |nodes, edges| {
+                // Graphe vivant : version allégée (sans source_text/content, trop
+                // lourds pour l'IPC répété) — juste de quoi dessiner les bulles.
+                let slim: Vec<serde_json::Value> = nodes.iter().map(|n| serde_json::json!({
+                    "id": n.id, "label": n.label, "kind": n.kind, "weight": n.weight,
+                    "summary": n.summary, "keywords": [], "decisions": [], "patterns": [],
+                    "community": n.community, "parent_id": n.parent_id,
+                })).collect();
+                let _ = app.emit("brain-partial", serde_json::json!({ "nodes": slim, "edges": edges }));
+            },
         )?;
 
         // Réinjecte le contenu utilisateur sur les nœuds correspondants
@@ -1928,9 +1995,7 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
             }
         }
         Ok(graph)
-    })
-    .await
-    .map_err(|e| format!("Tâche d'analyse interrompue : {e}"))?
+    }
 }
 
 /// Configure le vault Obsidian (chemin local).
@@ -2011,16 +2076,63 @@ fn parse_env(content: &str) {
     }
 }
 
+/// Watch auto : surveille `~/.claude/projects/` et régénère le cerveau tout seul
+/// quand une session Claude Code change. Cross-platform (crate notify).
+fn start_watcher(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use notify::Watcher;
+        // Attend que le dossier existe (1er lancement : connecteur pas encore actif).
+        let dir = loop {
+            if let Some(d) = connectors::claude_code::projects_dir() { break d; }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(ev) = res {
+                // Seules les sessions (*.jsonl) déclenchent une régénération.
+                if ev.paths.iter().any(|p| p.extension().is_some_and(|e| e == "jsonl")) {
+                    let _ = tx.send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => { eprintln!("⚠️ watch auto indisponible : {e}"); return; }
+        };
+        if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::Recursive) {
+            eprintln!("⚠️ watch auto indisponible : {e}");
+            return;
+        }
+        while rx.recv().is_ok() {
+            // Debounce : une session claude écrit en continu → attendre l'accalmie.
+            while rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok() {}
+            // Connecteur coupé, pas encore de cerveau, ou contenu démo → on ne touche à rien.
+            if connectors::claude_code::projects_dir().is_none() { continue; }
+            let Some(data) = ai::llama::app_data_dir() else { continue; };
+            if !data.join("brain.json").exists() || data.join("demo.flag").exists() { continue; }
+            // Une génération manuelle tourne → skip, le prochain event relancera.
+            let Ok(_gen) = GEN_LOCK.try_lock() else { continue; };
+            match run_generation(&app) {
+                Ok(_) => { let _ = app.emit("brain-updated", ()); }
+                Err(e) => eprintln!("⚠️ watch auto : régénération échouée : {e}"),
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_env_local();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| { start_watcher(app.handle().clone()); Ok(()) })
         .invoke_handler(tauri::generate_handler![
             list_conversations,
             load_conversation,
             claude_code_available,
+            claude_code_disconnect,
+            claude_code_reconnect,
             ai_ready,
             connectors_status,
             import_claude_ai,
@@ -2097,7 +2209,7 @@ mod ask_tests {
             BrainNode {
                 id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 3,
                 summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
-                community: 0, parent_id: None, synthesized_at: None, content: String::new(),
+                community: 0, parent_id: None, synthesized_at: None, date: None, content: String::new(),
                 connector: None, source_id: None, source_project: None, source_text: String::new(),
             },
             demo_leaf("p1", "root", "Notes Jaon", "Réunion avec Jaon sur le projet."),

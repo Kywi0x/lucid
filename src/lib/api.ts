@@ -59,6 +59,16 @@ export function connectorsStatus(): Promise<ConnectorStatus[]> {
   return invoke("connectors_status");
 }
 
+/** Déconnecte Claude Code (flag local, réversible). */
+export function claudeCodeDisconnect(): Promise<void> {
+  return invoke("claude_code_disconnect");
+}
+
+/** Reconnecte Claude Code (supprime le flag). */
+export function claudeCodeReconnect(): Promise<void> {
+  return invoke("claude_code_reconnect");
+}
+
 /** Importe un export ZIP claude.ai. Renvoie le nb de conversations importées. */
 export function importClaudeAi(path: string): Promise<number> {
   return invoke("import_claude_ai", { path });

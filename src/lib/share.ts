@@ -1,0 +1,88 @@
+import { supabase } from "./supabase";
+import type { BrainGraph, Space } from "./types";
+
+export interface ShareState {
+  id: string;
+  visibility: "public" | "private";
+  allowed_emails: string[];
+}
+
+export interface ShareOptions {
+  visibility: "public" | "private";
+  /** Emails invités (mode privé) — normalisés en minuscules. */
+  allowedEmails: string[];
+}
+
+function shareUrl(id: string): string {
+  const base = import.meta.env.VITE_SHARE_URL as string | undefined;
+  return base ? `${base.replace(/\/+$/, "")}/?id=${id}` : id;
+}
+
+async function uid(): Promise<string> {
+  if (!supabase) throw new Error("Supabase non configuré (.env).");
+  const { data } = await supabase.auth.getSession();
+  const id = data.session?.user.id;
+  if (!id) throw new Error("Connecte-toi pour publier.");
+  return id;
+}
+
+/** État de partage actuel du space (null = jamais publié). */
+export async function fetchShareState(space: Space): Promise<(ShareState & { url: string }) | null> {
+  const owner = await uid();
+  const { data, error } = await supabase!
+    .from("shared_spaces")
+    .select("id, visibility, allowed_emails")
+    .eq("owner", owner)
+    .eq("title", space.name)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data ? { ...(data as ShareState), url: shareUrl(data.id) } : null;
+}
+
+/** Publie (ou met à jour) un space. N'embarque QUE l'essentiel : labels,
+ *  résumés, contenus édités — jamais les `source_text` ni la provenance. */
+export async function publishSpace(
+  space: Space,
+  subgraph: BrainGraph,
+  opts: ShareOptions,
+): Promise<ShareState & { url: string }> {
+  const owner = await uid();
+  const payload = {
+    title: space.name,
+    nodes: subgraph.nodes.map((n) => ({
+      id: n.id, label: n.label, kind: n.kind, weight: n.weight,
+      summary: n.summary, keywords: n.keywords, parent_id: n.parent_id ?? null,
+      date: n.date ?? null, content: n.content ?? "",
+    })),
+    edges: subgraph.edges.filter((e) => e.kind === "contains" || e.kind === "link"),
+  };
+
+  const { data, error } = await supabase!
+    .from("shared_spaces")
+    .upsert(
+      {
+        owner,
+        title: space.name,
+        data: payload,
+        visibility: opts.visibility,
+        allowed_emails: opts.allowedEmails.map((e) => e.trim().toLowerCase()).filter(Boolean),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "owner,title" },
+    )
+    .select("id, visibility, allowed_emails")
+    .single();
+  if (error) throw new Error(error.message);
+  return { ...(data as ShareState), url: shareUrl(data.id) };
+}
+
+/** Retire le space du web (supprime la ligne — le lien meurt). */
+export async function unpublishSpace(space: Space): Promise<void> {
+  const owner = await uid();
+  const { error } = await supabase!
+    .from("shared_spaces")
+    .delete()
+    .eq("owner", owner)
+    .eq("title", space.name);
+  if (error) throw new Error(error.message);
+}
