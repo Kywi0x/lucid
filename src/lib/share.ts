@@ -76,6 +76,47 @@ export async function publishSpace(
   return { ...(data as ShareState), url: shareUrl(data.id) };
 }
 
+export interface SharedWithMe {
+  id: string;
+  title: string;
+  updated_at: string;
+}
+
+/** Spaces que d'autres ont partagés avec moi (mon email dans allowed_emails). */
+export async function fetchSharedWithMe(): Promise<SharedWithMe[]> {
+  if (!supabase) return [];
+  const { data: sess } = await supabase.auth.getSession();
+  const email = sess.session?.user.email?.toLowerCase();
+  const me = sess.session?.user.id;
+  if (!email || !me) return [];
+  const { data, error } = await supabase
+    .from("shared_spaces")
+    .select("id, title, updated_at")
+    .contains("allowed_emails", [email])
+    .neq("owner", me)
+    .order("updated_at", { ascending: false });
+  if (error) throw new Error(error.message);
+  return (data ?? []) as SharedWithMe[];
+}
+
+/** Charge le contenu d'un space partagé (le RLS vérifie l'accès). */
+export async function fetchSharedSpace(id: string): Promise<{ title: string; updated_at: string; data: never }> {
+  if (!supabase) throw new Error("Supabase non configuré.");
+  const { data, error } = await supabase
+    .from("shared_spaces")
+    .select("title, data, updated_at")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error("Ce space n'est plus partagé avec toi.");
+  return data as { title: string; updated_at: string; data: never };
+}
+
+/** URL navigateur d'un space partagé. */
+export function sharedSpaceUrl(id: string): string {
+  return shareUrl(id);
+}
+
 /** Retire le space du web (supprime la ligne — le lien meurt). */
 export async function unpublishSpace(space: Space): Promise<void> {
   const owner = await uid();

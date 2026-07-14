@@ -35,6 +35,8 @@ export function SpacesPanel({
   onSpaceSelect,
   onSpaceCreate,
   onSpaceShare,
+  sharedWithMe = [],
+  onOpenShared,
   onClose,
 }: {
   spaces: Space[];
@@ -43,6 +45,9 @@ export function SpacesPanel({
   onSpaceCreate: (name: string) => Promise<void>;
   /** Ouvre la modale de partage du space (public / privé sur invitation). */
   onSpaceShare?: (space: Space) => void;
+  /** Spaces que d'autres ont partagés avec moi (lecture seule). */
+  sharedWithMe?: { id: string; title: string }[];
+  onOpenShared?: (id: string) => void;
   onClose?: () => void;
 }) {
   const all = [LUCID_SPACE, ...spaces.filter((s) => s.id !== "lucid")];
@@ -112,6 +117,26 @@ export function SpacesPanel({
             <Plus className="size-3.5" />
             Nouveau space
           </button>
+        )}
+        {sharedWithMe.length > 0 && (
+          <div className="pt-3">
+            <p className="mb-1.5 px-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+              Partagés avec moi ({sharedWithMe.length})
+            </p>
+            {sharedWithMe.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => onOpenShared?.(s.id)}
+                className="flex w-full items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--color-surface-2)]"
+              >
+                <Share2 className="size-3 shrink-0 text-[var(--color-muted)]" />
+                <span className="flex-1 truncate text-xs font-medium text-[var(--color-text)]">{s.title}</span>
+                <span className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-[var(--color-muted)]">
+                  invité
+                </span>
+              </button>
+            ))}
+          </div>
         )}
         <p className="px-1 pt-2 text-[11px] leading-relaxed text-[var(--color-muted)]">
           Renommer ou supprimer : Paramètres → Spaces.

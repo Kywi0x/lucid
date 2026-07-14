@@ -54,6 +54,8 @@ import {
 } from "@/lib/api";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { ShareModal } from "@/components/ShareModal";
+import { RemoteSpaceView } from "@/components/RemoteSpaceView";
+import { fetchSharedWithMe, type SharedWithMe } from "@/lib/share";
 import type { McpProposal, SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
 import type {
@@ -363,6 +365,13 @@ function App() {
 
   // Modale de partage (public / privé sur invitation).
   const [shareSpace, setShareSpace] = useState<Space | null>(null);
+  // Spaces partagés avec moi (invité) + celui ouvert en lecture seule.
+  const [sharedWithMe, setSharedWithMe] = useState<SharedWithMe[]>([]);
+  const [remoteSpaceId, setRemoteSpaceId] = useState<string | null>(null);
+  useEffect(() => {
+    if (leftPanel !== "spaces") return;
+    fetchSharedWithMe().then(setSharedWithMe).catch(() => {});
+  }, [leftPanel]);
 
   async function handleSpaceRename(id: string, name: string) {
     await renameSpace(id, name);
@@ -698,6 +707,8 @@ function App() {
                   onSpaceSelect={setActiveSpaceId}
                   onSpaceCreate={handleSpaceCreate}
                   onSpaceShare={setShareSpace}
+                  sharedWithMe={sharedWithMe}
+                  onOpenShared={(id) => { setRemoteSpaceId(id); setLeftPanel(null); }}
                   onClose={() => setLeftPanel(null)}
                 />
               ) : (
@@ -994,6 +1005,11 @@ function App() {
               </button>
               <ThemeToggle />
             </div>
+          )}
+
+          {/* ── Space partagé avec moi, ouvert en lecture seule ── */}
+          {remoteSpaceId && (
+            <RemoteSpaceView spaceId={remoteSpaceId} onClose={() => setRemoteSpaceId(null)} />
           )}
 
           {/* ── Modale Partage de space ── */}

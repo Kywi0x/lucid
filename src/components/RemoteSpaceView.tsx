@@ -1,0 +1,107 @@
+import { useEffect, useState } from "react";
+import { ArrowLeft, Check, Copy, Eye, Loader2 } from "lucide-react";
+import { BrainMap } from "@/components/BrainMap";
+import { ReadOnlyDetail } from "@/components/ReadOnlyDetail";
+import { fetchSharedSpace, sharedSpaceUrl } from "@/lib/share";
+import { payloadToGraph } from "@/lib/shared-space";
+import type { BrainGraph, BrainNode } from "@/lib/types";
+import { cn, copyText } from "@/lib/utils";
+
+/** Un space partagé avec moi, ouvert DANS l'app — lecture seule (v1) :
+ *  même constellation, même panneau que le viewer web. */
+export function RemoteSpaceView({ spaceId, onClose }: { spaceId: string; onClose: () => void }) {
+  const [graph, setGraph] = useState<BrainGraph | null>(null);
+  const [title, setTitle] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<BrainNode | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    fetchSharedSpace(spaceId)
+      .then((row) => { setTitle(row.title); setGraph(payloadToGraph(row.data)); })
+      .catch((e) => setError(String(e instanceof Error ? e.message : e)));
+  }, [spaceId]);
+
+  async function copyLink() {
+    if (await copyText(sharedSpaceUrl(spaceId))) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  }
+
+  return (
+    <div className="absolute inset-0 z-40 bg-[var(--color-bg)] text-[var(--color-text)]">
+      {error ? (
+        <div className="flex h-full items-center justify-center px-6">
+          <div className="text-center">
+            <p className="text-sm text-[var(--color-muted)]">{error}</p>
+            <button onClick={onClose} className="mt-4 rounded-lg border border-[var(--color-border)] px-3 py-2 text-xs hover:bg-[var(--color-surface-2)]">
+              Retour à mon cerveau
+            </button>
+          </div>
+        </div>
+      ) : !graph ? (
+        <div className="flex h-full items-center justify-center">
+          <Loader2 className="size-6 animate-spin text-[var(--color-muted)]" />
+        </div>
+      ) : (
+        <>
+          <BrainMap
+            graph={graph}
+            onSelect={setSelected}
+            selectedId={selected?.id ?? null}
+            query=""
+            onBackgroundClick={() => setSelected(null)}
+            panelOffset={selected && !expanded ? 480 : 0}
+            focus={selected ? { id: selected.id, k: 1 } : null}
+          />
+
+          {/* Bandeau : retour + titre + lecture seule + lien navigateur */}
+          <div className="absolute left-3 top-3 z-20 flex items-center gap-2 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)]/85 py-1.5 pl-1.5 pr-3 shadow-[var(--shadow-float)] backdrop-blur-md">
+            <button
+              onClick={onClose}
+              title="Retour à mon cerveau"
+              className="flex size-7 items-center justify-center rounded-full text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
+            >
+              <ArrowLeft className="size-4" />
+            </button>
+            <p className="max-w-[240px] truncate text-sm font-semibold">{title}</p>
+            <span className="flex items-center gap-1 rounded-full bg-[var(--color-accent-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+              <Eye className="size-3" /> Lecture seule
+            </span>
+            <button
+              onClick={copyLink}
+              title="Copier le lien navigateur"
+              className={cn(
+                "flex size-7 items-center justify-center rounded-full transition-colors",
+                copied ? "text-[var(--color-ok)]" : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
+              )}
+            >
+              {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            </button>
+          </div>
+
+          {selected && (
+            <div
+              className={cn(
+                "panel absolute z-30 overflow-hidden rounded-xl",
+                expanded ? "inset-3" : "bottom-3 right-3 top-3 w-[480px] max-w-[calc(100vw-24px)] animate-slideInRight",
+              )}
+            >
+              <ReadOnlyDetail
+                key={selected.id}
+                node={selected}
+                graph={graph}
+                onSelect={setSelected}
+                onClose={() => { setSelected(null); setExpanded(false); }}
+                expanded={expanded}
+                onExpand={() => setExpanded((v) => !v)}
+              />
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
