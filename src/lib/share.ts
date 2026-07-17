@@ -11,11 +11,37 @@ export interface ShareOptions {
   visibility: "public" | "private";
   /** Emails invités (mode privé) — normalisés en minuscules. */
   allowedEmails: string[];
+  /** Opt-in explicite : embarquer le texte des sources (fichiers, conversations)
+   *  dans le space publié — sinon seuls titres/résumés/notes éditées sortent. */
+  includeSources?: boolean;
 }
 
 function shareUrl(id: string): string {
   const base = import.meta.env.VITE_SHARE_URL as string | undefined;
   return base ? `${base.replace(/\/+$/, "")}/?id=${id}` : id;
+}
+
+/** URL du connecteur MCP distant — construite sur le TOKEN MCP (capability
+ *  séparée du lien de partage : le lien public ne donne pas accès au MCP). */
+export function mcpUrl(token: string): string | null {
+  const base = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+  return base ? `${base.replace(/\/+$/, "")}/functions/v1/lucid-mcp?token=${token}` : null;
+}
+
+/** Récupère (ou crée) le token MCP d'un space publié. Nul si la table n'existe
+ *  pas encore (SQL pas appliqué) — l'UI masque alors la ligne MCP. */
+export async function ensureMcpToken(spaceRowId: string): Promise<string | null> {
+  try {
+    const { data } = await supabase!
+      .from("space_mcp_tokens").select("token").eq("space_id", spaceRowId).maybeSingle();
+    if (data?.token) return data.token as string;
+    const { data: created, error } = await supabase!
+      .from("space_mcp_tokens").insert({ space_id: spaceRowId }).select("token").single();
+    if (error) return null;
+    return created.token as string;
+  } catch {
+    return null;
+  }
 }
 
 async function uid(): Promise<string> {
@@ -39,8 +65,9 @@ export async function fetchShareState(space: Space): Promise<(ShareState & { url
   return data ? { ...(data as ShareState), url: shareUrl(data.id) } : null;
 }
 
-/** Publie (ou met à jour) un space. N'embarque QUE l'essentiel : labels,
- *  résumés, contenus édités — jamais les `source_text` ni la provenance. */
+/** Publie (ou met à jour) un space. Par défaut n'embarque QUE l'essentiel :
+ *  labels, résumés, contenus édités. Le texte des sources ne sort que sur
+ *  opt-in explicite (`includeSources`) — jamais la provenance. */
 export async function publishSpace(
   space: Space,
   subgraph: BrainGraph,
@@ -52,7 +79,8 @@ export async function publishSpace(
     nodes: subgraph.nodes.map((n) => ({
       id: n.id, label: n.label, kind: n.kind, weight: n.weight,
       summary: n.summary, keywords: n.keywords, parent_id: n.parent_id ?? null,
-      date: n.date ?? null, content: n.content ?? "",
+      date: n.date ?? null,
+      content: n.content || (opts.includeSources ? n.source_text ?? "" : ""),
     })),
     edges: subgraph.edges.filter((e) => e.kind === "contains" || e.kind === "link"),
   };

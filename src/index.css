@@ -24,6 +24,7 @@
   --canvas-label: rgba(55, 65, 90, 0.85);
   --canvas-label-dim: rgba(55, 65, 90, 0.45);
   --canvas-sel: rgba(27, 33, 48, 0.85);
+  --neural-halo: rgba(255, 255, 255, 0.9);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -47,6 +48,7 @@
     --canvas-label: rgba(212, 218, 230, 0.72);
     --canvas-label-dim: rgba(212, 218, 230, 0.38);
     --canvas-sel: rgba(255, 255, 255, 0.85);
+    --neural-halo: rgba(34, 40, 58, 0.55);
   }
 }
 
@@ -70,6 +72,7 @@
   --canvas-label: rgba(212, 218, 230, 0.72);
   --canvas-label-dim: rgba(212, 218, 230, 0.38);
   --canvas-sel: rgba(255, 255, 255, 0.85);
+  --neural-halo: rgba(34, 40, 58, 0.55);
 }
 
 * {
@@ -119,6 +122,25 @@ body {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   box-shadow: var(--shadow-float);
+}
+
+/* ── Constellation décorative (login / onboarding) ── */
+.lucid-orb {
+  animation: lucid-breathe 4.2s ease-in-out infinite;
+}
+@keyframes lucid-breathe {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+.lucid-rise {
+  animation: lucid-rise 0.5s ease-out both;
+}
+@keyframes lucid-rise {
+  from { opacity: 0; translate: 0 10px; }
+  to { opacity: 1; translate: 0 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lucid-orb, .lucid-rise { animation: none; }
 }
 
 /* Bulle : animation de survol */

@@ -238,13 +238,45 @@ export function importFile(path: string, parentId: string): Promise<import("./ty
 
 /** Exporte le cerveau en zip (octets) pour la sauvegarde cloud (~2 Mo, hors modèles). */
 export async function exportBackup(): Promise<Uint8Array> {
-  const bytes: number[] = await invoke("export_backup");
+  // Réponse IPC brute (ArrayBuffer) — jamais de tableau JSON pour des octets.
+  const bytes: ArrayBuffer = await invoke("export_backup");
   return new Uint8Array(bytes);
 }
 
 /** Restaure une sauvegarde zip dans le dossier de données. Renvoie le nombre de fichiers. */
 export function importBackup(bytes: Uint8Array): Promise<number> {
-  return invoke("import_backup", { bytes: Array.from(bytes) });
+  return invoke("import_backup", bytes); // payload IPC brut, même raison
+}
+
+/** Supprime un nœud et sa descendance (snapshot pris avant). Renvoie le nombre supprimé. */
+export function deleteNode(nodeId: string): Promise<number> {
+  return invoke("delete_node", { nodeId });
+}
+
+/** Empreinte (mtime max) des données locales — la sync cloud pousse quand elle change. */
+export function syncFingerprint(): Promise<number> {
+  return invoke("sync_fingerprint");
+}
+
+/** Reset complet (dev) : vide le dossier de données sauf l'IA locale (modèles gardés). */
+export function resetEnvironment(): Promise<void> {
+  return invoke("reset_environment");
+}
+
+/** Rapports de crash (Sentry) — opt-in, effet au redémarrage de l'app. */
+export function telemetryEnabled(): Promise<boolean> {
+  return invoke("telemetry_enabled");
+}
+export function setTelemetry(enabled: boolean): Promise<void> {
+  return invoke("set_telemetry", { enabled });
+}
+/** Sentry est-il réellement initialisé ce démarrage ? (consentement + DSN présents au boot) */
+export function sentryActive(): Promise<boolean> {
+  return invoke("sentry_active");
+}
+/** Panic Rust volontaire (dev) pour tester la chaîne Sentry. */
+export function crashTest(): Promise<void> {
+  return invoke("crash_test");
 }
 
 /** Statut des clients IA installés (Claude Desktop/Code, Cursor) vis-à-vis du MCP Lucid. */
@@ -275,9 +307,20 @@ export function listMcpProposals(): Promise<import("./types").McpProposal[]> {
 }
 
 /** Accepte (insère, ancêtres d'abord) ou refuse (supprime, descendants compris)
- *  une proposition MCP. Renvoie le nombre de propositions traitées. */
-export function resolveMcpProposal(id: string, accept: boolean): Promise<number> {
+ *  une proposition MCP. Renvoie les ids résolus (toute la chaîne). */
+export function resolveMcpProposal(id: string, accept: boolean): Promise<string[]> {
   return invoke("resolve_mcp_proposal", { id, accept });
+}
+
+/** Rapatrie une proposition MCP distante dans le circuit local de validation. */
+export function importMcpProposal(id: string, parentId: string, label: string, content: string): Promise<void> {
+  return invoke("import_mcp_proposal", { id, parentId, label, content });
+}
+
+/** Fork V1 : copie un space partagé (payload publié) comme nouveau projet dans
+ *  MON cerveau (ids re-mintés, provenance `fork`). Renvoie le projet créé. */
+export function importSharedSpace(payload: unknown, spaceId: string): Promise<import("./types").BrainNode> {
+  return invoke("import_shared_space", { payload, spaceId });
 }
 
 /** Déplace un nœud sous un nouveau parent (refuse les cycles). */

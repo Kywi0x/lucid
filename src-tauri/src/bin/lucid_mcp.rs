@@ -36,15 +36,31 @@ struct Node {
     decisions: Vec<String>,
     #[serde(default)]
     content: String,
+    /// Texte source embarqué par le pipeline (souvent le seul rempli : `content`
+    /// n'existe que pour les notes éditées dans Lucid).
+    #[serde(default)]
+    source_text: String,
     #[serde(default)]
     parent_id: Option<String>,
 }
 
+/// Le corps lisible d'un nœud : la note éditée si elle existe, sinon le texte source.
+fn body_of(n: &Node) -> &str {
+    if n.content.is_empty() { &n.source_text } else { &n.content }
+}
+
+/// Même résolution que `ai::llama::app_data_dir` : `users/<uuid>/` si un compte
+/// est connecté dans Lucid (fichier `active_user`), racine sinon (install legacy).
+fn data_dir() -> Result<std::path::PathBuf, String> {
+    let root = dirs::data_dir().ok_or("dossier de données introuvable")?.join(APP_DIR);
+    Ok(match std::fs::read_to_string(root.join("active_user")) {
+        Ok(id) if !id.trim().is_empty() => root.join("users").join(id.trim()),
+        _ => root,
+    })
+}
+
 fn load_graph() -> Result<Graph, String> {
-    let path = dirs::data_dir()
-        .ok_or("dossier de données introuvable")?
-        .join(APP_DIR)
-        .join("brain.json");
+    let path = data_dir()?.join("brain.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("brain.json illisible ({}) : {e}. Génère d'abord le cerveau dans Lucid.", path.display()))?;
     serde_json::from_str(&raw).map_err(|e| format!("brain.json invalide : {e}"))
@@ -104,7 +120,7 @@ fn tool_search(query: &str) -> Result<String, String> {
         let label = n.label.to_lowercase();
         let kw = n.keywords.join(" ").to_lowercase();
         let summary = n.summary.to_lowercase();
-        let content = n.content.to_lowercase();
+        let content = body_of(n).to_lowercase();
         let mut score = 0i64;
         for t in &terms {
             if label.contains(t) { score += 5; }
@@ -126,7 +142,7 @@ fn tool_search(query: &str) -> Result<String, String> {
             "\n- **{}** (`{}`, {}) — {}\n  {}\n",
             n.label, n.id, n.kind,
             if path.is_empty() { "racine".to_string() } else { path },
-            truncate(if n.summary.is_empty() { &n.content } else { &n.summary }, 200).replace('\n', " "),
+            truncate(if n.summary.is_empty() { body_of(n) } else { &n.summary }, 200).replace('\n', " "),
         ));
         let _ = score;
     }
@@ -147,7 +163,11 @@ fn tool_node(node_id: &str) -> Result<String, String> {
         for d in &n.decisions { out.push_str(&format!("- {d}\n")); }
     }
     if !n.summary.is_empty() { out.push_str(&format!("\n## Résumé\n{}\n", n.summary)); }
-    if !n.content.is_empty() { out.push_str(&format!("\n## Contenu\n{}\n", truncate(&n.content, 60_000))); }
+    // 24 000 caractères ≈ 6 300 tokens : assez pour travailler, sans exploser le
+    // contexte de l'IA cliente sur un gros PDF. ponytail: plafond fixe — passer
+    // à un paramètre max_chars si un client a besoin du texte intégral.
+    let body = body_of(n);
+    if !body.is_empty() { out.push_str(&format!("\n## Contenu\n{}\n", truncate(body, 24_000))); }
     let children: Vec<&Node> = g.nodes.iter()
         .filter(|c| c.parent_id.as_deref() == Some(n.id.as_str())).collect();
     if !children.is_empty() {
@@ -162,8 +182,7 @@ fn tool_node(node_id: &str) -> Result<String, String> {
 /// L'id renvoyé peut servir de parent_id pour construire un arbre.
 fn tool_add_note(parent_id: &str, label: &str, content: &str) -> Result<String, String> {
     if label.trim().is_empty() { return Err("label vide".into()); }
-    let data_dir = dirs::data_dir().ok_or("dossier de données introuvable")?.join(APP_DIR);
-    let pending_dir = data_dir.join("mcp_pending");
+    let pending_dir = data_dir()?.join("mcp_pending");
     std::fs::create_dir_all(&pending_dir).map_err(|e| e.to_string())?;
 
     // Le parent doit exister dans le graphe… ou être une proposition en attente.

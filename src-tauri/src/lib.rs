@@ -1,6 +1,16 @@
 //! Second Brain — point d'entrée de l'application Tauri.
 //! Expose les commandes appelables depuis le frontend React.
 
+/// Log vers stderr sans paniquer : `crate::elog!` panique si stderr est fermé
+/// (parent mort → Broken pipe), ce qui tuait la génération. Ici on ignore l'échec.
+#[macro_export]
+macro_rules! elog {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod ai;
 mod backup;
 mod connectors;
@@ -26,7 +36,7 @@ pub fn run_pipeline_demo(limit: usize) -> Result<BrainGraph, String> {
     }
     let cache_path = ai::llama::app_data_dir().map(|d| d.join("brain_cache.json"));
     let graph = pipeline::generate_brain(engine.as_ref(), &convs, cache_path.as_deref(), |p| {
-        eprintln!("[{}/{}] {}", p.current, p.total, p.label);
+        crate::elog!("[{}/{}] {}", p.current, p.total, p.label);
     }, |_, _, _| {}, |_, _| {})?;
     if let Some(dir) = ai::llama::app_data_dir() {
         let _ = std::fs::create_dir_all(&dir);
@@ -108,7 +118,7 @@ fn list_models_blocking() -> Vec<ModelInfo> {
     let active_id = ai::llama::active_model_stored().map(|m| m.id);
     let recommended_id = ai::llama::recommended_id(&catalog);
     catalog.into_iter().map(|m| {
-        let downloaded = ai::llama::app_data_dir()
+        let downloaded = ai::llama::shared_data_dir()
             .map(|d| d.join("models").join(&m.file).is_file())
             .unwrap_or(false);
         let active = active_id.as_deref() == Some(m.id.as_str());
@@ -892,7 +902,9 @@ fn load_proposals_in(dir: &std::path::Path) -> Vec<McpProposal> {
 /// Accepte (insère dans brain.json, ancêtres pending d'abord) ou refuse
 /// (supprime, descendants compris) une proposition. Renvoie le nombre de
 /// propositions traitées.
-fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<usize, String> {
+/// Renvoie les ids réellement résolus (la chaîne d'ancêtres acceptés, ou le
+/// sous-arbre refusé) — le front purge ces lignes côté Supabase (MCP distant).
+fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<Vec<String>, String> {
     let props = load_proposals_in(dir);
     let target = props.iter().find(|p| p.id == id)
         .ok_or_else(|| format!("Proposition {id} introuvable."))?;
@@ -911,7 +923,23 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
             std::fs::remove_file(mcp_pending_dir(dir).join(format!("{}.json", p.id)))
                 .map_err(|e| e.to_string())?;
         }
-        Ok(chain.len())
+        // Le nouveau nœud rejoint les spaces qui contiennent son parent : la vue
+        // d'un space ne montre que node_ids + ancêtres, une proposition acceptée
+        // resterait sinon invisible dans le space qu'elle visait.
+        let mut spaces = load_spaces(dir);
+        let mut touched = false;
+        for p in &chain {
+            for s in spaces.iter_mut() {
+                if let Some(ids) = s.node_ids.as_mut() {
+                    if ids.iter().any(|i| i == &p.parent_id) && !ids.contains(&p.id) {
+                        ids.push(p.id.clone());
+                        touched = true;
+                    }
+                }
+            }
+        }
+        if touched { save_spaces(dir, &spaces); }
+        Ok(chain.iter().map(|p| p.id.clone()).collect())
     } else {
         // Refus récursif : les descendants pending tombent avec le parent.
         let mut doomed = vec![id.to_string()];
@@ -927,7 +955,7 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
         for rid in &doomed {
             let _ = std::fs::remove_file(mcp_pending_dir(dir).join(format!("{rid}.json")));
         }
-        Ok(doomed.len())
+        Ok(doomed)
     }
 }
 
@@ -938,26 +966,206 @@ fn list_mcp_proposals() -> Result<Vec<McpProposal>, String> {
     Ok(load_proposals_in(&dir))
 }
 
-/// Accepte ou refuse une proposition MCP.
+/// Rapatrie une proposition MCP DISTANTE (table Supabase) dans le circuit local
+/// `mcp_pending/` — même validation par bulles fantômes que le MCP local.
 #[tauri::command]
-fn resolve_mcp_proposal(id: String, accept: bool) -> Result<usize, String> {
+fn import_mcp_proposal(id: String, parent_id: String, label: String, content: String) -> Result<(), String> {
+    // L'id vient du réseau : charset strict (uuid) contre toute traversée de chemin.
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("id de proposition invalide".into());
+    }
+    if label.trim().is_empty() {
+        return Err("label vide".into());
+    }
+    let dir = ai::llama::app_data_dir()
+        .ok_or("Dossier de données introuvable.")?
+        .join("mcp_pending");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let proposal = serde_json::json!({
+        "id": id,
+        "parent_id": parent_id,
+        "label": label.trim(),
+        "content": content,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(dir.join(format!("{id}.json")), proposal.to_string()).map_err(|e| e.to_string())
+}
+
+/// Fork V1 : copie un space partagé (payload publié) comme nouveau projet sous
+/// la racine de MON cerveau — ids re-mintés (les ids du cerveau source
+/// collisionneraient avec les nôtres), provenance `fork`, un seul write.
+/// Renvoie le nœud projet créé. Spec : coffre « Copier un space partagé (fork) ».
+#[tauri::command]
+fn import_shared_space(payload: serde_json::Value, space_id: String) -> Result<BrainNode, String> {
+    let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("Space importé").to_string();
+    let src = payload.get("nodes").and_then(|v| v.as_array()).ok_or("Payload sans nodes.")?;
+    if src.is_empty() {
+        return Err("Ce space est vide.".into());
+    }
+    if serde_json::to_string(&payload).map(|s| s.len()).unwrap_or(0) > 10_000_000 {
+        return Err("Space trop volumineux (> 10 Mo).".into());
+    }
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let raw = std::fs::read_to_string(dir.join("brain.json"))
+        .map_err(|_| "Ton cerveau n'existe pas encore — termine l'onboarding avant d'importer un space.".to_string())?;
+    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone())
+        .ok_or("Cerveau sans racine.")?;
+
+    // Nom unique sous la racine : « Titre », puis « Titre (copie) », « Titre (copie 2) »…
+    let taken: Vec<String> = graph.nodes.iter()
+        .filter(|n| n.parent_id.as_deref() == Some(root_id.as_str()))
+        .map(|n| n.label.clone())
+        .collect();
+    let mut name = title.clone();
+    if taken.contains(&name) {
+        name = format!("{title} (copie)");
+        let mut k = 2;
+        while taken.contains(&name) { name = format!("{title} (copie {k})"); k += 1; }
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let proj_id = format!("fork-{nanos}");
+
+    // Re-mint des ids ; les nœuds `root` du payload (la racine du cerveau source,
+    // présente car le sous-graphe publié garde les ancêtres) sont sautés — leurs
+    // enfants se rattachent directement au projet créé.
+    let mut remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (i, sn) in src.iter().enumerate() {
+        let old = sn.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        if old.is_empty() || sn.get("kind").and_then(|v| v.as_str()) == Some("root") { continue; }
+        remap.insert(old.to_string(), format!("fork-{nanos}-{i}"));
+    }
+
+    let proj = BrainNode {
+        id: proj_id.clone(),
+        label: name,
+        kind: "group".into(),
+        weight: remap.len(),
+        summary: String::new(),
+        keywords: vec![],
+        decisions: vec![],
+        patterns: vec![],
+        community: 0,
+        parent_id: Some(root_id.clone()),
+        synthesized_at: None,
+        date: Some(today.clone()),
+        content: String::new(),
+        connector: Some("fork".into()),
+        source_id: Some(space_id.clone()),
+        source_project: None,
+        source_text: String::new(),
+    };
+    graph.edges.push(BrainEdge {
+        source: root_id, target: proj_id.clone(), kind: "contains".into(), relation: "contains".into(),
+    });
+    graph.nodes.push(proj.clone());
+
+    for sn in src {
+        let old = sn.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let Some(new_id) = remap.get(old) else { continue; };
+        let parent_new = sn.get("parent_id").and_then(|v| v.as_str())
+            .and_then(|p| remap.get(p)).cloned()
+            .unwrap_or_else(|| proj_id.clone());
+        let str_of = |k: &str| sn.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        graph.edges.push(BrainEdge {
+            source: parent_new.clone(), target: new_id.clone(), kind: "contains".into(), relation: "contains".into(),
+        });
+        graph.nodes.push(BrainNode {
+            id: new_id.clone(),
+            label: { let l = str_of("label"); if l.is_empty() { "Sans titre".into() } else { l } },
+            kind: { let k = str_of("kind"); if k.is_empty() { "note".into() } else { k } },
+            weight: sn.get("weight").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            summary: str_of("summary"),
+            keywords: sn.get("keywords").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            decisions: vec![],
+            patterns: vec![],
+            community: 0,
+            parent_id: Some(parent_new),
+            synthesized_at: None,
+            date: { let d = str_of("date"); Some(if d.is_empty() { today.clone() } else { d }) },
+            content: str_of("content"),
+            connector: Some("fork".into()),
+            // `space:id-d-origine` — la clé d'un futur re-sync (V2 de la spec).
+            source_id: Some(format!("{space_id}:{old}")),
+            source_project: None,
+            source_text: String::new(),
+        });
+    }
+
+    // Ponts wikilinks du payload, remappés des deux côtés (sinon abandonnés).
+    if let Some(edges) = payload.get("edges").and_then(|v| v.as_array()) {
+        for e in edges {
+            if e.get("kind").and_then(|v| v.as_str()) != Some("link") { continue; }
+            let s = e.get("source").and_then(|v| v.as_str()).and_then(|x| remap.get(x));
+            let t = e.get("target").and_then(|v| v.as_str()).and_then(|x| remap.get(x));
+            if let (Some(s), Some(t)) = (s, t) {
+                graph.edges.push(BrainEdge {
+                    source: s.clone(), target: t.clone(), kind: "link".into(), relation: "wikilink".into(),
+                });
+            }
+        }
+    }
+
+    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(proj)
+}
+
+/// Accepte ou refuse une proposition MCP. Renvoie les ids résolus (chaîne).
+#[tauri::command]
+fn resolve_mcp_proposal(id: String, accept: bool) -> Result<Vec<String>, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
     resolve_proposal_in(&dir, &id, accept)
 }
 
-/// Exporte le cerveau en zip (~2 Mo, hors modèles) pour la sauvegarde cloud.
+/// Exporte le cerveau en zip (hors modèles) pour la sauvegarde/sync cloud.
+/// Async + spawn_blocking : une commande sync tournerait sur le main thread et
+/// gèlerait l'UI le temps du zip. Réponse IPC brute (pas de Vec<u8> sérialisé
+/// en tableau JSON — plusieurs Mo d'octets = freeze du webview).
 #[tauri::command]
-fn export_backup() -> Result<Vec<u8>, String> {
-    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    backup::export_in(&dir)
+async fn export_backup() -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(|| {
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.".to_string())?;
+        backup::export_in(&dir)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
-/// Restaure une sauvegarde (zip) dans le dossier de données. Renvoie le nombre
-/// de fichiers restaurés. L'app doit recharger le graphe ensuite.
+/// Restaure une sauvegarde (zip, payload IPC brut) dans le dossier de données.
+/// Renvoie le nombre de fichiers restaurés. L'app doit recharger le graphe ensuite.
 #[tauri::command]
-fn import_backup(bytes: Vec<u8>) -> Result<usize, String> {
-    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    backup::import_in(&dir, &bytes)
+async fn import_backup(request: tauri::ipc::Request<'_>) -> Result<usize, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Payload binaire attendu.".into());
+    };
+    let bytes = bytes.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.".to_string())?;
+        backup::import_in(&dir, &bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Empreinte des données locales (mtime max du périmètre de backup) — le front
+/// pousse la sync cloud quand elle change. Async : appelée toutes les 60 s, le
+/// walk de node_history/snapshots ne doit jamais passer par le main thread.
+#[tauri::command]
+async fn sync_fingerprint() -> u64 {
+    tauri::async_runtime::spawn_blocking(|| {
+        ai::llama::app_data_dir().map(|d| backup::fingerprint_in(&d)).unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Statut des clients IA (Claude Desktop/Code, Cursor) : installés ? connectés au MCP Lucid ?
@@ -1126,7 +1334,7 @@ mod mcp_proposal_tests {
         propose(&dir, "mcp-2", "mcp-1", "Enfant");
         propose(&dir, "mcp-3", "mcp-2", "Petit-enfant");
         // Accepter le petit-enfant doit insérer les 3, parents d'abord.
-        assert_eq!(resolve_proposal_in(&dir, "mcp-3", true).unwrap(), 3);
+        assert_eq!(resolve_proposal_in(&dir, "mcp-3", true).unwrap().len(), 3);
         let ids = graph_ids(&dir);
         assert!(ids.contains(&"mcp-1".into()) && ids.contains(&"mcp-3".into()));
         assert!(load_proposals_in(&dir).is_empty());
@@ -1139,7 +1347,7 @@ mod mcp_proposal_tests {
         propose(&dir, "mcp-1", "root", "Parent");
         propose(&dir, "mcp-2", "mcp-1", "Enfant");
         propose(&dir, "mcp-9", "root", "Autre");
-        assert_eq!(resolve_proposal_in(&dir, "mcp-1", false).unwrap(), 2);
+        assert_eq!(resolve_proposal_in(&dir, "mcp-1", false).unwrap().len(), 2);
         let rest = load_proposals_in(&dir);
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].id, "mcp-9");
@@ -1370,6 +1578,83 @@ fn rename_node(node_id: String, label: String) -> Result<(), String> {
     node.label = if l.is_empty() { "Sans titre".into() } else { l.to_string() };
     std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
+}
+
+// ── Tombstones : une suppression doit survivre aux régénérations ─────────────
+// Le pipeline reconstruit le graphe depuis les sources : sans mémoire des
+// suppressions, tout nœud issu d'un connecteur renaîtrait à la génération
+// suivante. Les ids supprimés (stables : `leaf:<conv>`, `p:<projet>`…) sont
+// donc consignés dans `deleted_nodes.json` (embarqué dans la sync cloud).
+
+fn load_tombstones(dir: &std::path::Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(dir.join("deleted_nodes.json")).ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn add_tombstones(dir: &std::path::Path, ids: &std::collections::HashSet<String>) {
+    let mut all = load_tombstones(dir);
+    all.extend(ids.iter().cloned());
+    if let Ok(json) = serde_json::to_string_pretty(&all) {
+        let _ = std::fs::write(dir.join("deleted_nodes.json"), json);
+    }
+}
+
+#[cfg(test)]
+mod tombstone_tests {
+    use super::*;
+
+    #[test]
+    fn add_cumule_et_load_retrouve_les_ids() {
+        let dir = std::env::temp_dir().join("lucid_test_tombstones");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_tombstones(&dir).is_empty());
+        add_tombstones(&dir, &["leaf:a".to_string()].into_iter().collect());
+        add_tombstones(&dir, &["p:x".to_string(), "leaf:a".to_string()].into_iter().collect());
+        let t = load_tombstones(&dir);
+        assert_eq!(t.len(), 2, "cumul sans doublon : {t:?}");
+        assert!(t.contains("leaf:a") && t.contains("p:x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Supprime un nœud et toute sa descendance (snapshot avant coup, racine
+/// intouchable). Purge aussi les ids morts des spaces. Renvoie le nombre
+/// de nœuds supprimés.
+#[tauri::command]
+fn delete_node(node_id: String) -> Result<usize, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let node = graph.nodes.iter().find(|n| n.id == node_id)
+        .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
+    if node.kind == "root" { return Err("La racine ne peut pas être supprimée.".into()); }
+
+    let doomed: std::collections::HashSet<String> =
+        subtree_ids(&dir, &node_id).into_iter().collect();
+    save_snapshot_in(&dir); // destructif → filet (restaurable via les snapshots)
+    add_tombstones(&dir, &doomed); // la suppression survivra aux régénérations
+    graph.nodes.retain(|n| !doomed.contains(&n.id));
+    graph.edges.retain(|e| !doomed.contains(&e.source) && !doomed.contains(&e.target));
+    std::fs::write(
+        dir.join("brain.json"),
+        serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Les spaces ne doivent pas garder d'ids morts.
+    let mut spaces = load_spaces(&dir);
+    let mut touched = false;
+    for s in spaces.iter_mut() {
+        if let Some(ids) = s.node_ids.as_mut() {
+            let before = ids.len();
+            ids.retain(|id| !doomed.contains(id));
+            touched |= ids.len() != before;
+        }
+    }
+    if touched { save_spaces(&dir, &spaces); }
+    Ok(doomed.len())
 }
 
 /// Re-synthétise un nœud unique à la demande (sources brutes + résumés enfants comme contexte).
@@ -1868,6 +2153,260 @@ fn reset_demo() -> Result<(), String> {
     Ok(())
 }
 
+/// Remet l'environnement à zéro pour rejouer l'onboarding : vide le dossier de
+/// données SAUF l'IA locale (llama.cpp, modèles ~2,3 Go) pour éviter le re-download.
+#[tauri::command]
+fn reset_environment() -> Result<(), String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    const KEEP: [&str; 4] = ["llama.cpp", "models", "model_config.json", "model_catalog.json"];
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if KEEP.iter().any(|k| name == *k) {
+            continue;
+        }
+        let path = entry.path();
+        let res = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        res.map_err(|e| format!("Impossible de supprimer {} : {e}", path.display()))?;
+    }
+    // Claude Code s'auto-détecte via ~/.claude/projects : sans ce flag il
+    // reviendrait « connecté » après reset. On repart déconnecté (réactivable
+    // dans Settings → Connecteurs), comme un utilisateur vierge.
+    let _ = std::fs::write(dir.join("claude_code_disabled"), "");
+    Ok(())
+}
+
+// ── Isolation par compte ──────────────────────────────────────────────────────
+// Les données utilisateur (brain, spaces, connecteurs, tokens) vivent dans
+// `users/<uuid>/` ; les assets machine (modèles, llama.cpp) restent à la racine.
+// Le front appelle cette commande au login (user_id) et au logout (null) AVANT
+// de monter l'app — tous les accès disque passent par `app_data_dir()` qui lit
+// le fichier `active_user`.
+
+/// Fichiers/dossiers de la racine qui appartiennent à la machine, pas au compte.
+const SHARED_ENTRIES: &[&str] = &[
+    "llama.cpp", "models", "model_catalog.json", "model_config.json",
+    "users", "active_user",
+];
+
+/// Renvoie `true` si le compte est neuf sur cette machine (dossier créé à
+/// l'instant, hors migration legacy) — le front relance alors l'onboarding.
+#[tauri::command]
+fn set_active_user(user_id: Option<String>) -> Result<bool, String> {
+    let root = ai::llama::shared_data_dir().ok_or("Dossier de données introuvable.")?;
+    set_active_user_in(&root, user_id)
+}
+
+fn set_active_user_in(root: &std::path::Path, user_id: Option<String>) -> Result<bool, String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let marker = root.join("active_user");
+
+    let Some(id) = user_id.filter(|id| !id.trim().is_empty()) else {
+        // Logout : plus d'utilisateur actif → le MCP et l'app ne voient plus le cerveau.
+        return match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(false),
+        };
+    };
+    // Le uuid vient de Supabase mais sert de nom de dossier : on refuse tout séparateur.
+    let id = id.trim().to_string();
+    if id.contains(['/', '\\', '.']) {
+        return Err("Identifiant utilisateur invalide.".to_string());
+    }
+
+    let user_dir = root.join("users").join(&id);
+
+    // Migration one-shot d'une install legacy : le premier compte qui se connecte
+    // hérite du cerveau existant de la machine (sinon il serait perdu).
+    let legacy = root.join("brain.json").exists() && !root.join("users").exists();
+    let fresh = !user_dir.exists() && !legacy;
+    if legacy && !user_dir.exists() {
+        std::fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(root).map_err(|e| e.to_string())?.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            if SHARED_ENTRIES.iter().any(|s| name == std::ffi::OsStr::new(s)) { continue; }
+            std::fs::rename(entry.path(), user_dir.join(&name))
+                .map_err(|e| format!("Migration de {:?} impossible : {e}", name))?;
+        }
+    }
+
+    std::fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
+    if fresh {
+        // Compte neuf : les sources de la machine ne sont pas aspirées d'office.
+        // Claude Code démarre déconnecté (opt-in dans Connexions) — sinon la
+        // première génération ingère les conversations des autres comptes.
+        let _ = std::fs::write(user_dir.join("claude_code_disabled"), "");
+    }
+    std::fs::write(&marker, &id).map_err(|e| e.to_string())?;
+    Ok(fresh)
+}
+
+#[cfg(test)]
+mod active_user_tests {
+    use super::*;
+
+    fn fresh_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn migre_le_legacy_vers_le_premier_compte_puis_isole_le_second() {
+        let root = fresh_root("lucid_test_active_user");
+        // Install legacy : cerveau + asset machine à la racine.
+        std::fs::write(root.join("brain.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models/m.gguf"), "x").unwrap();
+
+        let fresh = set_active_user_in(&root, Some("user-a".into())).unwrap();
+        assert!(!fresh, "une migration legacy n'est pas un compte neuf");
+        assert!(root.join("users/user-a/brain.json").exists(), "legacy migré vers le 1er compte");
+        assert!(!root.join("brain.json").exists());
+        assert!(root.join("models/m.gguf").exists(), "les assets machine restent partagés");
+        assert!(!root.join("users/user-a/claude_code_disabled").exists(), "le compte migré garde ses connecteurs");
+        assert_eq!(std::fs::read_to_string(root.join("active_user")).unwrap(), "user-a");
+
+        // 2e compte : dossier vierge, pas de fuite du cerveau de user-a,
+        // et les sources machine ne sont pas aspirées d'office.
+        let fresh = set_active_user_in(&root, Some("user-b".into())).unwrap();
+        assert!(fresh, "user-b est neuf sur cette machine");
+        assert!(root.join("users/user-b").is_dir());
+        assert!(!root.join("users/user-b/brain.json").exists(), "user-b ne voit pas le brain de user-a");
+        assert!(root.join("users/user-b/claude_code_disabled").exists(), "compte neuf : Claude Code opt-in");
+
+        // Logout : plus de marqueur → retombe sur la racine (vide de données user).
+        set_active_user_in(&root, None).unwrap();
+        assert!(!root.join("active_user").exists());
+
+        // Re-login user-a : retrouve son cerveau, aucune re-migration, pas « neuf ».
+        let fresh = set_active_user_in(&root, Some("user-a".into())).unwrap();
+        assert!(!fresh);
+        assert!(root.join("users/user-a/brain.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuse_un_user_id_avec_separateurs() {
+        let root = fresh_root("lucid_test_active_user_bad_id");
+        assert!(set_active_user_in(&root, Some("../evil".into())).is_err());
+        assert!(!root.join("active_user").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ── Crash reporting (Sentry) — opt-in strict ─────────────────────────────────
+// Promesse produit « 100 % local » : sans le flag de consentement ET un DSN,
+// Sentry n'est jamais initialisé → zéro connexion sortante.
+
+/// Fichier-drapeau : présent = l'utilisateur a accepté l'envoi des rapports de crash.
+fn telemetry_flag() -> Option<std::path::PathBuf> {
+    ai::llama::app_data_dir().map(|d| d.join("telemetry_enabled"))
+}
+
+#[tauri::command]
+fn telemetry_enabled() -> bool {
+    telemetry_flag().map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Active/désactive l'envoi des rapports de crash (effet au redémarrage de l'app).
+#[tauri::command]
+fn set_telemetry(enabled: bool) -> Result<(), String> {
+    let p = telemetry_flag().ok_or("Dossier de données introuvable.")?;
+    if enabled {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&p, "").map_err(|e| e.to_string())
+    } else {
+        match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Sentry réellement initialisé ce démarrage ? (≠ du flag : il faut aussi un DSN + redémarrage)
+static SENTRY_ACTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[tauri::command]
+fn sentry_active() -> bool {
+    *SENTRY_ACTIVE.get().unwrap_or(&false)
+}
+
+/// DSN : env runtime (`.env` en dev) puis compile-time (CI de release). Vide = désactivé.
+fn sentry_dsn() -> Option<String> {
+    std::env::var("SENTRY_DSN")
+        .ok()
+        .or_else(|| option_env!("SENTRY_DSN").map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Anonymise un event avant envoi : le home dir (= username) devient `~`.
+fn scrub_event(event: &mut sentry::protocol::Event<'static>) {
+    // Le hostname contient souvent le nom de l'utilisateur (« MacBook-Pro-de-… »).
+    event.server_name = None;
+    // Chemins absolus des binaires chargés (/Users/<nom>/…) — sans utilité tant
+    // qu'on n'upload pas de dSYM pour la symbolication serveur.
+    event.debug_meta.to_mut().images.clear();
+
+    let Some(home) = dirs::home_dir().map(|h| h.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let fix = |s: &mut String| {
+        if s.contains(&home) {
+            *s = s.replace(&home, "~");
+        }
+    };
+    if let Some(m) = event.message.as_mut() {
+        fix(m);
+    }
+    for exc in event.exception.values.iter_mut() {
+        if let Some(v) = exc.value.as_mut() {
+            fix(v);
+        }
+        if let Some(st) = exc.stacktrace.as_mut() {
+            for f in st.frames.iter_mut() {
+                if let Some(p) = f.abs_path.as_mut() {
+                    fix(p);
+                }
+                if let Some(p) = f.filename.as_mut() {
+                    fix(p);
+                }
+            }
+        }
+    }
+    for b in event.breadcrumbs.values.iter_mut() {
+        if let Some(m) = b.message.as_mut() {
+            fix(m);
+        }
+    }
+}
+
+/// Panic volontaire pour tester la chaîne Sentry de bout en bout (dev uniquement).
+/// Le message contient un chemin home réel → vérifie aussi le scrub (`~` attendu côté Sentry).
+#[tauri::command]
+fn crash_test() -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        // Panic dans un thread secondaire : le hook Sentry capture pareil, mais
+        // l'app survit (un panic sur le main thread aborterait le process avant
+        // que le transport n'ait le temps d'envoyer l'event).
+        std::thread::spawn(|| {
+            let p = dirs::home_dir()
+                .map(|h| h.join("note-secrète.md").display().to_string())
+                .unwrap_or_default();
+            panic!("Test Sentry : panic volontaire (scrub check : {p})");
+        });
+        return Ok(());
+    }
+    Err("Disponible uniquement en dev.".into())
+}
+
 /// Une seule génération à la fois (bouton Générer vs watch auto).
 /// ponytail: lock global — suffisant tant qu'il n'y a qu'un cerveau par machine.
 static GEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1888,7 +2427,15 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
     {
         // Sans IA locale la génération marche quand même (structure + texte source).
         let engine = LlamaEngine::detect().ok();
-        let convs = load_all_conversations();
+        let mut convs = load_all_conversations();
+        // Conversations supprimées par l'utilisateur : exclues de l'ingestion,
+        // sinon chaque régénération ressusciterait ce qu'il a effacé.
+        let tombstones = ai::llama::app_data_dir()
+            .map(|d| load_tombstones(&d))
+            .unwrap_or_default();
+        if !tombstones.is_empty() {
+            convs.retain(|c| !tombstones.contains(&format!("leaf:{}", c.summary.id)));
+        }
         if convs.is_empty() {
             return Err("Aucune conversation à analyser.".to_string());
         }
@@ -1983,6 +2530,13 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
                 });
             }
             graph.nodes.push(note);
+        }
+
+        // Filet : les nœuds dérivés (projets, concepts) tombstonés ne doivent pas
+        // réapparaître même si leurs conversations restantes les régénèrent.
+        if !tombstones.is_empty() {
+            graph.nodes.retain(|n| !tombstones.contains(&n.id));
+            graph.edges.retain(|e| !tombstones.contains(&e.source) && !tombstones.contains(&e.target));
         }
 
         if let Some(dir) = ai::llama::app_data_dir() {
@@ -2096,10 +2650,10 @@ fn start_watcher(app: tauri::AppHandle) {
             }
         }) {
             Ok(w) => w,
-            Err(e) => { eprintln!("⚠️ watch auto indisponible : {e}"); return; }
+            Err(e) => { crate::elog!("⚠️ watch auto indisponible : {e}"); return; }
         };
         if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::Recursive) {
-            eprintln!("⚠️ watch auto indisponible : {e}");
+            crate::elog!("⚠️ watch auto indisponible : {e}");
             return;
         }
         while rx.recv().is_ok() {
@@ -2113,7 +2667,7 @@ fn start_watcher(app: tauri::AppHandle) {
             let Ok(_gen) = GEN_LOCK.try_lock() else { continue; };
             match run_generation(&app) {
                 Ok(_) => { let _ = app.emit("brain-updated", ()); }
-                Err(e) => eprintln!("⚠️ watch auto : régénération échouée : {e}"),
+                Err(e) => crate::elog!("⚠️ watch auto : régénération échouée : {e}"),
             }
         }
     });
@@ -2122,7 +2676,33 @@ fn start_watcher(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_env_local();
-    tauri::Builder::default()
+
+    // Sentry seulement si consentement (flag) + DSN — sinon zéro réseau.
+    let sentry_client = if telemetry_enabled() {
+        sentry_dsn().map(|dsn| {
+            sentry::init((
+                dsn,
+                sentry::ClientOptions {
+                    release: sentry::release_name!(),
+                    send_default_pii: false,
+                    before_send: Some(std::sync::Arc::new(|mut event| {
+                        scrub_event(&mut event);
+                        Some(event)
+                    })),
+                    ..Default::default()
+                },
+            ))
+        })
+    } else {
+        None
+    };
+    let _ = SENTRY_ACTIVE.set(sentry_client.is_some());
+
+    let mut builder = tauri::Builder::default();
+    if let Some(client) = &sentry_client {
+        builder = builder.plugin(tauri_plugin_sentry::init(client));
+    }
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -2164,14 +2744,18 @@ pub fn run() {
             import_file,
             list_mcp_proposals,
             resolve_mcp_proposal,
+            import_mcp_proposal,
+            import_shared_space,
             save_pasted_image,
             ai_clients_status,
             connect_ai_client,
             disconnect_ai_client,
             export_backup,
             import_backup,
+            sync_fingerprint,
             set_node_parent,
             rename_node,
+            delete_node,
             obsidian_set_vault,
             obsidian_vault_path,
             obsidian_disconnect,
@@ -2193,6 +2777,12 @@ pub fn run() {
             export_space_md,
             seed_demo,
             reset_demo,
+            reset_environment,
+            set_active_user,
+            telemetry_enabled,
+            set_telemetry,
+            sentry_active,
+            crash_test,
             ai_info
         ])
         .run(tauri::generate_context!())

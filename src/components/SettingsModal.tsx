@@ -11,12 +11,10 @@ import {
   Clock,
   FileText,
   Folder,
-  Cpu,
   Layers,
   Pencil,
   Trash2,
   Plus,
-  Bot,
   User,
 } from "lucide-react";
 import claudeLogo from "@/assets/claude-logo.png";
@@ -50,12 +48,18 @@ import {
   disconnectAiClient,
   exportBackup,
   importBackup,
+  resetEnvironment,
+  telemetryEnabled,
+  setTelemetry,
+  sentryActive,
+  crashTest,
   type ModelInfo,
 } from "@/lib/api";
 import type { AiClientStatus } from "@/lib/types";
 import { supabase, BACKUP_BUCKET } from "@/lib/supabase";
 import type { ConnectorStatus, Space } from "@/lib/types";
 import { cn, relativeDate } from "@/lib/utils";
+import { McpConnectGuide } from "@/components/McpConnectGuide";
 
 // ── Brand logos ───────────────────────────────────────────────────────────────
 
@@ -139,14 +143,17 @@ export function ConnectorLogo({ id }: { id: string }) {
 
 // ── Statut : point 6px + label mono ──────────────────────────────────────────
 
-function StatusLine({ c, soon }: { c: ConnectorStatus; soon?: boolean }) {
+function StatusLine({ c, soon, className }: { c: ConnectorStatus; soon?: boolean; className?: string }) {
   const label = soon
     ? "bientôt"
     : c.connected
       ? c.last_sync ? `sync ${relativeDate(c.last_sync)}` : "connecté"
-      : "non lié";
+      : "à connecter";
   return (
-    <span className="ml-auto flex shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-[var(--color-muted)]">
+    <span className={cn(
+      "flex shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-[var(--color-muted)]",
+      className ?? "ml-auto",
+    )}>
       <span
         className={cn(
           "size-1.5 rounded-full",
@@ -196,6 +203,16 @@ interface ModalProps {
 
 function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidianVault, localFolder, onClose, onConnect, onSync, onDisconnect, onImport }: ModalProps) {
   const isSoon = c.id === "cowork";
+
+  // Échap ferme cette sous-modale AVANT la modale Paramètres : écouteur en phase
+  // capture + stopPropagation pour court-circuiter celui de SettingsModal.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.stopPropagation(); onClose(); }
+    };
+    window.addEventListener("keydown", onKey, { capture: true });
+    return () => window.removeEventListener("keydown", onKey, { capture: true });
+  }, [onClose]);
 
   return (
     <div
@@ -626,32 +643,31 @@ function ConnectorsSection({
   return (
     <div className="relative flex h-full flex-col">
       <div className="flex-1 overflow-y-auto px-5 py-4">
-        <p className="mb-3 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
-          Connecteurs · {connectors.filter((c) => c.connected).length}/{connectors.length}
-        </p>
-        {connectors.map((c) => {
-          const isSoon = c.id === "cowork";
-          return (
-            <button
-              key={c.id}
-              onClick={() => !isSoon && setModalId(c.id)}
-              disabled={isSoon}
-              className={cn(
-                "flex w-full items-center gap-2.5 border-b border-[var(--color-border)] px-1 py-2.5 text-left transition-colors last:border-b-0",
-                isSoon ? "opacity-40" : "hover:bg-[var(--color-surface-2)]",
-              )}
-            >
-              <ConnectorLogo id={c.id} />
-              <span className="min-w-0 truncate text-sm font-medium">{c.name}</span>
-              {msgs[c.id] && !isSoon && (
-                <span className="min-w-0 truncate text-[10px] text-[var(--color-muted)]">{msgs[c.id]}</span>
-              )}
-              <StatusLine c={c} soon={isSoon} />
-            </button>
-          );
-        })}
+        <div className="grid grid-cols-2 gap-2">
+          {connectors.map((c) => {
+            const isSoon = c.id === "cowork";
+            return (
+              <button
+                key={c.id}
+                onClick={() => !isSoon && setModalId(c.id)}
+                disabled={isSoon}
+                className={cn(
+                  "flex items-center gap-3 rounded-xl border border-[var(--color-border)] px-3.5 py-3 text-left transition-colors",
+                  isSoon ? "opacity-40" : "hover:bg-[var(--color-surface-2)]",
+                )}
+              >
+                <ConnectorLogo id={c.id} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">{c.name}</span>
+                  <StatusLine c={c} soon={isSoon} className="mt-0.5" />
+                </span>
+              </button>
+            );
+          })}
+        </div>
         <p className="px-1 pt-3 text-[11px] leading-relaxed text-[var(--color-muted)]">
-          Chaque source connectée alimente le même graphe.
+          Toutes les sources alimentent le même graphe — clique sur l'une d'elles
+          pour la connecter, la synchroniser ou la retirer.
         </p>
       </div>
 
@@ -727,6 +743,12 @@ function SpacesSection({
       <p className="mb-3 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
         Espaces · {spaces.length}
       </p>
+      {spaces.length <= 1 && (
+        <p className="mb-3 text-xs leading-relaxed text-[var(--color-muted)]">
+          Un espace est une vue filtrée du graphe (un projet, des révisions, un
+          client…) — partageable en lecture via le bouton Partager.
+        </p>
+      )}
       {spaces.map((s) => {
         const isLucid = s.id === "lucid";
         return (
@@ -825,8 +847,9 @@ function ModelSection() {
 
   return (
     <div className="h-full overflow-y-auto px-5 py-4">
-      <p className="mb-3 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
-        Modèle IA local
+      <p className="mb-3 text-xs leading-relaxed text-[var(--color-muted)]">
+        Le modèle tourne entièrement sur ta machine. Le changement est immédiat,
+        la prochaine génération l'utilise.
       </p>
       <div className="flex flex-col gap-1">
         {models.map((m) => (
@@ -849,7 +872,7 @@ function ModelSection() {
               </span>
             )}
             {!m.downloaded && (
-              <span className="shrink-0 text-[9px] text-[var(--color-err)]">À dl</span>
+              <span className="shrink-0 font-mono text-[9px] uppercase tracking-wide text-[var(--color-warn)]">à télécharger</span>
             )}
           </button>
         ))}
@@ -871,9 +894,70 @@ function ModelSection() {
   );
 }
 
+// ── Section Connexions : Connecteurs / MCP / IA locale sous une même page ────
+
+type ConnTab = "connectors" | "mcp" | "model";
+
+function Pill({ active, onClick, children }: {
+  active: boolean; onClick: () => void; children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "rounded-full px-3 py-1 text-xs font-medium transition-colors",
+        active
+          ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+          : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ConnectionsSection({
+  connectors, onRefresh, onSyncDone,
+}: {
+  connectors: ConnectorStatus[];
+  onRefresh: () => void;
+  onSyncDone: () => void;
+}) {
+  const [tab, setTab] = useState<ConnTab>("connectors");
+  const connected = connectors.filter((c) => c.connected).length;
+
+  const TABS: { id: ConnTab; label: string }[] = [
+    { id: "connectors", label: `Connecteurs · ${connected}/${connectors.length}` },
+    { id: "mcp",        label: "MCP" },
+    { id: "model",      label: "IA locale" },
+  ];
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="shrink-0 px-5 pt-4">
+        <p className="mb-2.5 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+          Connexions · ce qui nourrit et consulte ton cerveau
+        </p>
+        <div className="flex gap-1 border-b border-[var(--color-border)] pb-2.5">
+          {TABS.map((t) => (
+            <Pill key={t.id} active={tab === t.id} onClick={() => setTab(t.id)}>{t.label}</Pill>
+          ))}
+        </div>
+      </div>
+      <div className="min-h-0 flex-1">
+        {tab === "connectors" && (
+          <ConnectorsSection connectors={connectors} onRefresh={onRefresh} onSyncDone={onSyncDone} />
+        )}
+        {tab === "mcp" && <AiClientsSection />}
+        {tab === "model" && <ModelSection />}
+      </div>
+    </div>
+  );
+}
+
 // ── SettingsModal ─────────────────────────────────────────────────────────────
 
-type Section = "connectors" | "ai-clients" | "spaces" | "model" | "account";
+type Section = "connections" | "spaces" | "account";
 
 // ── Section « Compte » : auth Supabase + sauvegarde cloud du cerveau ─────────
 function AccountSection({ onRestored }: { onRestored?: () => void }) {
@@ -883,8 +967,12 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [backups, setBackups] = useState<{ name: string; created_at: string; size: number }[]>([]);
+  const [telemetry, setTelemetryState] = useState(false);
+  const [sentryOn, setSentryOn] = useState(false);
 
   useEffect(() => {
+    telemetryEnabled().then(setTelemetryState).catch(() => {});
+    sentryActive().then(setSentryOn).catch(() => {});
     if (!supabase) return;
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
     const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
@@ -971,7 +1059,9 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
 
   return (
     <div className="h-full overflow-y-auto p-5">
-      <p className="mb-1 text-sm font-semibold text-[var(--color-text)]">Compte</p>
+      <p className="mb-3 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+        Compte · accès, cloud & vie privée
+      </p>
       <p className="mb-4 text-xs leading-relaxed text-[var(--color-muted)]">
         Ton compte donne accès à l'app et permet de
         <strong> sauvegarder ton cerveau dans le cloud</strong> (~2 Mo chiffrés au repos)
@@ -1045,6 +1135,74 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
       )}
 
       {msg && <p className="mt-3 text-xs text-[var(--color-muted)]">{msg}</p>}
+
+      <div className="mt-6">
+        <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+          Confidentialité
+        </p>
+        <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--color-border)] px-3.5 py-2.5">
+          <input
+            type="checkbox"
+            checked={telemetry}
+            onChange={async (e) => {
+              const on = e.target.checked;
+              setTelemetryState(on);
+              try { await setTelemetry(on); } catch { setTelemetryState(!on); }
+            }}
+            className="mt-0.5 accent-[var(--color-accent)]"
+          />
+          <span className="min-w-0">
+            <span className="block text-sm text-[var(--color-text)]">Envoyer les rapports de crash</span>
+            <span className="block text-xs leading-relaxed text-[var(--color-muted)]">
+              Anonymes (aucun contenu de tes notes, chemins masqués). Désactivé par défaut :
+              rien ne sort de ta machine. Prend effet au redémarrage de l'app.
+            </span>
+            <span className="mt-1 flex items-center gap-1.5 text-[11px]">
+              <span className={cn("size-1.5 rounded-full", sentryOn ? "bg-[var(--color-ok)]" : "bg-[var(--color-muted)]")} />
+              <span className="text-[var(--color-muted)]">
+                {sentryOn
+                  ? "Actif sur cette session"
+                  : telemetry
+                    ? "Inactif — redémarre l'app (ou DSN absent du build)"
+                    : "Inactif"}
+              </span>
+            </span>
+          </span>
+        </label>
+      </div>
+
+      {import.meta.env.DEV && (
+        <div className="mt-6 rounded-xl border border-dashed border-[var(--color-err)]/40 p-3">
+          <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+            Dev uniquement
+          </p>
+          <button
+            onClick={async () => {
+              if (!confirm("Reset complet : cerveau, connecteurs, session et onboarding effacés (modèles IA gardés). Continuer ?")) return;
+              setBusy("reset"); setMsg(null);
+              try {
+                await resetEnvironment();
+                localStorage.clear(); // flags lucid.* + session Supabase → onboarding complet
+                location.reload();
+              } catch (e) {
+                setMsg(String((e as Error).message ?? e));
+                setBusy(null);
+              }
+            }}
+            disabled={busy !== null}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-err)]/50 px-3 py-2 text-sm text-[var(--color-err)] hover:bg-[var(--color-err)]/10 disabled:opacity-40"
+          >
+            {busy === "reset" ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+            Tout réinitialiser (rejouer l'onboarding)
+          </button>
+          <button
+            onClick={() => { crashTest().catch((e) => setMsg(String(e))); }}
+            className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-muted)] hover:bg-[var(--color-surface-2)]"
+          >
+            Tester Sentry (panic Rust volontaire)
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1090,11 +1248,10 @@ export function AiClientsSection() {
 
   return (
     <div className="h-full overflow-y-auto p-5">
-      <p className="mb-1 text-sm font-semibold text-[var(--color-text)]">Connecter mes IA</p>
       <p className="mb-4 text-xs leading-relaxed text-[var(--color-muted)]">
-        Branche ton second cerveau à tes IA en un clic : elles pourront le consulter
+        Branche tes IA en un clic : elles pourront consulter ton cerveau
         (recherche, lecture) et proposer des pages — que tu valides dans Lucid.
-        100 % local, aucune donnée n'est envoyée en ligne.
+        Tout passe en local, rien n'est envoyé en ligne.
       </p>
       <div className="space-y-2">
         {clients.map((c) => (
@@ -1148,6 +1305,19 @@ export function AiClientsSection() {
         Après connexion, demande par exemple : « Qu'est-ce qu'il y a dans mon second
         cerveau sur … ? » ou « Crée-moi une structure de révision dans Lucid ».
       </p>
+
+      {/* IA distantes : claude.ai / ChatGPT / agents — via un space publié */}
+      <div className="mt-5 border-t border-[var(--color-border)] pt-4">
+        <p className="mb-1 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+          IA distantes · claude.ai, ChatGPT…
+        </p>
+        <p className="text-[11px] leading-relaxed text-[var(--color-muted)]">
+          Les IA hors de cette machine (claude.ai web/mobile, ChatGPT…) accèdent à ton
+          cerveau via un <strong>space publié</strong> : ouvre un space → Partager →
+          Public → copie l'<strong>URL du connecteur IA</strong>, puis suis le guide.
+        </p>
+        <McpConnectGuide />
+      </div>
     </div>
   );
 }
@@ -1169,14 +1339,30 @@ export function SettingsModal({
   connectors, spaces, onRefresh, onSyncDone, onClose,
   onSpaceCreate, onSpaceRename, onSpaceDelete, onRestored,
 }: Props) {
-  const [section, setSection] = useState<Section>("connectors");
+  const [section, setSection] = useState<Section>("connections");
 
-  const NAV: { id: Section; label: string; desc: string; icon: React.ReactNode }[] = [
-    { id: "connectors", label: "Sources",  desc: "D'où vient ton savoir",     icon: <Plug className="size-3.5" /> },
-    { id: "ai-clients", label: "Mes IA",   desc: "Qui consulte ton cerveau",  icon: <Bot className="size-3.5" /> },
-    { id: "spaces",     label: "Spaces",   desc: "Tes vues du graphe",        icon: <Layers className="size-3.5" /> },
-    { id: "model",      label: "IA locale", desc: "Le moteur d'analyse",      icon: <Cpu className="size-3.5" /> },
-    { id: "account",    label: "Compte",   desc: "Sauvegarde cloud",          icon: <User className="size-3.5" /> },
+  // Échap ferme la modale (comportement attendu de toute surface modale).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  type NavItem = { id: Section; label: string; desc: string; icon: React.ReactNode };
+  const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
+    {
+      label: "Compte",
+      items: [
+        { id: "account", label: "Compte", desc: "Accès, sync & vie privée", icon: <User className="size-3.5" /> },
+      ],
+    },
+    {
+      label: "Cerveau",
+      items: [
+        { id: "connections", label: "Connexions", desc: "Connecteurs, MCP & IA locale", icon: <Plug className="size-3.5" /> },
+        { id: "spaces",      label: "Espaces",    desc: "Tes vues du graphe",           icon: <Layers className="size-3.5" /> },
+      ],
+    },
   ];
 
   return (
@@ -1187,52 +1373,61 @@ export function SettingsModal({
       >
         {/* Nav gauche */}
         <div className="flex w-44 shrink-0 flex-col gap-0.5 border-r border-[var(--color-border)] p-3">
-          <p className="px-2 pb-2 pt-1 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+          <p className="px-2 pb-1 pt-1 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
             Paramètres
           </p>
-          {NAV.map((n) => (
-            <button
-              key={n.id}
-              onClick={() => setSection(n.id)}
-              className={cn(
-                "flex items-start gap-2 rounded-lg px-2.5 py-2 text-left transition-colors",
-                section === n.id
-                  ? "bg-[var(--color-accent-soft)]"
-                  : "hover:bg-[var(--color-surface-2)]",
-              )}
-            >
-              <span className={cn("mt-0.5", section === n.id ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]")}>
-                {n.icon}
-              </span>
-              <span className="min-w-0">
-                <span className={cn(
-                  "block text-xs font-medium",
-                  section === n.id ? "text-[var(--color-accent)]" : "text-[var(--color-text)]",
-                )}>
-                  {n.label}
-                </span>
-                <span className="block text-[10px] leading-tight text-[var(--color-muted)]">{n.desc}</span>
-              </span>
-            </button>
+          {NAV_GROUPS.map((g) => (
+            <div key={g.label} className="flex flex-col gap-0.5">
+              <p className="px-2 pb-1 pt-2.5 text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]/70">
+                {g.label}
+              </p>
+              {g.items.map((n) => (
+                <button
+                  key={n.id}
+                  onClick={() => setSection(n.id)}
+                  className={cn(
+                    "flex items-start gap-2 rounded-lg px-2.5 py-2 text-left transition-colors",
+                    section === n.id
+                      ? "bg-[var(--color-accent-soft)]"
+                      : "hover:bg-[var(--color-surface-2)]",
+                  )}
+                >
+                  <span className={cn("mt-0.5", section === n.id ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]")}>
+                    {n.icon}
+                  </span>
+                  <span className="min-w-0">
+                    <span className={cn(
+                      "block text-xs font-medium",
+                      section === n.id ? "text-[var(--color-accent)]" : "text-[var(--color-text)]",
+                    )}>
+                      {n.label}
+                    </span>
+                    <span className="block text-[10px] leading-tight text-[var(--color-muted)]">{n.desc}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
           ))}
-          <button
-            onClick={onClose}
-            className="mt-auto flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-          >
-            <X className="size-3.5" /> Fermer
-          </button>
+          <p className="mt-auto px-2 pb-1 font-mono text-[9px] uppercase tracking-[0.16em] text-[var(--color-muted)]/70">
+            Lucid · alpha
+          </p>
         </div>
 
         {/* Contenu */}
         <div className="relative min-w-0 flex-1">
-          {section === "connectors" && (
-            <ConnectorsSection connectors={connectors} onRefresh={onRefresh} onSyncDone={onSyncDone} />
+          <button
+            onClick={onClose}
+            title="Fermer (Échap)"
+            className="absolute right-3 top-3 z-10 rounded-lg p-1.5 text-[var(--color-muted)] transition-colors hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
+          >
+            <X className="size-4" />
+          </button>
+          {section === "connections" && (
+            <ConnectionsSection connectors={connectors} onRefresh={onRefresh} onSyncDone={onSyncDone} />
           )}
-          {section === "ai-clients" && <AiClientsSection />}
           {section === "spaces" && (
             <SpacesSection spaces={spaces} onCreate={onSpaceCreate} onRename={onSpaceRename} onDelete={onSpaceDelete} />
           )}
-          {section === "model" && <ModelSection />}
           {section === "account" && <AccountSection onRestored={onRestored} />}
         </div>
       </div>

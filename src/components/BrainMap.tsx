@@ -18,6 +18,7 @@ interface Props {
   spaces?: Space[];
   onAddNodeToSpace?: (nodeId: string, spaceId: string) => void;
   onMoveNode?: (nodeId: string, parentId: string) => void;
+  onDeleteNode?: (nodeId: string) => void;
   /** Fichiers déposés sur le canvas (drag & drop OS) → import sous `parentId`. */
   onImportFiles?: (paths: string[], parentId: string) => void;
   /** Clic net sur le vide du canvas (ferme le panneau détail). */
@@ -144,33 +145,50 @@ function orbitR(N: number, maxR: number, gap: number, minR: number): number {
   return Math.max(minR, (maxR + gap) / Math.sin(Math.PI / N));
 }
 
-function arcOrbitR(N: number, rs: number, gap: number, spread: number, minR: number): number {
-  if (N <= 1) return minR;
-  const step = spread / (N - 1);
-  return Math.max(minR, (rs + gap / 2) / Math.sin(step / 2));
-}
 
-/** Repousse les paires de nœuds qui se chevauchent — passe itérative simple. */
-function resolveOverlaps(infos: Map<string, NodeInfo>, iterations = 4, minGap = 16): void {
+/** Relaxation de collisions sur grille spatiale : compacte sans chevauchement.
+ *  Déterministe (ordre d'insertion) ; les nœuds de structure bougent moins que
+ *  les pages (pin), le root ne bouge jamais. Remplace l'ancienne passe O(n²). */
+function resolveOverlaps(infos: Map<string, NodeInfo>, iterations = 60, minGap = 16): void {
   const nodes = Array.from(infos.values());
+  const CELL = 48;
+  const pinOf = (n: NodeInfo) =>
+    n.node.kind === "root" ? 1 : !isLeafKind(n.node.kind) ? 0.6 : 0;
+  const key = (x: number, y: number) => x * 73856093 ^ y * 19349663;
   for (let iter = 0; iter < iterations; iter++) {
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const a = nodes[i], b = nodes[j];
-        if (a.node.kind === "root" && b.node.kind === "root") continue;
-        const dx = b.finalX - a.finalX;
-        const dy = b.finalY - a.finalY;
-        const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-        const needed = a.r + b.r + minGap;
-        if (dist < needed) {
-          const push = (needed - dist) / 2;
-          const nx = dx / dist, ny = dy / dist;
-          if (a.node.kind !== "root") { a.finalX -= nx * push; a.finalY -= ny * push; }
-          if (b.node.kind !== "root") { b.finalX += nx * push; b.finalY += ny * push; }
+    const grid = new Map<number, NodeInfo[]>();
+    for (const n of nodes) {
+      const k = key(Math.floor(n.finalX / CELL), Math.floor(n.finalY / CELL));
+      let cell = grid.get(k);
+      if (!cell) grid.set(k, cell = []);
+      cell.push(n);
+    }
+    for (const a of nodes) {
+      const gx = Math.floor(a.finalX / CELL), gy = Math.floor(a.finalY / CELL);
+      for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) {
+        const cell = grid.get(key(gx + ox, gy + oy));
+        if (!cell) continue;
+        for (const b of cell) {
+          if (b.id <= a.id) continue; // chaque paire une seule fois
+          const dx = b.finalX - a.finalX, dy = b.finalY - a.finalY;
+          const dist = Math.hypot(dx, dy) || 0.01;
+          const gap = isLeafKind(a.node.kind) || isLeafKind(b.node.kind) ? Math.min(minGap, 8) : minGap;
+          const needed = a.r + b.r + gap;
+          if (dist < needed) {
+            const push = (needed - dist) / dist * 0.5;
+            const wa = 1 - pinOf(a), wb = 1 - pinOf(b);
+            a.finalX -= dx * push * wa; a.finalY -= dy * push * wa;
+            b.finalX += dx * push * wb; b.finalY += dy * push * wb;
+          }
         }
       }
     }
   }
+}
+
+/** Gaussienne déterministe en [-1, 1] dérivée de l'id (layout stable entre recalculs). */
+function gaussOf(id: string, salt: string): number {
+  return (stableHash(id + salt + "α") + stableHash(id + salt + "β") + stableHash(id + salt + "γ") - 1.5) / 1.5;
 }
 
 function stableHash(s: string): number {
@@ -208,49 +226,96 @@ function buildLayout(
 
   const GAP = 16;
 
-  function place(
-    parentId: string, px: number, py: number,
-    outAngle: number, depth: number,
-  ) {
-    const kids = childrenByParent.get(parentId) ?? [];
-    if (!kids.length) return;
-
-    const N = kids.length;
-    const maxKidR = kids.reduce((m, k) => Math.max(m, radiusOf(k)), 9);
-    const parentR = infos.get(parentId)!.r;
-    const isFirst = depth === 1;
-
-    const spread = isFirst
-      ? Math.PI * 2
-      : Math.min(Math.PI * 0.95, Math.max(Math.PI * 0.22, N * Math.PI * 0.22));
-
-    const R = isFirst
-      ? orbitR(N, maxKidR, GAP * 2, 110)
-      : arcOrbitR(N, maxKidR, GAP, spread, parentR + maxKidR + GAP);
-
-    kids.forEach((kid, ki) => {
-      const t = N <= 1 ? 0.5 : ki / (N - 1);
-      const baseAngle = isFirst
-        ? (ki / N) * Math.PI * 2 - Math.PI / 2
-        : outAngle - spread / 2 + t * spread;
-
-      const jAng = jitter(kid.id, "ang", 0.06 / Math.max(N, 2));
-      const jRad = jitter(kid.id, "rad", R * 0.04);
-
-      const kx = px + (R + jRad) * Math.cos(baseAngle + jAng);
-      const ky = py + (R + jRad) * Math.sin(baseAngle + jAng);
-
-      infos.set(kid.id, {
-        id: kid.id, node: kid, r: radiusOf(kid),
-        finalX: kx, finalY: ky, parentId,
-      });
-
-      place(kid.id, kx, ky, Math.atan2(ky - py, kx - px), depth + 1);
-    });
+  // Poids d'un sous-arbre = nombre de pages qu'il contient (min 1) — c'est lui
+  // qui dicte la part angulaire de chaque branche (géométrie de l'artifact).
+  const weightMemo = new Map<string, number>();
+  function weightOf(id: string): number {
+    const memo = weightMemo.get(id);
+    if (memo !== undefined) return memo;
+    const kids = childrenByParent.get(id) ?? [];
+    const w = kids.length === 0 ? 1 : kids.reduce((s, k) => s + weightOf(k.id), 0);
+    weightMemo.set(id, w);
+    return w;
   }
 
-  place(rootId, 0, 0, -Math.PI / 2, 1);
-  resolveOverlaps(infos, 6, GAP);
+  // Layout radial en secteurs : chaque branche reçoit un intervalle angulaire
+  // proportionnel à son poids et le subdivise pour ses enfants ; les distances
+  // sont mesurées depuis le CENTRE (anneaux), les pages se blottissent en amas
+  // anisotropes contre leur parent. Tout est déterministe (hash stable par id).
+  function place(parentId: string, a0: number, a1: number, dist: number, depth: number) {
+    const kids = childrenByParent.get(parentId) ?? [];
+    if (!kids.length) return;
+    const parent = infos.get(parentId)!;
+    const px = parent.finalX, py = parent.finalY;
+
+    const branchKids = kids.filter((k) => !isLeafKind(k.kind));
+    const leafKids = kids.filter((k) => isLeafKind(k.kind));
+
+    if (branchKids.length) {
+      const kidWeights = branchKids.map((k) => weightOf(k.id));
+      const total = kidWeights.reduce((a, b) => a + b, 0);
+      const span = a1 - a0;
+      const pad = branchKids.length > 1 ? span * 0.05 : 0;
+      const usable = span - pad * 2;
+      const maxKidR = branchKids.reduce((m, k) => Math.max(m, radiusOf(k)), 9);
+      // Anneaux resserrés en profondeur : passé le 1er niveau, un enfant reste
+      // proche de son parent (les longues cordes nues tuent la lecture).
+      const dR = depth === 1
+        ? Math.max(170, orbitR(branchKids.length, maxKidR, GAP * 2, 110))
+        : 78 + maxKidR + GAP * 0.5;
+      // Angle du parent vu du centre : on tire les enfants vers lui pour
+      // raccourcir la corde parent→enfant tout en restant dans le secteur.
+      const parentAng = px === 0 && py === 0 ? null : Math.atan2(py, px);
+      let cursor = a0 + pad;
+      branchKids.forEach((kid, ki) => {
+        const w = (kidWeights[ki] / total) * usable;
+        const mid = cursor + w / 2;
+        let ang = mid;
+        if (parentAng !== null) {
+          const delta = Math.atan2(Math.sin(parentAng - mid), Math.cos(parentAng - mid));
+          ang = mid + Math.max(-w * 0.38, Math.min(w * 0.38, delta * 0.5));
+        }
+        ang += jitter(kid.id, "ang", Math.min(0.09, w * 0.18));
+        const d = dist + dR + jitter(kid.id, "rad", dR * 0.3);
+        const kx = Math.cos(ang) * d, ky = Math.sin(ang) * d;
+        infos.set(kid.id, {
+          id: kid.id, node: kid, r: radiusOf(kid),
+          finalX: kx, finalY: ky, parentId,
+        });
+        place(kid.id, cursor, cursor + w, d, depth + 1);
+        cursor += w;
+      });
+    }
+
+    if (leafKids.length) {
+      // Amas anisotrope : poussé vers l'extérieur (axe centre→parent), étalé le
+      // long de la tangente — la « traînée » organique validée dans l'artifact.
+      const outAngle = px === 0 && py === 0 ? (a0 + a1) / 2 : Math.atan2(py, px);
+      const maxLeafR = leafKids.reduce((m, k) => Math.max(m, radiusOf(k)), 4);
+      const sigmaT = Math.max(26, Math.sqrt(leafKids.length) * 18);
+      const baseAway = parent.r + maxLeafR + GAP * 0.4;
+      const sigmaA = 22 + Math.sqrt(leafKids.length) * 13;
+      for (const kid of leafKids) {
+        // Direction propre à chaque page (±0.4 rad) : le panache enveloppe le
+        // parent au lieu de pointer raide vers l'extérieur — le « fouillis » voulu.
+        const oa = outAngle + gaussOf(kid.id, "o") * 0.4;
+        const outX = Math.cos(oa), outY = Math.sin(oa);
+        const tanX = -outY, tanY = outX;
+        const along = gaussOf(kid.id, "t") * sigmaT;
+        const away = baseAway + Math.abs(gaussOf(kid.id, "a")) * sigmaA;
+        const kx = px + outX * away + tanX * along + jitter(kid.id, "jx", 9);
+        const ky = py + outY * away + tanY * along + jitter(kid.id, "jy", 9);
+        infos.set(kid.id, {
+          id: kid.id, node: kid, r: radiusOf(kid),
+          finalX: kx, finalY: ky, parentId,
+        });
+        place(kid.id, a0, a1, Math.hypot(kx, ky), depth + 1);
+      }
+    }
+  }
+
+  place(rootId, -Math.PI / 2, Math.PI * 1.5, 0, 1);
+  resolveOverlaps(infos, 60, GAP);
 
   const childrenOf = new Map<string, string[]>();
   for (const info of infos.values()) {
@@ -286,7 +351,7 @@ function hexA(hex: string, a: number): string {
 export function BrainMap({
   graph, onSelect, selectedId, query,
   revealKey = 0, streamLabels = [], streamTotal = 0,
-  spaces, onAddNodeToSpace, onMoveNode, onImportFiles,
+  spaces, onAddNodeToSpace, onMoveNode, onDeleteNode, onImportFiles,
   onBackgroundClick, panelOffset = 0, focus = null,
   busy = false, busyMessage = null,
 }: Props) {
@@ -330,6 +395,20 @@ export function BrainMap({
     return { colorOf, neighbors, maxR: maxR + 30 };
   }, [graph, infos, theme]);
 
+  // Halo chaud : intensité de « fraîcheur » par nœud (1 = créé aujourd'hui,
+  // 0 = plus d'une semaine). Recalculé à chaque évolution du graphe.
+  const recentK = useMemo(() => {
+    const m = new Map<string, number>();
+    const now = Date.now();
+    for (const n of graph.nodes) {
+      if (!n.date || n.kind === "root") continue;
+      const age = (now - Date.parse(n.date)) / 86_400_000;
+      if (Number.isNaN(age) || age > 7) continue;
+      m.set(n.id, Math.pow(1 - Math.max(0, age) / 7, 0.8));
+    }
+    return m;
+  }, [graph]);
+
   // Recharge les couleurs du canvas quand le thème change (toggle in-app ou OS).
   useEffect(() => {
     const update = () => setTheme(readTheme());
@@ -354,15 +433,19 @@ export function BrainMap({
   const spawnAt = useRef(new Map<string, number>());
   // Positions vivantes : chaque bulle glisse vers sa place cible (relayouts fluides,
   // pas de téléportation quand des sœurs apparaissent — replay, watch auto, régén).
-  const livePos = useRef(new Map<string, { x: number; y: number }>());
+  const livePos = useRef(new Map<string, { x: number; y: number; vx?: number; vy?: number }>());
   const prevIds = useRef<Set<string> | null>(null);
   const drag = useRef<{ mode: "node" | "pan"; id?: string; ids?: string[]; moved: number; sx: number; sy: number } | null>(null);
+  // Matière : distance en sauts au nœud attrapé — la grappe suit en ressort avec
+  // une raideur décroissante par saut, pendant le drag et jusqu'à se reposer.
+  const hopOf = useRef(new Map<string, number>());
+  const mouse = useRef<{ x: number; y: number } | null>(null);
 
   const S = useRef<any>(null);
   S.current = {
     infos, childrenOf, colorOf, neighbors, q, selectedId, theme, linkEdges,
     onSelect, onMoveNode, onImportFiles, onBackgroundClick, isGenesis, streamLabels, streamTotal, rootId,
-    busy, busyMessage, maxR,
+    busy, busyMessage, maxR, recentK,
   };
 
   // Refit caméra au chargement / à chaque régénération.
@@ -456,20 +539,50 @@ export function BrainMap({
       const s = S.current;
       const firstLayout = livePos.current.size === 0;
       const k = reduce ? 1 : 0.16;
+      // Matière : répulsion très douce du curseur (hors drag) — appliquée à la
+      // cible, le lerp fait l'aller ET le retour. Un frémissement, pas une bousculade.
+      const m = !reduce && !drag.current ? mouse.current : null;
+      const wm = m ? toWorld(m.x, m.y) : null;
+      const zoom = cam.current.zoom;
+      const repulseR = 70 / zoom;
       for (const info of s.infos.values() as Iterable<NodeInfo>) {
         const o = dragOffsets.current.get(info.id) ?? { dx: 0, dy: 0 };
-        const tx = info.finalX + o.dx, ty = info.finalY + o.dy;
+        let tx = info.finalX + o.dx, ty = info.finalY + o.dy;
         let lp = livePos.current.get(info.id);
         if (!lp) {
           const par = info.parentId ? livePos.current.get(info.parentId) : undefined;
           lp = firstLayout || !par ? { x: tx, y: ty } : { x: par.x, y: par.y };
           livePos.current.set(info.id, lp);
         }
-        lp.x += (tx - lp.x) * k;
-        lp.y += (ty - lp.y) * k;
-        // Snap à l'arrivée : sans lui le lerp n'atteint jamais la cible et le
-        // texte, redessiné en sous-pixel à chaque frame, scintille en continu.
-        if (Math.abs(tx - lp.x) < 0.1 && Math.abs(ty - lp.y) < 0.1) { lp.x = tx; lp.y = ty; }
+        if (wm && info.node.kind !== "root") {
+          const dx = lp.x - wm.x, dy = lp.y - wm.y;
+          const d = Math.hypot(dx, dy);
+          if (d < repulseR && d > 0.01) {
+            const f = (1 - d / repulseR) ** 2 * (isLeafKind(info.node.kind) ? 7 : 3.5) / zoom;
+            tx += (dx / d) * f; ty += (dy / d) * f;
+          }
+        }
+        const hop = hopOf.current.get(info.id) ?? 0;
+        if (!reduce && hop > 0) {
+          // Ressort par sauts : enfants raides, petits-enfants plus mous, pages
+          // traînardes — la grappe s'étire pendant le drag puis se repose.
+          const ks = 0.11 * Math.pow(0.58, hop - 1);
+          lp.vx = (lp.vx ?? 0) + (tx - lp.x) * ks;
+          lp.vy = (lp.vy ?? 0) + (ty - lp.y) * ks;
+          lp.vx *= 0.8; lp.vy *= 0.8;
+          lp.x += lp.vx; lp.y += lp.vy;
+          if (!drag.current && Math.abs(tx - lp.x) < 0.15 && Math.abs(ty - lp.y) < 0.15
+            && Math.abs(lp.vx) < 0.05 && Math.abs(lp.vy) < 0.05) {
+            lp.x = tx; lp.y = ty; lp.vx = 0; lp.vy = 0;
+            hopOf.current.delete(info.id);
+          }
+        } else {
+          lp.x += (tx - lp.x) * k;
+          lp.y += (ty - lp.y) * k;
+          // Snap à l'arrivée : sans lui le lerp n'atteint jamais la cible et le
+          // texte, redessiné en sous-pixel à chaque frame, scintille en continu.
+          if (Math.abs(tx - lp.x) < 0.1 && Math.abs(ty - lp.y) < 0.1) { lp.x = tx; lp.y = ty; }
+        }
       }
     };
 
@@ -627,6 +740,19 @@ export function BrainMap({
         const r = info.r * rScale;
         ctx.globalAlpha = vis * spawnAlpha;
 
+        // Halo chaud : les pages créées cette semaine « couvent » — teinte chaude,
+        // intensité qui décroît avec l'âge, respiration lente (fixe si reduce).
+        const rk = s.recentK.get(info.id) ?? 0;
+        if (rk > 0.02 && !isPending) {
+          const warm = t.dark ? "#e8a04b" : "#c9873a";
+          const breathe = reduce ? 0.75 : 0.65 + 0.35 * Math.sin(time * 1.1 + phase);
+          const hr = r * (2.6 + rk * 1.2);
+          const wg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, hr);
+          wg.addColorStop(0, hexA(warm, (0.09 + 0.15 * rk) * breathe));
+          wg.addColorStop(1, hexA(warm, 0));
+          ctx.fillStyle = wg; ctx.beginPath(); ctx.arc(p.x, p.y, hr, 0, Math.PI * 2); ctx.fill();
+        }
+
         // halo très léger (racine et survol/sélection seulement)
         if (isRoot || boost > 0) {
           const haloR = r * 2.6;
@@ -768,16 +894,35 @@ export function BrainMap({
       if (e.button !== 0) return;
       setCtxMenu(null);
       const n = nodeAt(e.clientX, e.clientY);
-      const canDrag = !!n && n.node.kind !== "root" && !isLeafKind(n.node.kind) && n.node.kind !== "pending";
+      const canDrag = !!n && n.node.kind !== "root" && n.node.kind !== "pending";
       // On garde toujours l'id du nœud sous le curseur → clic (sans déplacement) = sélection,
       // même pour une feuille/page non déplaçable (qui, elle, laisse le pan agir).
       drag.current = canDrag
         ? { mode: "node", id: n!.id, ids: [n!.id, ...getDescendants(n!.id, S.current.childrenOf)], moved: 0, sx: e.clientX, sy: e.clientY }
         : { mode: "pan", id: n?.id, moved: 0, sx: e.clientX, sy: e.clientY };
+      if (canDrag) {
+        // Matière : profondeur en sauts de chaque descendant → raideur décroissante.
+        const hops = new Map<string, number>([[n!.id, 0]]);
+        const q: Array<[string, number]> = [[n!.id, 0]];
+        while (q.length) {
+          const [id, h] = q.pop()!;
+          for (const c of S.current.childrenOf.get(id) ?? []) { hops.set(c, h + 1); q.push([c, h + 1]); }
+        }
+        hopOf.current = hops;
+      }
       canvas.style.cursor = canDrag ? "grabbing" : "move";
     };
     const onMove = (e: MouseEvent) => {
       const d = drag.current;
+      // Listener window (le drag doit survivre hors du canvas), mais au repos
+      // on ignore tout ce qui n'est pas directement le canvas : une surface
+      // par-dessus (modale, panneau, onboarding) ne doit pas piloter le hover.
+      if (!d && e.target !== canvas) {
+        mouse.current = null;
+        if (hovered.current) { hovered.current = null; canvas.style.cursor = "default"; }
+        return;
+      }
+      mouse.current = { x: e.clientX, y: e.clientY };
       if (d) {
         const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
         d.moved += Math.abs(dx) + Math.abs(dy); d.sx = e.clientX; d.sy = e.clientY;
@@ -841,6 +986,8 @@ export function BrainMap({
     canvas.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("dblclick", onDbl);
     canvas.addEventListener("contextmenu", onCtx);
+    const onLeave = () => { mouse.current = null; };
+    canvas.addEventListener("mouseleave", onLeave);
 
     // ── Drag & drop de fichiers OS (Tauri) : cible = bulle survolée (ou son
     // parent si feuille), sinon la racine. Le ring de survol sert de feedback.
@@ -878,6 +1025,7 @@ export function BrainMap({
       canvas.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("dblclick", onDbl);
       canvas.removeEventListener("contextmenu", onCtx);
+      canvas.removeEventListener("mouseleave", onLeave);
       dropDisposed = true;
       unlistenDrop?.();
     };
@@ -891,7 +1039,7 @@ export function BrainMap({
     <div ref={wrapRef} style={{ width: "100%", height: "100%", position: "relative", overflow: "hidden", background: "var(--canvas-bg)" }}>
       <canvas ref={canvasRef} style={{ display: "block", position: "absolute", inset: 0 }} />
 
-      {ctxMenu && (onMoveNode || (spaces && onAddNodeToSpace)) && (
+      {ctxMenu && (onMoveNode || onDeleteNode || (spaces && onAddNodeToSpace)) && (
         <div
           style={{
             position: "fixed",
@@ -932,6 +1080,17 @@ export function BrainMap({
                   <p className="px-3 py-1.5 text-xs text-[var(--color-muted)]">Crée une space d&apos;abord</p>
                 )}
               </div>
+            </>
+          )}
+          {onDeleteNode && infos.get(ctxMenu.nodeId)?.node.kind !== "root" && (
+            <>
+              <div className="my-1 border-t border-[var(--color-border)]" />
+              <button
+                onClick={() => { onDeleteNode(ctxMenu.nodeId); setCtxMenu(null); }}
+                className="w-full px-3 py-1.5 text-left text-sm text-[var(--color-err)] hover:bg-[var(--color-surface-2)] transition-colors"
+              >
+                Supprimer…
+              </button>
             </>
           )}
         </div>

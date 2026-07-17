@@ -29,16 +29,30 @@ pub struct ModelDef {
 
 // ── Dossier de données ────────────────────────────────────────────────────────
 
-pub fn app_data_dir() -> Option<PathBuf> {
+/// Racine machine : assets partagés entre tous les comptes (llama.cpp, modèles,
+/// catalogue). Ne jamais y écrire de données utilisateur.
+pub fn shared_data_dir() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join(APP_DIR))
 }
 
+/// Dossier de données de l'utilisateur actif : `users/<uuid>/` si un compte est
+/// connecté (fichier `active_user` écrit par la commande `set_active_user`),
+/// racine sinon (pré-login / install legacy). Lu à chaque appel : l'app, le
+/// binaire MCP et les examples CLI restent cohérents sans état partagé.
+pub fn app_data_dir() -> Option<PathBuf> {
+    let root = shared_data_dir()?;
+    match std::fs::read_to_string(root.join("active_user")) {
+        Ok(id) if !id.trim().is_empty() => Some(root.join("users").join(id.trim())),
+        _ => Some(root),
+    }
+}
+
 fn catalog_cache_path() -> Option<PathBuf> {
-    Some(app_data_dir()?.join("model_catalog.json"))
+    Some(shared_data_dir()?.join("model_catalog.json"))
 }
 
 fn config_path() -> Option<PathBuf> {
-    Some(app_data_dir()?.join("model_config.json"))
+    Some(shared_data_dir()?.join("model_config.json"))
 }
 
 // ── Catalogue de modèles ──────────────────────────────────────────────────────
@@ -168,7 +182,7 @@ pub fn load_catalog() -> Vec<ModelDef> {
     // 2. Modèles locaux déjà présents dans <data>/models/ (ex. Gemma téléchargé manuellement)
     let remote_files: std::collections::HashSet<&str> = remote.iter().map(|m| m.file.as_str()).collect();
     let mut local: Vec<ModelDef> = Vec::new();
-    if let Some(models_dir) = app_data_dir().map(|d| d.join("models")) {
+    if let Some(models_dir) = shared_data_dir().map(|d| d.join("models")) {
         if let Ok(entries) = std::fs::read_dir(&models_dir) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
@@ -295,7 +309,7 @@ fn resolve_binary() -> Option<PathBuf> {
         }
     }
     // Dev : checkout llama.cpp dans le dossier de données.
-    let candidate = app_data_dir()?
+    let candidate = shared_data_dir()?
         .join("llama.cpp").join("build").join("bin").join("llama-completion");
     candidate.is_file().then_some(candidate)
 }
@@ -306,7 +320,7 @@ fn resolve_model() -> Option<PathBuf> {
         if p.is_file() { return Some(p); }
     }
     let m = active_model_stored()?;
-    let candidate = app_data_dir()?.join("models").join(&m.file);
+    let candidate = shared_data_dir()?.join("models").join(&m.file);
     candidate.is_file().then_some(candidate)
 }
 
@@ -327,7 +341,7 @@ pub struct DownloadProgress {
 pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
     let m = active_model_stored()
         .ok_or("Aucun modèle sélectionné. Choisis un modèle d'abord.")?;
-    let dest = app_data_dir().ok_or("Dossier de données introuvable.")?.join("models").join(&m.file);
+    let dest = shared_data_dir().ok_or("Dossier de données introuvable.")?.join("models").join(&m.file);
     if dest.is_file() { return Ok(()); }
     std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
 
@@ -378,7 +392,7 @@ pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
 /// Copie un .gguf local vers `<data>/models/`. Fallback si téléchargement impossible.
 pub fn install_from_path(app: &tauri::AppHandle, src: &std::path::Path) -> Result<(), String> {
     let m = active_model_stored().ok_or("Aucun modèle sélectionné.")?;
-    let dest = app_data_dir().ok_or("Dossier de données introuvable.")?.join("models").join(&m.file);
+    let dest = shared_data_dir().ok_or("Dossier de données introuvable.")?.join("models").join(&m.file);
     if dest.exists() { return Ok(()); }
     std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
 

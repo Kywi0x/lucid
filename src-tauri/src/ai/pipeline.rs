@@ -253,7 +253,7 @@ pub fn generate_brain(
                 ) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("⚠️ Conversation ignorée ({}) : {e}", conv.summary.id);
+                        crate::elog!("⚠️ Conversation ignorée ({}) : {e}", conv.summary.id);
                         failures += 1;
                         continue;
                     }
@@ -375,7 +375,7 @@ pub fn generate_brain(
         ));
     }
 
-    eprintln!("📦 Cache : {cache_hits}/{total} conversations réutilisées.");
+    crate::elog!("📦 Cache : {cache_hits}/{total} conversations réutilisées.");
     if let Some(path) = cache_path {
         save_cache(path, &cache);
     }

@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { Brain, Check, Copy, Sparkles } from "lucide-react";
+import { Check, Copy, Sparkles } from "lucide-react";
 import type { ConnectorStatus } from "@/lib/types";
 import { ConnectorLogo, AiClientsSection } from "@/components/SettingsModal";
+import { NeuralBg, LucidOrb } from "@/components/NeuralBg";
 import { cn } from "@/lib/utils";
 
 const EXAMPLE_PROMPT = "Qu'est-ce qu'il y a dans mon second cerveau Lucid ? Fais-moi un tour d'horizon.";
@@ -26,12 +27,37 @@ function StepDots({ current }: { current: number }) {
         <span
           key={i}
           className={cn(
-            "size-1.5 rounded-full transition-colors",
-            i <= current ? "bg-[var(--color-accent)]" : "bg-[var(--color-border)]",
+            "rounded-full transition-all",
+            i === current ? "h-1.5 w-4 bg-[var(--color-accent)]" : "size-1.5",
+            i < current && "bg-[var(--color-accent)]/50",
+            i > current && "bg-[var(--color-border)]",
           )}
         />
       ))}
     </div>
+  );
+}
+
+/** Point d'état façon HUD : pastille + label mono, jamais d'aplat de couleur. */
+function ConnectorState({ c }: { c: ConnectorStatus }) {
+  return (
+    <span className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.08em]">
+      <span
+        className={cn(
+          "size-1.5 rounded-full",
+          c.connected
+            ? "bg-[var(--color-ok)] shadow-[0_0_6px_color-mix(in_srgb,var(--color-ok)_60%,transparent)]"
+            : "border border-[var(--color-muted)]/50",
+        )}
+      />
+      <span className="text-[var(--color-muted)]">
+        {c.connected
+          ? c.conversation_count > 0
+            ? `${c.conversation_count} élément${c.conversation_count > 1 ? "s" : ""}`
+            : "connecté"
+          : "off"}
+      </span>
+    </span>
   );
 }
 
@@ -48,39 +74,44 @@ export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDo
   }
 
   return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center bg-[var(--color-bg)]/95">
-      <div className="panel w-[560px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl">
+    <div className="absolute inset-0 z-40 flex items-center justify-center">
+      <NeuralBg />
+      <div className="lucid-rise panel relative w-[560px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl">
         {phase === "sources" ? (
           <div className="px-8 py-7">
-            <Brain className="mx-auto size-10 text-[var(--color-accent)]" />
-            <h2 className="mt-3 text-center text-lg font-semibold text-[var(--color-text)]">
-              Bienvenue dans Lucid
-            </h2>
-            <p className="mx-auto mt-1 max-w-md text-center text-sm text-[var(--color-muted)]">
-              Ton second cerveau se nourrit de tes sources. Tout est analysé
-              <strong> 100 % en local</strong> — rien ne quitte cette machine.
-            </p>
+            <div className="flex flex-col items-center text-center">
+              <LucidOrb size={40} />
+              <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+                Bienvenue · étape 1/3
+              </p>
+              <h2 className="mt-1.5 text-lg font-semibold tracking-tight text-[var(--color-text)]">
+                Nourris ton second cerveau
+              </h2>
+              <p className="mx-auto mt-1 max-w-md text-sm leading-relaxed text-[var(--color-muted)]">
+                Lucid se construit à partir de tes sources, analysées
+                <strong className="text-[var(--color-text)]"> 100 % en local</strong> —
+                rien ne quitte cette machine.
+              </p>
+            </div>
 
-            <div className="mt-5 space-y-1.5">
-              {connectors.map((c) => (
-                <div key={c.id} className="flex items-center gap-3 rounded-xl border border-[var(--color-border)] px-3.5 py-2.5">
+            <div className="mt-5 overflow-hidden rounded-xl border border-[var(--color-border)]">
+              {connectors.map((c, i) => (
+                <div
+                  key={c.id}
+                  className={cn(
+                    "flex items-center gap-3 px-3.5 py-2.5",
+                    i > 0 && "border-t border-[var(--color-border)]",
+                  )}
+                >
                   <ConnectorLogo id={c.id} />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm text-[var(--color-text)]">{c.name}</p>
-                    <p className="text-[11px] text-[var(--color-muted)]">
-                      {c.connected
-                        ? c.conversation_count > 0
-                          ? `✓ Détecté — ${c.conversation_count} élément${c.conversation_count > 1 ? "s" : ""}`
-                          : "✓ Connecté"
-                        : "Non connecté"}
-                    </p>
-                  </div>
+                  <p className="min-w-0 flex-1 truncate text-sm text-[var(--color-text)]">{c.name}</p>
+                  <ConnectorState c={c} />
                   {!c.connected && (
                     <button
                       onClick={onOpenSettings}
-                      className="shrink-0 rounded-lg border border-[var(--color-border)] px-2.5 py-1 text-xs text-[var(--color-text)] hover:bg-[var(--color-surface-2)]"
+                      className="shrink-0 rounded-lg border border-[var(--color-border)] px-2.5 py-1 text-xs text-[var(--color-text)] transition-colors hover:border-[var(--color-accent)]/40 hover:text-[var(--color-accent)]"
                     >
-                      Configurer
+                      Connecter
                     </button>
                   )}
                 </div>
@@ -91,20 +122,20 @@ export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDo
               <button
                 onClick={onGenerate}
                 disabled={!hasSource}
-                className="flex items-center gap-2 rounded-xl bg-[var(--color-accent)] px-5 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+                className="flex items-center gap-2 rounded-xl bg-[var(--color-accent)] px-5 py-2.5 text-sm font-medium text-white transition-all hover:bg-[var(--color-accent-hover)] hover:shadow-[0_4px_20px_color-mix(in_srgb,var(--color-accent)_40%,transparent)] disabled:opacity-40"
               >
                 <Sparkles className="size-4" />
                 Générer mon cerveau
               </button>
               {!hasSource && (
-                <p className="text-[11px] text-[var(--color-muted)]">
-                  Connecte au moins une source pour commencer.
+                <p className="font-mono text-[10px] uppercase tracking-[0.08em] text-[var(--color-muted)]">
+                  connecte au moins une source
                 </p>
               )}
               <button onClick={onSeedDemo} className="mt-1 text-xs text-[var(--color-accent)] hover:underline">
                 Explorer une démo (sans connecteur)
               </button>
-              <button onClick={onDone} className="text-[11px] text-[var(--color-muted)] hover:text-[var(--color-text)]">
+              <button onClick={onDone} className="text-[11px] text-[var(--color-muted)] transition-colors hover:text-[var(--color-text)]">
                 Plus tard
               </button>
             </div>
@@ -114,11 +145,14 @@ export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDo
         ) : (
           <div>
             <div className="px-8 pb-2 pt-7 text-center">
-              <span className="text-3xl">🎉</span>
-              <h2 className="mt-2 text-lg font-semibold text-[var(--color-text)]">
+              <div className="flex justify-center"><LucidOrb size={40} /></div>
+              <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+                étape 3/3
+              </p>
+              <h2 className="mt-1.5 text-lg font-semibold tracking-tight text-[var(--color-text)]">
                 Ton cerveau est prêt
               </h2>
-              <p className="mx-auto mt-1 max-w-md text-sm text-[var(--color-muted)]">
+              <p className="mx-auto mt-1 max-w-md text-sm leading-relaxed text-[var(--color-muted)]">
                 Dernière étape : branche tes IA pour qu'elles puissent le consulter.
               </p>
             </div>
@@ -146,7 +180,7 @@ export function Onboarding({ phase, connectors, onOpenSettings, onGenerate, onDo
                 <StepDots current={2} />
                 <button
                   onClick={onDone}
-                  className="rounded-xl bg-[var(--color-accent)] px-5 py-2 text-sm font-medium text-white hover:opacity-90"
+                  className="rounded-xl bg-[var(--color-accent)] px-5 py-2 text-sm font-medium text-white transition-all hover:bg-[var(--color-accent-hover)] hover:shadow-[0_4px_20px_color-mix(in_srgb,var(--color-accent)_40%,transparent)]"
                 >
                   C'est parti
                 </button>

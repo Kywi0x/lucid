@@ -71,6 +71,9 @@ jobs:
           # n'a rien à saisir. Le client_secret n'est plus critique (PKCE), mais reste un secret CI.
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          # Crash reporting Sentry (optionnel, ADR-0016) : DSN baké au build (option_env!).
+          # Secret absent → app sans Sentry, et de toute façon opt-in côté user.
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         with:
           # Release seulement sur push de tag v* ; en workflow_dispatch (test), on
           # build sans publier de release (évite de créer un tag « main » parasite).

@@ -7,8 +7,10 @@
 
 App desktop **Tauri 2 (Rust + React/TS)** qui agrège les conversations de tes outils IA
 (Claude Code aujourd'hui) et génère, **100% en local**, un **graphe de connaissances** affiché
-en **mind map à bulles** (façon Obsidian) + un `brain.md`. L'IA tourne en local (llama.cpp + Gemma 3 4B),
-aucune donnée ne sort de la machine.
+en **mind map à bulles** (façon Obsidian) + un `brain.md`. L'IA tourne en local (llama.cpp + Gemma 3 4B).
+Positionnement **local-first** (décision Liam 2026-07-17, ex-« 100 % local ») : l'analyse reste sur la
+machine, mais le cerveau (résultat, ~2 Mo) se synchronise entre appareils via le compte Supabase
+(`src/lib/sync.ts`, bucket `backups`, `users/<uuid>/sync.zip`, last-write-wins).
 
 Principe clé : le **pipeline est agnostique de la source**. Un connecteur produit des
 `Conversation` normalisées ; le graphe, le drill-down et les ponts inter-sources marchent tout seuls.

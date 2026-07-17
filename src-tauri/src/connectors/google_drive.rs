@@ -380,10 +380,10 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     {
         let mut types: Vec<String> = all_files.iter().map(|f| f.mime_type.clone()).collect();
         types.sort(); types.dedup();
-        eprintln!("🗂 Drive total={} | types: {}", all_files.len(), types.join(", "));
+        crate::elog!("🗂 Drive total={} | types: {}", all_files.len(), types.join(", "));
         let pdf_count = all_files.iter().filter(|f| f.mime_type == "application/pdf" || f.name.to_lowercase().ends_with(".pdf")).count();
-        eprintln!("📄 PDFs trouvés : {pdf_count}");
-        eprintln!("🔧 pdftotext PATH: {:?}", which_bin("pdftotext"));
+        crate::elog!("📄 PDFs trouvés : {pdf_count}");
+        crate::elog!("🔧 pdftotext PATH: {:?}", which_bin("pdftotext"));
     }
 
     let mut convs: Vec<Conversation> = Vec::new();
@@ -392,14 +392,14 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     for f in all_files {
         // PDF, Google Slides, PowerPoint .pptx — le reste (images, vidéos…) ignoré.
         let Some(kind) = drive_kind(&f) else { continue };
-        eprintln!("📋 {kind} détecté : {} ({})", f.name, f.mime_type);
+        crate::elog!("📋 {kind} détecté : {} ({})", f.name, f.mime_type);
 
         let id = f.id.clone();
         let modified = f.modified_time.clone();
 
         // Hiérarchie complète des dossiers parents (racine → feuille immédiate).
         let container_path = build_container_path(&f.parents, &folder_names, &folder_parents);
-        eprintln!("  📁 parents_ids={:?} → path={:?}", f.parents, container_path);
+        crate::elog!("  📁 parents_ids={:?} → path={:?}", f.parents, container_path);
         let project = container_path.last().cloned().unwrap_or_else(|| "Google Drive".to_string());
         let project_slug = slugify(&project);
 
@@ -421,7 +421,7 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
         }
     }
 
-    eprintln!("📂 Google Drive : {new_count} nouveaux / {} total", convs.len());
+    crate::elog!("📂 Google Drive : {new_count} nouveaux / {} total", convs.len());
 
     let path = crate::ai::llama::app_data_dir()
         .ok_or("Dossier de données introuvable.")?
@@ -500,7 +500,7 @@ fn download_then(
     if !resp.status().is_success() { return None; }
     let bytes = resp.bytes().ok()?;
     if bytes.len() > 25 * 1024 * 1024 {
-        eprintln!("⚠️ {} trop volumineux (>25 Mo), skipped.", file.name);
+        crate::elog!("⚠️ {} trop volumineux (>25 Mo), skipped.", file.name);
         return None;
     }
     let safe_id: String = file.id.chars().take(8).filter(|c| c.is_alphanumeric()).collect();
@@ -535,7 +535,7 @@ fn export_slides_text(
         .send()
         .ok()?;
     if !resp.status().is_success() {
-        eprintln!("⚠️ export Slides {} : HTTP {}", file.name, resp.status());
+        crate::elog!("⚠️ export Slides {} : HTTP {}", file.name, resp.status());
         return None;
     }
     let text = resp.text().ok()?.trim().to_string();
@@ -671,23 +671,23 @@ fn tessdata_prefix() -> Option<std::path::PathBuf> {
 /// pdftotext (poppler) en premier ; fallback OCR (pdftoppm + tesseract) pour les PDFs scannés.
 /// `brew install poppler tesseract tesseract-lang`
 pub fn pdf_to_markdown(path: &std::path::Path, name: &str) -> Option<String> {
-    eprintln!("🔍 Extraction PDF : {name}");
+    crate::elog!("🔍 Extraction PDF : {name}");
     if let Some(text) = run_pdftotext(path) {
-        eprintln!("✅ pdftotext OK ({} chars)", text.len());
+        crate::elog!("✅ pdftotext OK ({} chars)", text.len());
         return Some(post_process(text));
     }
     // Fallback pur Rust (pdf-extract) : indispensable sur Windows où poppler
     // n'est pas embarqué — qualité moindre que pdftotext -layout mais universel.
     if let Some(text) = extract_pdf_rust(path) {
-        eprintln!("✅ pdf-extract OK ({} chars)", text.len());
+        crate::elog!("✅ pdf-extract OK ({} chars)", text.len());
         return Some(post_process(text));
     }
-    eprintln!("⚠️ extraction texte vide — tentative OCR…");
+    crate::elog!("⚠️ extraction texte vide — tentative OCR…");
     if let Some(text) = ocr_pdf(path) {
-        eprintln!("✅ OCR OK ({} chars)", text.len());
+        crate::elog!("✅ OCR OK ({} chars)", text.len());
         return Some(post_process(text));
     }
-    eprintln!("❌ Extraction impossible : {name}");
+    crate::elog!("❌ Extraction impossible : {name}");
     None
 }
 

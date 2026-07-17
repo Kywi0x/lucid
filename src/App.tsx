@@ -45,17 +45,21 @@ import {
   renameSpace,
   aiClientsStatus,
   createNoteNode,
+  deleteNode,
   importFile,
   listMcpProposals,
   resolveMcpProposal,
+  importMcpProposal,
   setNodeParent,
   seedDemo,
   type BrainProgress,
 } from "@/lib/api";
+import { pushIfDirty, startAutoSync } from "@/lib/sync";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { ShareModal } from "@/components/ShareModal";
 import { RemoteSpaceView } from "@/components/RemoteSpaceView";
 import { fetchSharedWithMe, type SharedWithMe } from "@/lib/share";
+import { supabase } from "@/lib/supabase";
 import type { McpProposal, SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
 import type {
@@ -148,6 +152,8 @@ function App() {
   const [onboarding, setOnboarding] = useState<null | "waiting" | "connect">(null);
   // Mode démo : carte explorable sans connecteur, données jetables (reset à la sortie).
   const [demoMode, setDemoMode] = useState(() => localStorage.getItem("lucid.demo") === "1");
+  // Pull cloud initial effectué (réussi ou non) — gate du seed démo.
+  const [syncChecked, setSyncChecked] = useState(false);
   function finishOnboarding() {
     localStorage.setItem("lucid.onboarded", "1");
     setOnboarding(null);
@@ -161,13 +167,15 @@ function App() {
     setDemoMode(true);
   }
   // Premier lancement (modèle prêt, pas de cerveau, jamais onboardé) :
-  // seed automatique du contenu starter — jamais d'écran bloquant.
+  // seed automatique du contenu starter — jamais d'écran bloquant. On attend
+  // la vérification cloud (syncChecked) : si un cerveau existe là-haut, c'est
+  // lui qui doit apparaître, pas la démo.
   useEffect(() => {
-    if (!booted || needsSetup !== false || graph || generating || demoMode) return;
+    if (!booted || !syncChecked || needsSetup !== false || graph || generating || demoMode) return;
     if (localStorage.getItem("lucid.onboarded") === "1") return;
     handleSeedDemo().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [booted, needsSetup, graph]);
+  }, [booted, syncChecked, needsSetup, graph]);
   // Première vraie génération terminée → propose de brancher ses IA.
   useEffect(() => {
     if (graph && onboarding === "waiting") setOnboarding("connect");
@@ -242,8 +250,19 @@ function App() {
     const unlisten = listen("brain-updated", () => {
       readBrainGraph().then((g) => { if (g) setGraph(g); });
       connectorsStatus().then(setConnectors);
+      void pushIfDirty();
     });
     return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // Sync cloud : le cerveau suit le compte entre machines (pull au boot si le
+  // cloud a bougé, push périodique quand les données locales changent).
+  useEffect(() => {
+    return startAutoSync(() => {
+      readBrainGraph().then((g) => { if (g) { setGraph(g); setRevealKey((k) => k + 1); } });
+      listSpaces().then(setSpaces);
+      connectorsStatus().then(setConnectors);
+    }, () => setSyncChecked(true));
   }, []);
 
   // `skipSync` : la sync a déjà été faite par le connecteur (bouton Synchroniser)
@@ -278,6 +297,7 @@ function App() {
       // Le cerveau réel remplace le contenu starter (côté Rust, demo.flag est retiré).
       localStorage.removeItem("lucid.demo");
       setDemoMode(false);
+      void pushIfDirty(); // nouveau cerveau → dispo sur les autres machines sans attendre le tick
     } catch (e) {
       setError(String(e));
     } finally {
@@ -389,6 +409,23 @@ function App() {
     if (g) { setGraph(g); setRevealKey((k) => k + 1); }
   }
 
+  async function handleDeleteNode(nodeId: string) {
+    const n = graph?.nodes.find((x) => x.id === nodeId);
+    const kids = n ? graph!.nodes.filter((x) => x.parent_id === nodeId).length : 0;
+    const detail = kids > 0 ? " et toutes ses sous-pages" : "";
+    if (!confirm(`Supprimer « ${n?.label ?? "ce nœud"} »${detail} ? (un snapshot est gardé)`)) return;
+    try {
+      await deleteNode(nodeId);
+      const g = await readBrainGraph();
+      if (g) {
+        setGraph(g); setRevealKey((k) => k + 1);
+        // Le nœud ouvert dans le panneau a pu partir avec le sous-arbre supprimé.
+        if (selectedNode && !g.nodes.some((x) => x.id === selectedNode.id)) closeDetail();
+      }
+      setSpaces(await listSpaces());
+    } catch (e) { setError(String(e)); }
+  }
+
   async function handleCreateNote(parentId: string, title: string) {
     const n = await createNoteNode(parentId, title);
     await refreshGraph();
@@ -410,12 +447,51 @@ function App() {
     return () => { stop = true; clearInterval(iv); };
   }, [needsSetup]);
 
+  // ── Propositions MCP distantes (IA via connecteur claude.ai/ChatGPT) :
+  //    rapatriées de Supabase vers le circuit local mcp_pending/ (mêmes bulles
+  //    fantômes, même validation), puis supprimées de la table. RLS : on ne
+  //    voit que les propositions de SES spaces. ──
+  useEffect(() => {
+    if (needsSetup || !supabase) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const { data: sess } = await supabase!.auth.getSession();
+        if (!sess.session || stop) return;
+        const { data, error } = await supabase!
+          .from("mcp_proposals")
+          .select("id,parent_id,label,content,created_at")
+          .limit(20);
+        if (error || !data?.length || stop) return;
+        for (const p of data) {
+          await importMcpProposal(p.id, p.parent_id, p.label, p.content);
+          // La ligne reste 10 min dans la table : l'IA distante peut chaîner des
+          // sous-pages (l'edge function vérifie que le parent existe encore).
+          // L'import est idempotent → la relire aux ticks suivants est sans effet,
+          // et la résolution (accepter/refuser) supprime la ligne immédiatement.
+          const age = Date.now() - new Date(p.created_at).getTime();
+          if (age > 10 * 60_000) {
+            await supabase!.from("mcp_proposals").delete().eq("id", p.id);
+          }
+        }
+      } catch { /* hors-ligne ou table absente : silencieux */ }
+    };
+    tick();
+    const iv = setInterval(tick, 10_000);
+    return () => { stop = true; clearInterval(iv); };
+  }, [needsSetup]);
+
   async function handleProposal(id: string, accept: boolean) {
     try {
-      const n = await resolveMcpProposal(id, accept);
+      const ids = await resolveMcpProposal(id, accept);
+      // Purge les lignes Supabase de toute la chaîne résolue (si distante) :
+      // sinon le poll de rapatriement les ré-importerait en bulles zombies.
+      supabase?.from("mcp_proposals").delete().in("id", ids).then(() => {}, () => {});
       setProposals(await listMcpProposals());
-      if (accept) await refreshGraph();
-      showToast(accept ? `${n > 1 ? `${n} propositions acceptées` : "Proposition acceptée"} ✓` : "Proposition refusée");
+      // L'acceptation peut enrôler le nœud dans des spaces (côté Rust) →
+      // recharger les deux, sinon la vue filtre avec l'ancien node_ids.
+      if (accept) { await refreshGraph(); setSpaces(await listSpaces()); }
+      showToast(accept ? `${ids.length > 1 ? `${ids.length} propositions acceptées` : "Proposition acceptée"} ✓` : "Proposition refusée");
     } catch (e) { showToast(String(e)); }
   }
 
@@ -424,7 +500,7 @@ function App() {
       try { await resolveMcpProposal(p.id, accept); } catch { /* déjà traitée via une chaîne parent/enfant */ }
     }
     setProposals(await listMcpProposals());
-    if (accept) await refreshGraph();
+    if (accept) { await refreshGraph(); setSpaces(await listSpaces()); }
     showToast(accept ? "Toutes les propositions acceptées ✓" : "Propositions refusées");
   }
 
@@ -639,6 +715,7 @@ function App() {
               spaces={spaces}
               onAddNodeToSpace={handleAddNodeToSpace}
               onMoveNode={handleMoveNode}
+              onDeleteNode={handleDeleteNode}
               onImportFiles={handleImportDrop}
               onBackgroundClick={closeDetail}
               panelOffset={selectedNode && !nodeExpanded ? 480 : 0}
@@ -1009,7 +1086,16 @@ function App() {
 
           {/* ── Space partagé avec moi, ouvert en lecture seule ── */}
           {remoteSpaceId && (
-            <RemoteSpaceView spaceId={remoteSpaceId} onClose={() => setRemoteSpaceId(null)} />
+            <RemoteSpaceView
+              spaceId={remoteSpaceId}
+              onClose={() => setRemoteSpaceId(null)}
+              onForked={async (proj) => {
+                setRemoteSpaceId(null);
+                await refreshGraph();
+                setFocus({ id: proj.id, k: Date.now() });
+                showToast(`« ${proj.label} » copié dans ton cerveau ✓`);
+              }}
+            />
           )}
 
           {/* ── Modale Partage de space ── */}

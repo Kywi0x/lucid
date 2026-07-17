@@ -68,6 +68,8 @@ export interface BrainNode {
   /** Date (YYYY-MM-DD) d'apparition — feuilles/notes ; absente = toujours visible (timeline). */
   date?: string | null;
   content?: string;
+  /** Texte source embarqué par le pipeline (fichier, conversation…). */
+  source_text?: string;
   // Provenance (nœuds feuilles uniquement)
   connector?: string;
   source_id?: string;

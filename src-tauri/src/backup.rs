@@ -11,6 +11,7 @@ const FILES: &[&str] = &[
     "brain.json",
     "brain.md",
     "spaces.json",
+    "deleted_nodes.json",
     "brain_cache.json",
     "notion_cache.json",
     "google_drive_conversations.json",
@@ -49,6 +50,22 @@ pub fn export_in(dir: &Path) -> Result<Vec<u8>, String> {
         zip.finish().map_err(|e| e.to_string())?;
     }
     Ok(buf.into_inner())
+}
+
+/// Empreinte des données user : mtime le plus récent (secs epoch) du périmètre
+/// de sauvegarde. La sync cloud pousse quand elle change — une suppression seule
+/// ne la fait pas bouger, mais toute suppression réécrit brain.json à côté.
+pub fn fingerprint_in(dir: &Path) -> u64 {
+    let mtime = |p: &Path| -> u64 {
+        p.metadata().ok()
+            .and_then(|md| md.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    let files = FILES.iter().map(|f| dir.join(f));
+    let dirs = DIRS.iter().flat_map(|d| walk(&dir.join(d)));
+    files.chain(dirs).map(|p| mtime(&p)).max().unwrap_or(0)
 }
 
 /// Fichiers d'une arborescence (récursif, fichiers seulement).
@@ -125,6 +142,17 @@ mod tests {
         // Le brain.json écrasé a été gardé de côté
         assert!(dst.join("brain.json.avant-restauration").exists());
         for d in [&src, &dst] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn fingerprint_nul_sans_donnees_puis_positif_apres_ecriture() {
+        let dir = std::env::temp_dir().join("brainlink_test_fingerprint");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(fingerprint_in(&dir), 0);
+        std::fs::write(dir.join("brain.json"), "{}").unwrap();
+        assert!(fingerprint_in(&dir) > 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

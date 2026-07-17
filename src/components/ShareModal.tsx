@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Check, Copy, Globe, Loader2, Lock, Trash2, X } from "lucide-react";
 import {
-  fetchShareState, publishSpace, unpublishSpace,
+  fetchShareState, publishSpace, unpublishSpace, mcpUrl, ensureMcpToken,
   type ShareState,
 } from "@/lib/share";
+import { Bot } from "lucide-react";
 import type { BrainGraph, Space } from "@/lib/types";
 import { cn, copyText } from "@/lib/utils";
+import { McpConnectGuide } from "@/components/McpConnectGuide";
 
 const EMAIL_RE = /^\S+@\S+\.\S+$/;
 
@@ -23,12 +25,18 @@ export function ShareModal({ space, subgraph, onClose }: {
   const [emailDraft, setEmailDraft] = useState("");
   const [busy, setBusy] = useState<"publish" | "unpublish" | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedMcp, setCopiedMcp] = useState(false);
+  const [includeSources, setIncludeSources] = useState(false);
+  const [mcpToken, setMcpToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchShareState(space)
-      .then((s) => {
-        if (s) { setState(s); setVisibility(s.visibility); setEmails(s.allowed_emails); }
+      .then(async (s) => {
+        if (s) {
+          setState(s); setVisibility(s.visibility); setEmails(s.allowed_emails);
+          setMcpToken(await ensureMcpToken(s.id));
+        }
       })
       .catch((e) => setError(String(e instanceof Error ? e.message : e)))
       .finally(() => setLoading(false));
@@ -44,8 +52,9 @@ export function ShareModal({ space, subgraph, onClose }: {
   async function handlePublish() {
     setBusy("publish"); setError(null);
     try {
-      const s = await publishSpace(space, subgraph, { visibility, allowedEmails: emails });
+      const s = await publishSpace(space, subgraph, { visibility, allowedEmails: emails, includeSources });
       setState(s);
+      setMcpToken(await ensureMcpToken(s.id));
       if (await copyText(s.url)) { setCopied(true); setTimeout(() => setCopied(false), 2000); }
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -155,14 +164,94 @@ export function ShareModal({ space, subgraph, onClose }: {
               </div>
             )}
 
-            {/* Lien actuel */}
+            {/* Opt-in texte des sources */}
+            <label className="mb-4 flex cursor-pointer items-start gap-2.5 rounded-xl border border-[var(--color-border)] px-3 py-2.5 transition-colors hover:bg-[var(--color-surface-2)]/50">
+              <input
+                type="checkbox"
+                checked={includeSources}
+                onChange={(e) => setIncludeSources(e.target.checked)}
+                className="mt-0.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-xs font-medium text-[var(--color-text)]">
+                  Inclure le texte des sources
+                </span>
+                <span className="block text-[11px] leading-relaxed text-[var(--color-muted)]">
+                  Embarque le contenu des fichiers et conversations — indispensable pour
+                  que les IA puissent vraiment lire le space. Sinon, seuls titres,
+                  résumés et notes éditées sortent.
+                </span>
+              </span>
+            </label>
+
+            {/* ── Les deux accès, clairement séparés : humains vs IA ── */}
             {state && (
-              <div className="mb-4 flex items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2">
-                <p className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--color-muted)]">{state.url}</p>
-                <button onClick={handleCopy} title="Copier le lien"
-                  className="shrink-0 rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
-                  {copied ? <Check className="size-3.5 text-[var(--color-ok)]" /> : <Copy className="size-3.5" />}
-                </button>
+              <div className="mb-4">
+                <p className="mb-1.5 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+                  Liens d'accès
+                </p>
+                <div className="overflow-hidden rounded-xl border border-[var(--color-border)]">
+                  {/* Humains : lecture seule */}
+                  <div className="flex items-center gap-2.5 px-3 py-2.5">
+                    <Globe className="size-4 shrink-0 text-[var(--color-muted)]" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium text-[var(--color-text)]">
+                        Lien de lecture
+                        <span className="ml-2 font-mono text-[9px] uppercase tracking-wide text-[var(--color-muted)]">humains · lecture seule</span>
+                      </p>
+                      <p className="truncate font-mono text-[10.5px] text-[var(--color-muted)]">{state.url}</p>
+                    </div>
+                    <button onClick={handleCopy} title="Copier le lien de lecture"
+                      className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
+                      {copied ? <Check className="size-3.5 text-[var(--color-ok)]" /> : <Copy className="size-3.5" />}
+                    </button>
+                  </div>
+
+                  <div className="border-t border-[var(--color-border)]" />
+
+                  {/* IA : lecture + propositions (token distinct, jamais déductible du lien) */}
+                  {visibility === "public" && mcpToken && mcpUrl(mcpToken) ? (
+                    <div className="flex items-center gap-2.5 bg-[var(--color-accent-soft)]/40 px-3 py-2.5">
+                      <Bot className="size-4 shrink-0 text-[var(--color-accent)]" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium text-[var(--color-text)]">
+                          Connecteur IA
+                          <span className="ml-2 font-mono text-[9px] uppercase tracking-wide text-[var(--color-accent)]">mcp · lecture + propositions</span>
+                        </p>
+                        <p className="truncate font-mono text-[10.5px] text-[var(--color-muted)]">{mcpUrl(mcpToken)}</p>
+                        <p className="mt-0.5 text-[10px] leading-relaxed text-[var(--color-muted)]">
+                          Pour <strong>tes</strong> IA (claude.ai, ChatGPT…). Elles lisent le space et
+                          peuvent proposer des notes — que tu valides ici. Lien distinct du lien de
+                          lecture : le partager, c'est donner ce pouvoir.
+                        </p>
+                      </div>
+                      <button
+                        onClick={async () => {
+                          if (await copyText(mcpUrl(mcpToken)!)) { setCopiedMcp(true); setTimeout(() => setCopiedMcp(false), 2000); }
+                        }}
+                        title="Copier l'URL du connecteur IA"
+                        className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
+                      >
+                        {copiedMcp ? <Check className="size-3.5 text-[var(--color-ok)]" /> : <Copy className="size-3.5" />}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2.5 px-3 py-2.5 opacity-60">
+                      <Bot className="size-4 shrink-0 text-[var(--color-muted)]" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium text-[var(--color-text)]">Connecteur IA</p>
+                        <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
+                          {visibility !== "public"
+                            ? "Disponible pour les spaces publics uniquement (v1)."
+                            : "Indisponible — exécute docs/supabase-mcp-proposals.sql dans Supabase (une fois), puis rouvre cette fenêtre."}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                {visibility === "public" && mcpToken && mcpUrl(mcpToken) && (
+                  <McpConnectGuide url={mcpUrl(mcpToken)} />
+                )}
               </div>
             )}
 

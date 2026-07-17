@@ -1,28 +1,48 @@
 import { useEffect, useState } from "react";
-import { ArrowLeft, Check, Copy, Eye, Loader2 } from "lucide-react";
+import { ArrowLeft, Check, Copy, Eye, FolderDown, Loader2 } from "lucide-react";
 import { BrainMap } from "@/components/BrainMap";
 import { ReadOnlyDetail } from "@/components/ReadOnlyDetail";
 import { fetchSharedSpace, sharedSpaceUrl } from "@/lib/share";
 import { payloadToGraph } from "@/lib/shared-space";
+import { importSharedSpace } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import type { BrainGraph, BrainNode } from "@/lib/types";
 import { cn, copyText } from "@/lib/utils";
 
-/** Un space partagé avec moi, ouvert DANS l'app — lecture seule (v1) :
- *  même constellation, même panneau que le viewer web. */
-export function RemoteSpaceView({ spaceId, onClose }: { spaceId: string; onClose: () => void }) {
+/** Un space partagé avec moi, ouvert DANS l'app — lecture seule, avec le geste
+ *  « Copier dans mon cerveau » (fork V1) : il devient un projet à moi. */
+export function RemoteSpaceView({ spaceId, onClose, onForked }: {
+  spaceId: string;
+  onClose: () => void;
+  /** Appelé après un fork réussi, avec le nœud projet créé. */
+  onForked?: (proj: BrainNode) => void;
+}) {
   const [graph, setGraph] = useState<BrainGraph | null>(null);
+  const [rawData, setRawData] = useState<unknown>(null);
   const [title, setTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<BrainNode | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [forking, setForking] = useState(false);
+  const [forkErr, setForkErr] = useState<string | null>(null);
+
+  async function handleFork() {
+    if (!rawData || forking) return;
+    setForking(true); setForkErr(null);
+    try {
+      const proj = await importSharedSpace(rawData, spaceId);
+      onForked?.(proj);
+    } catch (e) {
+      setForkErr(String(e instanceof Error ? e.message : e));
+    } finally { setForking(false); }
+  }
 
   useEffect(() => {
     let cancelled = false;
     const load = () =>
       fetchSharedSpace(spaceId)
-        .then((row) => { if (!cancelled) { setTitle(row.title); setGraph(payloadToGraph(row.data)); } })
+        .then((row) => { if (!cancelled) { setTitle(row.title); setRawData(row.data); setGraph(payloadToGraph(row.data)); } })
         .catch((e) => { if (!cancelled) setError(String(e instanceof Error ? e.message : e)); });
     load();
 
@@ -100,7 +120,22 @@ export function RemoteSpaceView({ spaceId, onClose }: { spaceId: string; onClose
             >
               {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             </button>
+            <button
+              onClick={handleFork}
+              disabled={forking || !rawData}
+              title="Crée une copie de ce space comme projet dans ton cerveau — éditable, lisible par tes IA"
+              className="ml-1 flex items-center gap-1.5 rounded-full bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-[var(--color-accent-hover)] disabled:opacity-50"
+            >
+              {forking ? <Loader2 className="size-3 animate-spin" /> : <FolderDown className="size-3" />}
+              Copier dans mon cerveau
+            </button>
           </div>
+
+          {forkErr && (
+            <p className="absolute left-3 top-14 z-20 max-w-sm rounded-lg border border-[var(--color-err)]/30 bg-[var(--color-surface)] px-3 py-2 text-[11px] text-[var(--color-err)] shadow-[var(--shadow-float)]">
+              {forkErr}
+            </p>
+          )}
 
           {selected && (
             <div
