@@ -496,9 +496,13 @@ function App() {
   }
 
   async function handleAllProposals(accept: boolean) {
+    const resolved: string[] = [];
     for (const p of proposals) {
-      try { await resolveMcpProposal(p.id, accept); } catch { /* déjà traitée via une chaîne parent/enfant */ }
+      try { resolved.push(...await resolveMcpProposal(p.id, accept)); } catch { /* déjà traitée via une chaîne parent/enfant */ }
     }
+    // Purge Supabase comme le clic unitaire : sinon le poll de rapatriement
+    // ré-importe tout en bulles zombies dans les 10 s.
+    if (resolved.length) supabase?.from("mcp_proposals").delete().in("id", resolved).then(() => {}, () => {});
     setProposals(await listMcpProposals());
     if (accept) { await refreshGraph(); setSpaces(await listSpaces()); }
     showToast(accept ? "Toutes les propositions acceptées ✓" : "Propositions refusées");

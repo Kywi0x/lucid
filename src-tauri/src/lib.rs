@@ -919,7 +919,13 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
         }
         chain.reverse();
         for p in &chain {
-            insert_note_node_in(dir, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone(), None)?;
+            match insert_note_node_in(dir, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone(), None) {
+                Ok(_) => {}
+                // Réimport zombie (le poll Supabase a recréé une proposition déjà
+                // acceptée) : le nœud vit déjà dans le cerveau — on nettoie juste.
+                Err(e) if e.ends_with("déjà présent.") => {}
+                Err(e) => return Err(e),
+            }
             std::fs::remove_file(mcp_pending_dir(dir).join(format!("{}.json", p.id)))
                 .map_err(|e| e.to_string())?;
         }
@@ -977,9 +983,18 @@ fn import_mcp_proposal(id: String, parent_id: String, label: String, content: St
     if label.trim().is_empty() {
         return Err("label vide".into());
     }
-    let dir = ai::llama::app_data_dir()
-        .ok_or("Dossier de données introuvable.")?
-        .join("mcp_pending");
+    let data_dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    // Déjà accepté (le nœud vit dans brain.json) → ne pas recréer une bulle
+    // zombie que ✓ ne pourrait plus résoudre (« Nœud déjà présent »).
+    if let Ok(g) = std::fs::read_to_string(data_dir.join("brain.json"))
+        .map_err(|e| e.to_string())
+        .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).map_err(|e| e.to_string()))
+    {
+        if g.nodes.iter().any(|n| n.id == id) {
+            return Ok(());
+        }
+    }
+    let dir = data_dir.join("mcp_pending");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let proposal = serde_json::json!({
         "id": id,
@@ -1338,6 +1353,19 @@ mod mcp_proposal_tests {
         let ids = graph_ids(&dir);
         assert!(ids.contains(&"mcp-1".into()) && ids.contains(&"mcp-3".into()));
         assert!(load_proposals_in(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepter_un_zombie_deja_dans_le_cerveau_nettoie_sans_erreur() {
+        let dir = setup("zombie");
+        propose(&dir, "mcp-1", "root", "Note");
+        assert_eq!(resolve_proposal_in(&dir, "mcp-1", true).unwrap().len(), 1);
+        // Le poll Supabase recrée la proposition déjà acceptée (réimport zombie).
+        propose(&dir, "mcp-1", "root", "Note");
+        assert_eq!(resolve_proposal_in(&dir, "mcp-1", true).unwrap().len(), 1);
+        assert!(load_proposals_in(&dir).is_empty());
+        assert_eq!(graph_ids(&dir).iter().filter(|i| *i == "mcp-1").count(), 1); // pas de doublon
         let _ = std::fs::remove_dir_all(&dir);
     }
 

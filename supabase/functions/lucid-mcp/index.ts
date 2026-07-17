@@ -156,25 +156,72 @@ async function proposalExists(id: string, spaceId: string): Promise<boolean> {
   return ((await r.json()) as unknown[]).length > 0;
 }
 
+/// Vérifie que `parentId` est une page du space OU une proposition déjà déposée.
+async function assertParent(spaceId: string, parentId: string): Promise<void> {
+  const payload = await loadSpace(spaceId); // vérifie aussi que le space est public
+  if (!payload.nodes.some((n) => n.id === parentId) && !(await proposalExists(parentId, spaceId))) {
+    throw new Error(`parent \`${parentId}\` introuvable — utilise brain_overview/brain_search pour l'id d'une page existante, ou l'id renvoyé par un dépôt précédent pour créer une sous-page`);
+  }
+}
+
+async function insertProposals(rows: ProposalRow[]): Promise<void> {
+  // Uuids générés côté function : pas de RETURNING (la RLS interdit — à raison —
+  // la relecture des propositions à l'anon, et PostgREST exige un droit select
+  // pour representation).
+  const r = await fetch(`${env("SUPABASE_URL")}/rest/v1/mcp_proposals`, {
+    method: "POST",
+    headers: { ...anonHeaders(), "content-type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify(rows),
+  });
+  if (!r.ok) throw new Error(`dépôt refusé (${r.status}) — le space est-il toujours public ?`);
+}
+
 /// Dépose une PROPOSITION de note (jamais d'écriture directe) : elle transite
 /// par la table mcp_proposals, l'app du propriétaire la rapatrie dans son
 /// circuit local de validation (bulles fantômes), puis la supprime.
 async function addProposal(spaceId: string, parentId: string, label: string, content: string): Promise<string> {
   if (!label.trim()) throw new Error("label vide");
-  const payload = await loadSpace(spaceId); // vérifie aussi que le space est public
-  if (!payload.nodes.some((n) => n.id === parentId) && !(await proposalExists(parentId, spaceId))) {
-    throw new Error(`parent \`${parentId}\` introuvable — utilise brain_overview/brain_search pour l'id d'une page existante, ou l'id renvoyé par un brain_add_note précédent pour créer une sous-page`);
-  }
-  // Uuid généré ici : pas de RETURNING (la RLS interdit — à raison — la relecture
-  // des propositions à l'anon, et PostgREST exige un droit select pour representation).
+  await assertParent(spaceId, parentId);
   const proposalId = crypto.randomUUID();
-  const r = await fetch(`${env("SUPABASE_URL")}/rest/v1/mcp_proposals`, {
-    method: "POST",
-    headers: { ...anonHeaders(), "content-type": "application/json", Prefer: "return=minimal" },
-    body: JSON.stringify({ id: proposalId, space_id: spaceId, parent_id: parentId, label: label.trim(), content }),
-  });
-  if (!r.ok) throw new Error(`dépôt refusé (${r.status}) — le space est-il toujours public ?`);
+  await insertProposals([{ id: proposalId, space_id: spaceId, parent_id: parentId, label: label.trim(), content }]);
   return `Proposition \`${proposalId}\` déposée. Elle apparaîtra dans l'app Lucid du propriétaire (bulle en attente) et sera visible dans le cerveau seulement s'il l'accepte. Pour proposer une sous-page de celle-ci, rappelle brain_add_note avec parent_id="${proposalId}".`;
+}
+
+// ── Arbre de propositions (plusieurs nœuds/sous-nœuds en UN appel) ────────────
+
+type NoteTree = { label: string; content?: string; children?: NoteTree[] };
+type ProposalRow = { id: string; space_id: string; parent_id: string; label: string; content: string };
+
+/// Aplati un arbre imbriqué en lignes mcp_proposals chaînées par parent_id.
+/// Pur (hors uuid) — exporté pour les tests. Bornes anti-abus alignées sur les
+/// checks SQL (label ≤ 200, content ≤ 100k) + caps arbre.
+export function flattenTree(spaceId: string, rootParentId: string, nodes: NoteTree[]): { rows: ProposalRow[]; outline: string } {
+  const rows: ProposalRow[] = [];
+  let outline = "";
+  const walk = (list: NoteTree[], parent: string, depth: number) => {
+    if (depth >= 8) throw new Error("profondeur max : 8 niveaux");
+    for (const n of list) {
+      const label = (n.label ?? "").trim();
+      if (!label || label.length > 200) throw new Error(`label invalide (1–200 caractères) : « ${label.slice(0, 40)} »`);
+      const content = n.content ?? "";
+      if (content.length > 100_000) throw new Error(`content trop long pour « ${label} » (100k max)`);
+      if (rows.length >= 60) throw new Error("60 notes max par appel — découpe l'arbre en plusieurs appels");
+      const id = crypto.randomUUID();
+      rows.push({ id, space_id: spaceId, parent_id: parent, label, content });
+      outline += `${"  ".repeat(depth)}- ${label} → \`${id}\`\n`;
+      if (n.children?.length) walk(n.children, id, depth + 1);
+    }
+  };
+  walk(nodes, rootParentId, 0);
+  if (!rows.length) throw new Error("nodes vide — passe au moins une note");
+  return { rows, outline };
+}
+
+async function addTree(spaceId: string, parentId: string, nodes: NoteTree[]): Promise<string> {
+  await assertParent(spaceId, parentId);
+  const { rows, outline } = flattenTree(spaceId, parentId, nodes);
+  await insertProposals(rows);
+  return `${rows.length} proposition(s) déposée(s) sous \`${parentId}\` :\n${outline}\nElles apparaîtront dans l'app Lucid du propriétaire (bulles en attente) — accepter une note accepte automatiquement ses parents. Pour prolonger une branche, rappelle brain_add_tree (ou brain_add_note) avec l'id de la note concernée.`;
 }
 
 // ── Protocole MCP (JSON-RPC 2.0 sur POST, stateless) ─────────────────────────
@@ -197,7 +244,7 @@ const TOOLS = [
   },
   {
     name: "brain_add_note",
-    description: "PROPOSE une nouvelle note sous une page existante (parent_id via brain_overview/brain_search) OU sous une proposition précédente (l'id renvoyé) pour construire un arbre de sous-pages. N'écrit jamais directement : le propriétaire valide dans Lucid.",
+    description: "PROPOSE une seule note sous une page existante (parent_id via brain_overview/brain_search) ou sous une proposition précédente. Pour plusieurs nœuds/sous-nœuds, préfère brain_add_tree. N'écrit jamais directement : le propriétaire valide dans Lucid.",
     inputSchema: {
       type: "object",
       properties: {
@@ -206,6 +253,30 @@ const TOOLS = [
         content: { type: "string", description: "contenu markdown" },
       },
       required: ["parent_id", "label"],
+    },
+  },
+  {
+    name: "brain_add_tree",
+    description: "PROPOSE une arborescence complète de notes (nœuds + sous-nœuds, jusqu'à 8 niveaux / 60 notes) en UN appel, sous une page existante ou une proposition précédente. Chaque nœud : {label, content?, children?} — children a la même forme, récursivement. N'écrit jamais directement : le propriétaire valide dans Lucid.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent_id: { type: "string", description: "id de la page (ou proposition) sous laquelle greffer l'arbre" },
+        nodes: {
+          type: "array",
+          description: "arbre imbriqué : [{label, content?, children?: [même forme]}]",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string", description: "titre de la note" },
+              content: { type: "string", description: "contenu markdown" },
+              children: { type: "array", description: "sous-notes, même forme récursive", items: { type: "object" } },
+            },
+            required: ["label"],
+          },
+        },
+      },
+      required: ["parent_id", "nodes"],
     },
   },
 ];
@@ -262,12 +333,20 @@ export async function handler(req: Request): Promise<Response> {
       return rpcResult(id, { tools: TOOLS });
     case "tools/call": {
       const name = params?.name as string;
-      const args = (params?.arguments ?? {}) as Record<string, string>;
+      // deno-lint-ignore no-explicit-any
+      const args = (params?.arguments ?? {}) as Record<string, any>;
       try {
         if (!mcpToken) throw new Error("paramètre ?token=<token-mcp> manquant — copie l'URL MCP depuis la modale Partager de Lucid (le lien de partage public ne donne pas accès au MCP)");
         const spaceId = await spaceIdFromToken(mcpToken);
         if (name === "brain_add_note") {
           const text = await addProposal(spaceId, args.parent_id ?? "", args.label ?? "", args.content ?? "");
+          return rpcResult(id, { content: [{ type: "text", text }] });
+        }
+        if (name === "brain_add_tree") {
+          // Certains clients sérialisent l'argument array en string JSON.
+          const nodes = typeof args.nodes === "string" ? JSON.parse(args.nodes) : args.nodes;
+          if (!Array.isArray(nodes)) throw new Error("nodes doit être un tableau [{label, content?, children?}]");
+          const text = await addTree(spaceId, args.parent_id ?? "", nodes as NoteTree[]);
           return rpcResult(id, { content: [{ type: "text", text }] });
         }
         const payload = await loadSpace(spaceId);
