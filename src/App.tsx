@@ -19,6 +19,7 @@ import { FolderView } from "@/components/FolderView";
 import { SpacesPanel, AssistantPanel } from "@/components/LeftSidebar";
 import { SettingsModal } from "@/components/SettingsModal";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { UpdateBanner } from "@/components/UpdateBanner";
 import {
   GenerateEmpty,
   GenerateProgress,
@@ -883,6 +884,8 @@ function App() {
               />
             </div>
           )}
+
+          <UpdateBanner />
 
           {/* ── Toast (feedback import drag & drop) ── */}
           {toast && (

@@ -58,11 +58,32 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pwsh scripts/bundle-sidecars.ps1
 
+      # Overlay de config par canal : version dérivée du tag, et endpoint updater
+      # beta si le tag contient un pré-release (ex. v0.2.0-beta.1). Sans tag → {}.
+      # Canal stable = endpoint par défaut de tauri.conf.json (releases/latest).
+      - name: Channel overlay
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+            if [[ "$VER" == *-* ]]; then
+              printf '{"version":"%s","plugins":{"updater":{"endpoints":["https://github.com/Kywi0x/lucid/releases/download/beta/latest.json"]}}}' "$VER" > overlay.conf.json
+            else
+              printf '{"version":"%s"}' "$VER" > overlay.conf.json
+            fi
+          else
+            echo '{}' > overlay.conf.json
+          fi
+          cat overlay.conf.json
+
       - name: Build + release
         id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signature des artefacts updater (minisign) — obligatoire pour tauri-plugin-updater.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           # Compte/sauvegarde cloud Supabase (optionnel) : si les secrets sont vides,
           # supabase=null → l'app reste 100 % locale, section Compte « non configuré ».
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
@@ -81,8 +102,8 @@ jobs:
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Lucid {0}', github.ref_name) || '' }}
           releaseBody: "Téléchargez le .dmg (macOS) ou le .exe (Windows) ci-dessous."
           releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.args }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          args: ${{ matrix.args }} --config overlay.conf.json
 
       # Copie à nom fixe → lien stable. Tag v* → sa release ; push main → release `alpha`.
       - name: Stable-named asset (macOS)
@@ -114,3 +135,24 @@ jobs:
             gh release create $env:TARGET --prerelease --title "Lucid ($env:TARGET — dernier build de main)" --notes "Build automatique du dernier commit sur main."
           }
           gh release upload $env:TARGET "Lucid-Windows-setup.exe" --clobber
+
+  # Pointeur du canal beta : release fixe `beta` dont le latest.json est réécrit à
+  # chaque tag (beta ET stable — semver fait que 0.2.0 > 0.2.0-beta.N, donc les
+  # testeurs beta reçoivent aussi les stables). Le canal stable n'a pas besoin de
+  # pointeur : releases/latest/download/latest.json est géré par GitHub.
+  updater-pointer:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repoint beta channel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" -R "$REPO" -p latest.json
+          gh release view beta -R "$REPO" >/dev/null 2>&1 || \
+            gh release create beta --prerelease -R "$REPO" \
+              --title "Canal beta (pointeur updater)" \
+              --notes "Release technique : héberge le latest.json du canal beta. Ne pas supprimer."
+          gh release upload beta latest.json --clobber -R "$REPO"

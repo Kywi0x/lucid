@@ -19,6 +19,8 @@
     "dialog:default",
     "dialog:allow-open",
     "clipboard-manager:allow-write-text",
-    "sentry:default"
+    "sentry:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

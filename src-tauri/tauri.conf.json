@@ -27,8 +27,17 @@
       }
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExMTdGQTg5MjY1MUMyQ0IKUldUTHdsRW1pZm9Yb1M0MDFGTzFhWG1CNUtsMWE2SHFVbERDMVFaVzRHWTF6eFozTTU3dGpFRE0K",
+      "endpoints": [
+        "https://github.com/Kywi0x/lucid/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
