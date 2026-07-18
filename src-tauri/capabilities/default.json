@@ -21,6 +21,7 @@
     "clipboard-manager:allow-write-text",
     "sentry:default",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "core:window:allow-destroy"
   ]
 }

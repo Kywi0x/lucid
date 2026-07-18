@@ -1,13 +1,13 @@
 name: Release (dmg + exe)
 
-# Deux déclencheurs :
-#  - Tag `v*` (ex. `git tag v0.1.0 && git push origin v0.1.0`) → release versionnée figée.
-#  - Push sur `main` → build auto qui met à jour l'asset de la release `alpha`
-#    (URL stable `releases/download/alpha/Lucid-macOS-arm64.dmg`, toujours = dernier main).
-# Dans les deux cas : build macOS (.dmg) + Windows (.exe NSIS) + copies à nom fixe.
+# Un seul déclencheur de livraison : les tags `v*`.
+#  - `vX.Y.Z-beta.N` (depuis preprod) → prerelease, canal updater beta.
+#  - `vX.Y.Z` (depuis main) → release stable, canal updater stable + site.
+# (La release roulante `alpha` sur push main a été supprimée le 2026-07-18 :
+#  3 sources de téléchargement = les testeurs installaient le mauvais build.)
+# workflow_dispatch = build de validation sans publication.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -105,41 +105,35 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           args: ${{ matrix.args }} --config overlay.conf.json
 
-      # Copie à nom fixe → lien stable. Tag v* → sa release ; push main → release `alpha`.
+      # Copie à nom fixe dans la release du tag → le site pointe
+      # `releases/latest/download/<nom fixe>` (= dernière stable, géré par GitHub).
       - name: Stable-named asset (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'alpha' }}
         run: |
           dmg=$(ls src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg | head -1)
           cp "$dmg" "Lucid-macOS-arm64.dmg"
-          # ponytail: crée la release alpha si absente ; sinon on clobbe juste l'asset.
-          gh release view "$TARGET" >/dev/null 2>&1 || \
-            gh release create "$TARGET" --prerelease \
-              --title "Lucid ($TARGET — dernier build de main)" \
-              --notes "Build automatique du dernier commit sur \`main\`. Les installateurs ci-dessous sont mis à jour à chaque push."
-          gh release upload "$TARGET" "Lucid-macOS-arm64.dmg" --clobber
+          gh release upload "$GITHUB_REF_NAME" "Lucid-macOS-arm64.dmg" --clobber
 
       - name: Stable-named asset (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'alpha' }}
         shell: pwsh
         run: |
           $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           Copy-Item $exe.FullName "Lucid-Windows-setup.exe"
-          gh release view $env:TARGET *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TARGET --prerelease --title "Lucid ($env:TARGET — dernier build de main)" --notes "Build automatique du dernier commit sur main."
-          }
-          gh release upload $env:TARGET "Lucid-Windows-setup.exe" --clobber
+          gh release upload $env:GITHUB_REF_NAME "Lucid-Windows-setup.exe" --clobber
 
-  # Pointeur du canal beta : release fixe `beta` dont le latest.json est réécrit à
-  # chaque tag (beta ET stable — semver fait que 0.2.0 > 0.2.0-beta.N, donc les
-  # testeurs beta reçoivent aussi les stables). Le canal stable n'a pas besoin de
-  # pointeur : releases/latest/download/latest.json est géré par GitHub.
+  # Pointeur du canal beta : release fixe `beta` réécrite à chaque tag (beta ET
+  # stable — semver fait que 0.2.0 > 0.2.0-beta.N, donc les testeurs beta
+  # reçoivent aussi les stables). Elle héberge :
+  #  - latest.json (endpoint updater du canal beta) ;
+  #  - les installateurs à nom fixe → LE lien à donner aux testeurs, toujours
+  #    le même : releases/download/beta/Lucid-macOS-arm64.dmg / Lucid-Windows-setup.exe
+  #    (une seule installation ; ensuite l'app se met à jour toute seule).
+  # Le canal stable n'a pas besoin de pointeur : releases/latest/... est géré par GitHub.
   updater-pointer:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
@@ -150,9 +144,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          gh release download "$GITHUB_REF_NAME" -R "$REPO" -p latest.json
+          gh release download "$GITHUB_REF_NAME" -R "$REPO" -p latest.json -p "Lucid-macOS-arm64.dmg" -p "Lucid-Windows-setup.exe"
           gh release view beta -R "$REPO" >/dev/null 2>&1 || \
             gh release create beta --prerelease -R "$REPO" \
-              --title "Canal beta (pointeur updater)" \
-              --notes "Release technique : héberge le latest.json du canal beta. Ne pas supprimer."
-          gh release upload beta latest.json --clobber -R "$REPO"
+              --title "Lucid — canal beta (testeurs)" \
+              --notes "Toujours la dernière beta. Installez une fois : l'app se met ensuite à jour toute seule. Ne pas supprimer cette release (elle sert aussi de canal de mise à jour)."
+          gh release upload beta latest.json Lucid-macOS-arm64.dmg Lucid-Windows-setup.exe --clobber -R "$REPO"

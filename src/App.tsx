@@ -55,7 +55,7 @@ import {
   seedDemo,
   type BrainProgress,
 } from "@/lib/api";
-import { pushIfDirty, startAutoSync } from "@/lib/sync";
+import { syncNow, startAutoSync } from "@/lib/sync";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { ShareModal } from "@/components/ShareModal";
 import { RemoteSpaceView } from "@/components/RemoteSpaceView";
@@ -251,15 +251,17 @@ function App() {
     const unlisten = listen("brain-updated", () => {
       readBrainGraph().then((g) => { if (g) setGraph(g); });
       connectorsStatus().then(setConnectors);
-      void pushIfDirty();
+      void syncNow();
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  // Sync cloud : le cerveau suit le compte entre machines (pull au boot si le
-  // cloud a bougé, push périodique quand les données locales changent).
+  // Sync cloud : le cerveau suit le compte entre machines (événementiel :
+  // watcher local + ping Realtime, filets boot/60 s/focus/fermeture — voir lib/sync.ts).
   useEffect(() => {
     return startAutoSync(() => {
+      // Un pull a remplacé le local : c'est un vrai cerveau, plus la démo.
+      setDemoMode(false);
       readBrainGraph().then((g) => { if (g) { setGraph(g); setRevealKey((k) => k + 1); } });
       listSpaces().then(setSpaces);
       connectorsStatus().then(setConnectors);
@@ -298,7 +300,7 @@ function App() {
       // Le cerveau réel remplace le contenu starter (côté Rust, demo.flag est retiré).
       localStorage.removeItem("lucid.demo");
       setDemoMode(false);
-      void pushIfDirty(); // nouveau cerveau → dispo sur les autres machines sans attendre le tick
+      void syncNow(); // nouveau cerveau → dispo sur les autres machines sans attendre le tick
     } catch (e) {
       setError(String(e));
     } finally {
@@ -408,6 +410,16 @@ function App() {
   async function refreshGraph() {
     const g = await readBrainGraph();
     if (g) { setGraph(g); setRevealKey((k) => k + 1); }
+  }
+
+  // Après une restauration manuelle (Réglages → Compte) : les données restaurées
+  // sont un vrai cerveau (fin de la démo), et les espaces ont pu changer aussi.
+  async function handleRestored() {
+    localStorage.removeItem("lucid.demo");
+    setDemoMode(false);
+    await refreshGraph();
+    listSpaces().then(setSpaces);
+    connectorsStatus().then(setConnectors);
   }
 
   async function handleDeleteNode(nodeId: string) {
@@ -1125,7 +1137,7 @@ function App() {
               onSpaceCreate={handleSpaceCreate}
               onSpaceRename={handleSpaceRename}
               onSpaceDelete={handleSpaceDelete}
-              onRestored={refreshGraph}
+              onRestored={handleRestored}
             />
           )}
 
@@ -1190,7 +1202,7 @@ function App() {
           onSpaceCreate={handleSpaceCreate}
           onSpaceRename={handleSpaceRename}
           onSpaceDelete={handleSpaceDelete}
-              onRestored={refreshGraph}
+              onRestored={handleRestored}
         />
       )}
     </div>

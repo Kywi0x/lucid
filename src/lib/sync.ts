@@ -1,16 +1,22 @@
 /** Sync cloud du cerveau : le brain suit le compte entre machines.
  *
- *  Modèle v1 (décision Liam, 2026-07-17) : un fichier `sync.zip` par user dans
- *  le bucket `backups` (même périmètre que la sauvegarde manuelle, ~2 Mo),
- *  last-write-wins. Pull au démarrage si le cloud a changé depuis la dernière
- *  sync de CETTE machine ; push quand les données locales changent (empreinte
- *  mtime côté Rust). L'analyse reste 100 % locale — seul le résultat transite,
- *  protégé par RLS. `import_backup` garde une copie locale avant écrasement.
+ *  Modèle v1 (décision Liam, 2026-07-17, boucle continue 2026-07-18) : un fichier
+ *  `sync.zip` par user dans le bucket `backups` (~2 Mo), last-write-wins. La
+ *  passe `syncNow` tourne au boot, toutes les 15 s, au focus de la fenêtre et à
+ *  la fermeture : push si le local a changé (empreinte mtime côté Rust), pull si
+ *  le cloud a changé, conflit tranché à la dernière écriture. L'analyse reste
+ *  100 % locale — seul le résultat transite, protégé par RLS. `import_backup`
+ *  garde une copie locale avant écrasement. L'état de la sync est observable
+ *  (`useSyncStatus`) — jamais d'échec silencieux.
  */
+import { useSyncExternalStore } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { supabase, BACKUP_BUCKET } from "./supabase";
 import { exportBackup, importBackup, syncFingerprint } from "./api";
 
-const FILE = "sync.zip";
+export const SYNC_FILE = "sync.zip";
 
 /** État de la dernière sync réussie sur cette machine (par compte). */
 interface Marker {
@@ -33,73 +39,140 @@ async function uid(): Promise<string | null> {
 }
 
 async function remoteUpdatedAt(id: string): Promise<string | null> {
-  const { data } = await supabase!.storage.from(BACKUP_BUCKET).list(id, { search: FILE });
-  const f = data?.find((f) => f.name === FILE);
+  const { data, error } = await supabase!.storage.from(BACKUP_BUCKET).list(id, { search: SYNC_FILE });
+  if (error) throw new Error(`cloud injoignable : ${error.message}`);
+  const f = data?.find((f) => f.name === SYNC_FILE);
   return f?.updated_at ?? f?.created_at ?? null;
 }
 
-let pushing = false;
-
-/** Push si les données locales ont changé depuis la dernière sync. Silencieux
- *  en cas d'échec (offline, policy manquante) — on retentera au tick suivant. */
-export async function pushIfDirty(): Promise<void> {
-  const id = await uid();
-  if (!id || pushing) return;
-  const fp = await syncFingerprint();
-  if (fp === 0 || fp === readMarker(id)?.fingerprint) return;
-  pushing = true;
-  try {
-    const bytes = await exportBackup();
-    const { error } = await supabase!.storage.from(BACKUP_BUCKET).upload(
-      `${id}/${FILE}`,
-      new Blob([bytes.buffer as ArrayBuffer], { type: "application/zip" }),
-      { upsert: true },
-    );
-    if (error) throw error;
-    writeMarker(id, { remote: (await remoteUpdatedAt(id)) ?? "", fingerprint: fp });
-  } catch (e) {
-    console.warn("sync push:", e);
-  } finally {
-    pushing = false;
-  }
+// ── État observable (affiché dans Réglages → Compte) ────────────────────────
+export interface SyncState {
+  phase: "idle" | "syncing" | "ok" | "error";
+  at: number | null; // timestamp de la dernière passe réussie
+  detail?: string; // message d'erreur humain
+}
+let state: SyncState = { phase: "idle", at: null };
+const listeners = new Set<() => void>();
+function setSyncState(patch: Partial<SyncState>) {
+  state = { ...state, ...patch };
+  listeners.forEach((l) => l());
+}
+export function useSyncStatus(): SyncState {
+  return useSyncExternalStore(
+    (cb) => { listeners.add(cb); return () => listeners.delete(cb); },
+    () => state,
+  );
 }
 
-/** Pull au démarrage si le cloud a bougé depuis la dernière sync d'ici.
- *  Renvoie true si le cerveau local a été remplacé (recharger le graphe). */
-export async function pullIfNewer(): Promise<boolean> {
+async function push(id: string): Promise<void> {
+  const bytes = await exportBackup();
+  const { error } = await supabase!.storage.from(BACKUP_BUCKET).upload(
+    `${id}/${SYNC_FILE}`,
+    new Blob([bytes.buffer as ArrayBuffer], { type: "application/zip" }),
+    { upsert: true },
+  );
+  if (error) throw new Error(`envoi impossible : ${error.message}`);
+  writeMarker(id, { remote: (await remoteUpdatedAt(id)) ?? "", fingerprint: await syncFingerprint() });
+  // Préviens les autres machines connectées : elles tirent tout de suite au
+  // lieu d'attendre leur tick (simple ping, aucune donnée ne transite ici).
+  void channel?.send({ type: "broadcast", event: "pushed", payload: {} });
+}
+
+async function pull(id: string, remote: string): Promise<void> {
+  const { data, error } = await supabase!.storage.from(BACKUP_BUCKET).download(`${id}/${SYNC_FILE}`);
+  if (error || !data) throw new Error(`téléchargement impossible : ${error?.message ?? "vide"}`);
+  await importBackup(new Uint8Array(await data.arrayBuffer()));
+  // Le cloud remplace l'éventuel contenu d'exemple (le Rust retire demo.flag).
+  localStorage.removeItem("lucid.demo");
+  writeMarker(id, { remote, fingerprint: await syncFingerprint() });
+}
+
+let running = false;
+let notifyPulled: (() => void) | null = null;
+let channel: RealtimeChannel | null = null;
+
+/** Une passe de sync complète : push si le local a changé, pull si le cloud a
+ *  changé, conflit tranché à la dernière écriture. Sans effet si déconnecté. */
+export async function syncNow(): Promise<void> {
   const id = await uid();
-  if (!id) return false;
+  if (!id || running) return;
+  running = true;
+  setSyncState({ phase: "syncing" });
   try {
-    const remote = await remoteUpdatedAt(id);
-    if (!remote) return false; // rien dans le cloud → le prochain push seedera
-    // « Déjà à jour » ne vaut que si des données locales existent : si le dossier
-    // user a été vidé (reset, réinstall), le cloud fait foi et on restaure —
-    // sinon le marqueur périmé bloquerait le pull et le push écraserait le cloud.
     const fp = await syncFingerprint();
-    if (fp !== 0 && readMarker(id)?.remote === remote) return false;
-    const { data, error } = await supabase!.storage.from(BACKUP_BUCKET).download(`${id}/${FILE}`);
-    if (error || !data) throw error ?? new Error("téléchargement vide");
-    await importBackup(new Uint8Array(await data.arrayBuffer()));
-    writeMarker(id, { remote, fingerprint: await syncFingerprint() });
-    return true;
+    const marker = readMarker(id);
+    const remote = await remoteUpdatedAt(id);
+    const localDirty = fp !== 0 && fp !== marker?.fingerprint;
+    // fp === 0 : dossier vide OU contenu d'exemple (fingerprint côté Rust
+    // renvoie 0 si demo.flag) → le cloud fait foi, la démo n'est jamais poussée.
+    const remoteNew = remote !== null && (fp === 0 || remote !== marker?.remote);
+    if (localDirty && remoteNew) {
+      // Les deux côtés ont bougé depuis la dernière sync d'ici : dernière
+      // écriture gagne (mtime local vs updated_at distant — LWW v1 assumé,
+      // à la précision des horloges des machines).
+      if (Date.parse(remote!) > fp * 1000) { await pull(id, remote!); notifyPulled?.(); }
+      else await push(id);
+    } else if (localDirty) {
+      await push(id);
+    } else if (remoteNew) {
+      await pull(id, remote!);
+      notifyPulled?.();
+    }
+    setSyncState({ phase: "ok", at: Date.now(), detail: undefined });
   } catch (e) {
-    console.warn("sync pull:", e);
-    return false;
+    console.warn("sync:", e);
+    setSyncState({ phase: "error", detail: String((e as Error)?.message ?? e) });
+  } finally {
+    running = false;
   }
 }
 
-/** Démarre la sync auto : pull initial, puis push périodique tant que l'app
- *  est ouverte. `onChecked` est appelé après le pull initial (réussi ou non) —
- *  l'app attend ce signal avant de seeder le starter démo, sinon la démo
- *  gagnerait la course contre la restauration cloud. Renvoie le stop (cleanup React). */
+/** Démarre la sync continue, événementielle des deux côtés :
+ *  - push : le watcher Rust émet `user-data-changed` (débouncé 2 s) à toute
+ *    écriture dans le périmètre de backup, d'où qu'elle vienne (UI, MCP, watch) ;
+ *  - pull : chaque push annonce un ping Realtime `sync-<uid>` → les autres
+ *    machines tirent en ~1 s ;
+ *  - filets : passe initiale au boot (gate du seed démo via `onChecked`), tick
+ *    60 s (offline, ping raté), focus fenêtre, et fermeture de l'app (retenue
+ *    4 s max, le temps de pousser la dernière modif).
+ *  `onPulled` est appelé à CHAQUE pull qui remplace le local — l'app y recharge
+ *  graphe/espaces. Renvoie le stop (cleanup React). */
 export function startAutoSync(onPulled: () => void, onChecked?: () => void): () => void {
+  notifyPulled = onPulled;
   let stopped = false;
-  pullIfNewer().then((pulled) => {
-    if (stopped) return;
-    if (pulled) onPulled();
-    onChecked?.();
-    void pushIfDirty(); // seed du cloud / rattrapage de la session précédente
+  syncNow().finally(() => { if (!stopped) onChecked?.(); });
+  // Ping des autres machines (broadcast, pas de données) → pull immédiat.
+  uid().then((id) => {
+    if (!id || stopped || !supabase) return;
+    channel = supabase
+      .channel(`sync-${id}`, { config: { broadcast: { self: false } } })
+      .on("broadcast", { event: "pushed" }, () => void syncNow())
+      .subscribe();
   });
-  const timer = setInterval(() => void pushIfDirty(), 60_000);
-  return () => { stopped = true; clearInterval(timer); };
+  // Écritures locales (watcher Rust, déjà débouncé) → push immédiat.
+  const unlistenData = listen("user-data-changed", () => void syncNow());
+  // ponytail: tick 60 s conservé en filet (retour de offline, ping Realtime
+  // manqué) — les événements font le chemin rapide.
+  const timer = setInterval(() => void syncNow(), 60_000);
+  const onFocus = () => void syncNow();
+  window.addEventListener("focus", onFocus);
+  let closing = false;
+  const win = getCurrentWindow();
+  const unlistenClose = win.onCloseRequested(async (e) => {
+    if (closing) return;
+    closing = true;
+    e.preventDefault();
+    await Promise.race([syncNow(), new Promise((r) => setTimeout(r, 4000))]);
+    void win.destroy();
+  });
+  return () => {
+    stopped = true;
+    if (notifyPulled === onPulled) notifyPulled = null; // StrictMode : ne pas écraser le mount suivant
+    clearInterval(timer);
+    window.removeEventListener("focus", onFocus);
+    unlistenClose.then((fn) => fn());
+    unlistenData.then((fn) => fn());
+    void channel?.unsubscribe();
+    channel = null;
+  };
 }

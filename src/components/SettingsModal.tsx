@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+import { syncNow, useSyncStatus, SYNC_FILE } from "@/lib/sync";
 import {
   Plug,
   MessageCircle,
@@ -961,6 +963,7 @@ type Section = "connections" | "spaces" | "account";
 
 // ── Section « Compte » : auth Supabase + sauvegarde cloud du cerveau ─────────
 function AccountSection({ onRestored }: { onRestored?: () => void }) {
+  const sync = useSyncStatus();
   const [session, setSession] = useState<import("@supabase/supabase-js").Session | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -986,7 +989,9 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
     const { data, error } = await supabase.storage.from(BACKUP_BUCKET)
       .list(uid, { sortBy: { column: "created_at", order: "desc" }, limit: 20 });
     if (!error && data) {
-      setBackups(data.map((f) => ({
+      // sync.zip = la sync automatique, affichée dans son propre bloc — seules
+      // les sauvegardes manuelles datées vont dans la liste « Restaurer ».
+      setBackups(data.filter((f) => f.name !== SYNC_FILE).map((f) => ({
         name: f.name,
         created_at: f.created_at ?? "",
         size: (f.metadata as { size?: number } | null)?.size ?? 0,
@@ -1102,16 +1107,47 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
             </button>
           </div>
 
+          {/* Sync automatique : état visible + déclenchement manuel — jamais d'échec silencieux. */}
+          <div className="rounded-xl border border-[var(--color-border)] px-3.5 py-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <p className="flex items-center gap-2 text-sm text-[var(--color-text)]">
+                <span className={cn(
+                  "size-2 shrink-0 rounded-full",
+                  sync.phase === "error" ? "bg-[var(--color-err)]"
+                    : sync.phase === "ok" ? "bg-[var(--color-ok)]"
+                    : "bg-[var(--color-muted)]",
+                )} />
+                Synchronisation automatique
+              </p>
+              <button onClick={() => void syncNow()} disabled={sync.phase === "syncing"}
+                className="shrink-0 rounded-lg px-2.5 py-1 text-xs font-medium text-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] disabled:opacity-40">
+                {sync.phase === "syncing"
+                  ? <Loader2 className="size-3.5 animate-spin" />
+                  : "Synchroniser maintenant"}
+              </button>
+            </div>
+            <p className={cn(
+              "mt-1 text-xs leading-relaxed",
+              sync.phase === "error" ? "text-[var(--color-err)]" : "text-[var(--color-muted)]",
+            )}>
+              {sync.phase === "error"
+                ? `Erreur : ${sync.detail} — nouvel essai automatique sous 1 min.`
+                : sync.phase === "ok" && sync.at
+                  ? `À jour — dernière vérification ${relativeDate(new Date(sync.at).toISOString())}.`
+                  : "Ton cerveau suit ton compte sur toutes tes machines, en continu."}
+            </p>
+          </div>
+
           <button onClick={handleBackup} disabled={busy !== null}
             className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--color-accent)] px-3 py-2 text-sm text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-40">
             {busy === "backup" ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-            Sauvegarder mon cerveau maintenant
+            Créer une sauvegarde manuelle
           </button>
 
           {backups.length > 0 && (
             <div>
               <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-                Sauvegardes ({backups.length})
+                Sauvegardes manuelles ({backups.length})
               </p>
               <ul className="space-y-1">
                 {backups.map((b) => (
@@ -1340,6 +1376,8 @@ export function SettingsModal({
   onSpaceCreate, onSpaceRename, onSpaceDelete, onRestored,
 }: Props) {
   const [section, setSection] = useState<Section>("connections");
+  const [version, setVersion] = useState("");
+  useEffect(() => { getVersion().then(setVersion).catch(() => {}); }, []);
 
   // Échap ferme la modale (comportement attendu de toute surface modale).
   useEffect(() => {
@@ -1409,7 +1447,7 @@ export function SettingsModal({
             </div>
           ))}
           <p className="mt-auto px-2 pb-1 font-mono text-[9px] uppercase tracking-[0.16em] text-[var(--color-muted)]/70">
-            Lucid · alpha
+            Lucid{version ? ` · v${version}` : ""}
           </p>
         </div>
 
