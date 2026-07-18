@@ -51,11 +51,11 @@
     <p class="tag">Votre second cerveau, 100&nbsp;% en local.</p>
     <p class="status" id="status">Chargement de l'état du build…</p>
     <div class="btns">
-      <a class="btn primary" href="https://github.com/Kywi0x/lucid/releases/download/alpha/Lucid-macOS-arm64.dmg">
+      <a class="btn primary" href="https://github.com/Kywi0x/lucid/releases/latest/download/Lucid-macOS-arm64.dmg">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M16.4 12.6c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9s-1.8-.8-3-.8c-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7 2-1.1 2.8-2.2c.9-1.3 1.2-2.5 1.3-2.6-.1 0-2.4-1-2.5-3.6zM14.1 5.4c.6-.8 1.1-1.9 1-3-1 0-2.1.6-2.8 1.4-.6.7-1.1 1.8-1 2.9 1.1.1 2.2-.5 2.8-1.3z"/></svg>
         Télécharger pour Mac
       </a>
-      <a class="btn" href="https://github.com/Kywi0x/lucid/releases/download/alpha/Lucid-Windows-setup.exe">
+      <a class="btn" href="https://github.com/Kywi0x/lucid/releases/latest/download/Lucid-Windows-setup.exe">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5.5 10.5 4.4v7.1H3zm0 13L10.5 19.6v-7H3zM11.5 4.3 21 3v8.5h-9.5zM11.5 12.5H21V21l-9.5-1.3z"/></svg>
         Télécharger pour Windows
       </a>
@@ -63,9 +63,15 @@
     <p class="note">
       App non signée en v1 (notarisation à venir).<br>
       <strong>macOS</strong> : glisse l'app dans Applications, puis dans le Terminal :
-      <code>xattr -cr "/Applications/Second Brain.app"</code>, puis ouvre-la.<br>
+      <code>xattr -cr "/Applications/Lucid.app"</code>, puis ouvre-la.<br>
       <strong>Windows</strong> : <em>Informations complémentaires → Exécuter quand même</em>.<br>
       Toutes les versions sur <a href="https://github.com/Kywi0x/lucid/releases">GitHub Releases</a>.
+    </p>
+    <p class="note beta">
+      <strong>Testeur ?</strong> Dernière beta :
+      <a href="https://github.com/Kywi0x/lucid/releases/download/beta/Lucid-macOS-arm64.dmg">Mac</a> ·
+      <a href="https://github.com/Kywi0x/lucid/releases/download/beta/Lucid-Windows-setup.exe">Windows</a><br>
+      Une seule installation — l'app se met ensuite à jour toute seule à chaque nouvelle version.
     </p>
   </main>
 
@@ -91,7 +97,7 @@
       try {
         const [runsRes, relRes] = await Promise.all([
           fetch(`https://api.github.com/repos/${REPO}/actions/workflows/release.yml/runs?per_page=1`),
-          fetch(`https://api.github.com/repos/${REPO}/releases/tags/alpha`),
+          fetch(`https://api.github.com/repos/${REPO}/releases/latest`),
         ]);
         const run = (await runsRes.json()).workflow_runs?.[0];
         const rel = relRes.ok ? await relRes.json() : null;
@@ -106,7 +112,7 @@
         lines.push(`${jobIcon(mac)} macOS : ${jobText(mac)}`);
         lines.push(`${jobIcon(win)} Windows : ${jobText(win)}`);
         const dmg = rel?.assets?.find(a => a.name === "Lucid-macOS-arm64.dmg");
-        if (dmg) lines.push(`Installateur publié le <b>${fmt(dmg.updated_at)}</b>`);
+        if (dmg) lines.push(`Version <b>${rel.tag_name}</b> · publiée le <b>${fmt(dmg.updated_at)}</b>`);
         el.innerHTML = lines.join("<br>");
       } catch {
         el.textContent = "État du build indisponible pour le moment.";
