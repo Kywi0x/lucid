@@ -107,7 +107,7 @@ export function FolderView({ graph, onSelect, selectedId, query }: Props) {
       <div className="mx-auto max-w-2xl">
         <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
           <Brain className="size-4 text-[var(--color-accent)]" />
-          Second Brain
+          Lucid
           <span className="text-xs font-normal text-[var(--color-muted)]">
             {topLevel.length} espaces · {totalLeaves} documents
           </span>
