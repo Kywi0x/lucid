@@ -1863,11 +1863,15 @@ fn restore_snapshot(snapshot_id: String) -> Result<BrainGraph, String> {
 
 // ── Spaces ─────────────────────────────────────────────────────────────────
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 struct Space {
     id: String,
     name: String,
     node_ids: Option<Vec<String>>,
+    /// Epoch (secondes) de la dernière modification — estampillé par save_spaces,
+    /// sert à la fusion de la sync cloud (le plus récent gagne).
+    #[serde(default)]
+    updated_at: Option<u64>,
 }
 
 fn load_spaces(dir: &std::path::Path) -> Vec<Space> {
@@ -1878,14 +1882,30 @@ fn load_spaces(dir: &std::path::Path) -> Vec<Space> {
 }
 
 fn save_spaces(dir: &std::path::Path, spaces: &[Space]) {
-    if let Ok(json) = serde_json::to_string_pretty(spaces) {
+    // Estampille les espaces nouveaux/modifiés (comparaison hors updated_at),
+    // comme write_brain pour les nœuds — la fusion de sync s'appuie dessus.
+    let old = load_spaces(dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut stamped: Vec<Space> = spaces.to_vec();
+    for s in &mut stamped {
+        s.updated_at = match old.iter().find(|o| o.id == s.id) {
+            Some(o) if Space { updated_at: None, ..o.clone() } == Space { updated_at: None, ..s.clone() } => {
+                o.updated_at.or(Some(now))
+            }
+            _ => Some(now),
+        };
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&stamped) {
         let _ = std::fs::write(dir.join("spaces.json"), json);
     }
 }
 
 #[tauri::command]
 fn list_spaces() -> Vec<Space> {
-    let lucid = Space { id: "lucid".into(), name: "Lucid".into(), node_ids: None };
+    let lucid = Space { id: "lucid".into(), name: "Lucid".into(), node_ids: None, updated_at: None };
     let mut spaces = vec![lucid];
     if let Some(dir) = ai::llama::app_data_dir() {
         spaces.extend(load_spaces(&dir));
@@ -1900,7 +1920,7 @@ fn create_space(name: String) -> Result<Space, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let space = Space { id: format!("space_{ts}"), name, node_ids: Some(vec![]) };
+    let space = Space { id: format!("space_{ts}"), name, node_ids: Some(vec![]), updated_at: None };
     let mut spaces = load_spaces(&dir);
     spaces.push(space.clone());
     save_spaces(&dir, &spaces);
@@ -1927,6 +1947,15 @@ fn delete_space(id: String) -> Result<(), String> {
     spaces.retain(|s| s.id != id);
     if spaces.len() == len_before { return Err("Espace introuvable.".into()); }
     save_spaces(&dir, &spaces);
+    // Tombstone : la suppression doit tenir face à la fusion de sync (sinon
+    // l'espace renaîtrait au prochain pull depuis l'autre machine).
+    let mut dead: std::collections::HashSet<String> =
+        std::fs::read_to_string(dir.join("deleted_spaces.json"))
+            .ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    dead.insert(id);
+    if let Ok(json) = serde_json::to_string_pretty(&dead) {
+        let _ = std::fs::write(dir.join("deleted_spaces.json"), json);
+    }
     Ok(())
 }
 
@@ -2174,6 +2203,7 @@ Base : [[Les atomes]].
     save_spaces(&dir, &[Space {
         id: "space_demo".into(), name: "Projet Alpha".into(),
         node_ids: Some(vec!["demo-plan".into(), "demo-meeting".into(), "demo-ideas".into()]),
+        updated_at: None,
     }]);
     std::fs::write(dir.join("demo.flag"), "1").map_err(|e| e.to_string())?;
     Ok(graph)
@@ -2491,9 +2521,13 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
             }
         }
 
-        // Préserve l'état utilisateur avant que le pipeline écrase brain.json :
+        // Préserve l'état existant avant que le pipeline écrase brain.json :
         //  - contenu édité (tout nœud) ;
-        //  - nœuds « note » créés à la main (absents des conversations, sinon perdus).
+        //  - TOUT nœud absent de la nouvelle génération (pass-through) : notes
+        //    manuelles, imports, et surtout les nœuds venus d'une AUTRE machine
+        //    via la sync — le pipeline ne connaît que les sources locales, il ne
+        //    doit reconstruire que ce qui en vient. Une suppression = tombstone,
+        //    jamais une absence de régénération.
         // Sauf en sortie de démo : le starter ne doit jamais fuiter dans le vrai cerveau.
         let prev_graph = if was_demo { None } else {
             ai::llama::app_data_dir()
@@ -2507,8 +2541,12 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
                 .map(|n| (n.id.clone(), n.content.clone()))
                 .collect())
             .unwrap_or_default();
-        let user_notes: Vec<BrainNode> = prev_graph
-            .map(|g| g.nodes.into_iter().filter(|n| n.kind == "note").collect())
+        let carried: Vec<BrainNode> = prev_graph
+            .as_ref()
+            .map(|g| g.nodes.iter().filter(|n| n.kind != "root").cloned().collect())
+            .unwrap_or_default();
+        let prev_links: Vec<BrainEdge> = prev_graph
+            .map(|g| g.edges.into_iter().filter(|e| e.kind != "contains").collect())
             .unwrap_or_default();
 
         let cache_path = ai::llama::app_data_dir().map(|d| d.join("brain_cache.json"));
@@ -2553,28 +2591,24 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
             }
         }
 
-        // Ré-ajoute les notes utilisateur ; réattache à la racine si leur parent a disparu.
-        let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone());
-        for mut note in user_notes {
-            if graph.nodes.iter().any(|n| n.id == note.id) { continue; }
-            let parent_ok = note.parent_id.as_ref()
-                .map(|p| graph.nodes.iter().any(|n| &n.id == p))
-                .unwrap_or(false);
-            if !parent_ok { note.parent_id = root_id.clone(); }
-            if let Some(p) = note.parent_id.clone() {
-                graph.edges.push(BrainEdge {
-                    source: p, target: note.id.clone(), kind: "contains".into(), relation: "contains".into(),
-                });
-            }
-            graph.nodes.push(note);
+        // Pass-through : ré-ajoute tel quel tout nœud absent de la nouvelle
+        // génération (l'estampille updated_at reste intacte → la fusion de sync
+        // ne les considère pas comme « modifiés ici »). Les wikilinks/ponts
+        // précédents sont conservés ; l'arbre (contains) sera reconstruit depuis
+        // parent_id, les parents disparus rattachés à la racine.
+        let existing: std::collections::HashSet<String> =
+            graph.nodes.iter().map(|n| n.id.clone()).collect();
+        for node in carried {
+            if !existing.contains(&node.id) { graph.nodes.push(node); }
         }
+        graph.edges.extend(prev_links);
 
         // Filet : les nœuds dérivés (projets, concepts) tombstonés ne doivent pas
         // réapparaître même si leurs conversations restantes les régénèrent.
         if !tombstones.is_empty() {
             graph.nodes.retain(|n| !tombstones.contains(&n.id));
-            graph.edges.retain(|e| !tombstones.contains(&e.source) && !tombstones.contains(&e.target));
         }
+        backup::rebuild_tree_edges(&mut graph);
 
         if let Some(dir) = ai::llama::app_data_dir() {
             let _ = std::fs::create_dir_all(&dir);

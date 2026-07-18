@@ -12,6 +12,7 @@ pub const FILES: &[&str] = &[
     "brain.md",
     "spaces.json",
     "deleted_nodes.json",
+    "deleted_spaces.json",
     "brain_cache.json",
     "notion_cache.json",
     "google_drive_conversations.json",
@@ -215,6 +216,44 @@ pub fn write_brain(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// La structure de l'arbre a UNE seule vérité : `parent_id`. Les arêtes
+/// `contains` sont re-dérivées d'elle — jamais fusionnées : l'union des arêtes
+/// de deux régénérations différentes emmêle la hiérarchie (doubles parents).
+/// Les autres arêtes (wikilinks, ponts) sont conservées, dédupliquées, et les
+/// parents orphelins sont rattachés à la racine.
+pub fn rebuild_tree_edges(graph: &mut BrainGraph) {
+    let ids: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+    let root = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone());
+    for n in &mut graph.nodes {
+        if let Some(p) = &n.parent_id {
+            if !ids.contains(p) && n.kind != "root" {
+                n.parent_id = root.clone();
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut edges: Vec<BrainEdge> = vec![];
+    for e in graph.edges.drain(..) {
+        if e.kind != "contains"
+            && ids.contains(&e.source) && ids.contains(&e.target)
+            && seen.insert(format!("{}|{}|{}|{}", e.source, e.target, e.kind, e.relation))
+        {
+            edges.push(e);
+        }
+    }
+    for n in &graph.nodes {
+        if let Some(p) = &n.parent_id {
+            if ids.contains(p) {
+                edges.push(BrainEdge {
+                    source: p.clone(), target: n.id.clone(),
+                    kind: "contains".into(), relation: "contains".into(),
+                });
+            }
+        }
+    }
+    graph.edges = edges;
+}
+
 /// Résultat d'une fusion : l'appelant repousse vers le cloud si le local
 /// contenait des choses que le distant n'avait pas.
 #[derive(serde::Serialize)]
@@ -281,28 +320,23 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
                 if keep_local { by_id.insert(ln.id.clone(), ln); }
             }
             for id in &deleted { by_id.remove(id); }
-            let ids: std::collections::HashSet<&String> = by_id.keys().collect();
-            let mut edges: Vec<BrainEdge> = vec![];
-            let mut seen = std::collections::HashSet::new();
-            for e in remote.edges.into_iter().chain(local.edges.into_iter()) {
-                let key = format!("{}|{}|{}|{}", e.source, e.target, e.kind, e.relation);
-                if seen.insert(key) && ids.contains(&e.source) && ids.contains(&e.target) {
-                    edges.push(e);
-                }
-            }
+            // Seuls les wikilinks/ponts s'unionnent — l'arbre est reconstruit
+            // depuis parent_id (rebuild_tree_edges), jamais fusionné.
+            let edges: Vec<BrainEdge> = remote.edges.into_iter().chain(local.edges.into_iter()).collect();
             // markdown/report : régénérables — on garde le plus récemment généré.
             let (markdown, report, generated_at) = if remote.generated_at > local.generated_at {
                 (remote.markdown, remote.report, remote.generated_at)
             } else {
                 (local.markdown, local.report, local.generated_at)
             };
-            let merged = BrainGraph {
+            let mut merged = BrainGraph {
                 nodes: by_id.into_values().collect(),
                 edges,
                 markdown,
                 report,
                 generated_at,
             };
+            rebuild_tree_edges(&mut merged);
             std::fs::write(
                 dir.join("brain.json"),
                 serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?,
@@ -318,20 +352,39 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
         (None, None) => {}
     }
 
-    // spaces.json : union par id, le local gagne sur les ids communs.
-    // ponytail: pas de tombstone d'espace en v1 — un espace supprimé peut renaître.
-    let mut spaces: Vec<serde_json::Value> = std::fs::read_to_string(dir.join("spaces.json"))
+    // spaces.json : même mécanique que les nœuds — union par id, le plus récent
+    // gagne (`updated_at` estampillé par save_spaces), tombstones honorées.
+    let mut deleted_spaces: std::collections::HashSet<String> =
+        std::fs::read_to_string(dir.join("deleted_spaces.json"))
+            .ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    let remote_deleted_spaces: std::collections::HashSet<String> =
+        zip_json(&mut archive, "deleted_spaces.json").unwrap_or_default();
+    if !deleted_spaces.is_subset(&remote_deleted_spaces) { local_extra = true; }
+    deleted_spaces.extend(remote_deleted_spaces);
+    if let Ok(json) = serde_json::to_string_pretty(&deleted_spaces) {
+        let _ = std::fs::write(dir.join("deleted_spaces.json"), json);
+    }
+
+    let sid = |s: &serde_json::Value| s.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let stamp = |s: &serde_json::Value| s.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    let local_spaces: Vec<serde_json::Value> = std::fs::read_to_string(dir.join("spaces.json"))
         .ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
     let remote_spaces: Vec<serde_json::Value> = zip_json(&mut archive, "spaces.json").unwrap_or_default();
-    let local_ids: std::collections::HashSet<String> = spaces.iter()
-        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(String::from)).collect();
-    let remote_ids: std::collections::HashSet<String> = remote_spaces.iter()
-        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(String::from)).collect();
-    if !local_ids.is_subset(&remote_ids) { local_extra = true; }
-    for rs in remote_spaces {
-        let rid = rs.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        if !local_ids.contains(&rid) { spaces.push(rs); }
+    let mut by_id: std::collections::HashMap<String, serde_json::Value> =
+        remote_spaces.into_iter().map(|s| (sid(&s), s)).collect();
+    for ls in local_spaces {
+        let id = sid(&ls);
+        match by_id.get(&id) {
+            Some(rs) if stamp(rs) > stamp(&ls) => {}
+            Some(rs) => {
+                if rs != &ls { local_extra = true; }
+                by_id.insert(id, ls);
+            }
+            None => { local_extra = true; by_id.insert(id, ls); }
+        }
     }
+    for id in &deleted_spaces { by_id.remove(id); }
+    let spaces: Vec<serde_json::Value> = by_id.into_values().collect();
     if let Ok(json) = serde_json::to_string_pretty(&spaces) {
         let _ = std::fs::write(dir.join("spaces.json"), json);
     }
@@ -420,6 +473,57 @@ mod tests {
         assert_eq!(a.updated_at, Some(10), "nœud inchangé → garde son estampille");
         assert!(b.updated_at.unwrap() > 10, "nœud modifié → ré-estampillé maintenant");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_spaces_convergents_et_arbre_reconstruit() {
+        let remote = std::env::temp_dir().join("brainlink_test_sp_remote");
+        let local = std::env::temp_dir().join("brainlink_test_sp_local");
+        for d in [&remote, &local] { let _ = std::fs::remove_dir_all(d); std::fs::create_dir_all(d).unwrap(); }
+
+        let node = |id: &str, kind: &str, parent: Option<&str>| -> crate::models::BrainNode {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "label": id, "kind": kind, "weight": 1,
+                "parent_id": parent, "updated_at": 5
+            })).unwrap()
+        };
+        let edge = |s: &str, t: &str| BrainEdge {
+            source: s.into(), target: t.into(), kind: "contains".into(), relation: "contains".into(),
+        };
+
+        // Distant : arbre avec une arête bidon en plus (ex-fusion d'arêtes), space s1
+        // renommé récemment, tombstone sur s3.
+        let mut rg = g(vec![node("brain", "root", None), node("n1", "leaf", Some("brain"))]);
+        rg.edges = vec![edge("brain", "n1"), edge("fantome", "n1")];
+        std::fs::write(remote.join("brain.json"), serde_json::to_string(&rg).unwrap()).unwrap();
+        std::fs::write(remote.join("spaces.json"), r#"[{"id":"s1","name":"Renommé","updated_at":20}]"#).unwrap();
+        std::fs::write(remote.join("deleted_spaces.json"), r#"["s3"]"#).unwrap();
+        let zip = export_in(&remote).unwrap();
+
+        // Local : un nœud orphelin (parent disparu), s1 avec un vieux nom, s2 à lui, s3 encore là.
+        let mut lg = g(vec![node("brain", "root", None), node("n1", "leaf", Some("brain")), node("n2", "leaf", Some("fantome"))]);
+        lg.edges = vec![edge("brain", "n1")];
+        std::fs::write(local.join("brain.json"), serde_json::to_string(&lg).unwrap()).unwrap();
+        std::fs::write(local.join("spaces.json"),
+            r#"[{"id":"s1","name":"Vieux","updated_at":10},{"id":"s2","name":"Local","updated_at":5},{"id":"s3","name":"Mort","updated_at":1}]"#).unwrap();
+
+        merge_in(&local, &zip).unwrap();
+
+        let spaces: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(local.join("spaces.json")).unwrap()).unwrap();
+        let name = |id: &str| spaces.iter().find(|s| s["id"] == id).map(|s| s["name"].as_str().unwrap().to_string());
+        assert_eq!(name("s1").as_deref(), Some("Renommé"), "le renommage distant (plus récent) se propage");
+        assert!(name("s2").is_some(), "l'espace local-only survit");
+        assert!(name("s3").is_none(), "la tombstone d'espace tient");
+
+        let merged: BrainGraph = serde_json::from_str(
+            &std::fs::read_to_string(local.join("brain.json")).unwrap()).unwrap();
+        let contains: Vec<_> = merged.edges.iter().filter(|e| e.kind == "contains").collect();
+        assert_eq!(contains.len(), 2, "arbre reconstruit : une arête par parent_id, pas d'union");
+        assert!(contains.iter().all(|e| e.source == "brain"), "l'orphelin est rattaché à la racine");
+        let n2 = merged.nodes.iter().find(|n| n.id == "n2").unwrap();
+        assert_eq!(n2.parent_id.as_deref(), Some("brain"));
+        for d in [&remote, &local] { let _ = std::fs::remove_dir_all(d); }
     }
 
     #[test]
