@@ -14,7 +14,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { supabase, BACKUP_BUCKET } from "./supabase";
-import { exportBackup, importBackup, syncFingerprint } from "./api";
+import { exportBackup, mergeBackup, syncFingerprint } from "./api";
 
 export const SYNC_FILE = "sync.zip";
 
@@ -78,13 +78,17 @@ async function push(id: string): Promise<void> {
   void channel?.send({ type: "broadcast", event: "pushed", payload: {} });
 }
 
-async function pull(id: string, remote: string): Promise<void> {
+/** Tire le cloud et le FUSIONNE dans le local (nœud le plus récent gagne, rien
+ *  n'est perdu). Renvoie true si le local avait des choses que le cloud n'a pas
+ *  → l'appelant doit repousser. */
+async function pull(id: string, remote: string): Promise<boolean> {
   const { data, error } = await supabase!.storage.from(BACKUP_BUCKET).download(`${id}/${SYNC_FILE}`);
   if (error || !data) throw new Error(`téléchargement impossible : ${error?.message ?? "vide"}`);
-  await importBackup(new Uint8Array(await data.arrayBuffer()));
-  // Le cloud remplace l'éventuel contenu d'exemple (le Rust retire demo.flag).
+  const report = await mergeBackup(new Uint8Array(await data.arrayBuffer()));
+  // De vraies données sont arrivées : l'état démo ne s'applique plus.
   localStorage.removeItem("lucid.demo");
   writeMarker(id, { remote, fingerprint: await syncFingerprint() });
+  return report.local_extra;
 }
 
 let running = false;
@@ -106,18 +110,15 @@ export async function syncNow(): Promise<void> {
     // fp === 0 : dossier vide OU contenu d'exemple (fingerprint côté Rust
     // renvoie 0 si demo.flag) → le cloud fait foi, la démo n'est jamais poussée.
     const remoteNew = remote !== null && (fp === 0 || remote !== marker?.remote);
-    if (localDirty && remoteNew) {
-      // Les deux côtés ont bougé depuis la dernière sync d'ici : dernière
-      // écriture gagne (mtime local vs updated_at distant — LWW v1 assumé,
-      // à la précision des horloges des machines).
-      if (Date.parse(remote!) > fp * 1000) { await pull(id, remote!); notifyPulled?.(); }
-      else await push(id);
-    } else if (localDirty) {
-      await push(id);
-    } else if (remoteNew) {
-      await pull(id, remote!);
+    let mustPush = localDirty;
+    if (remoteNew) {
+      // Fusion (pas de remplacement) : les deux côtés peuvent avoir bougé,
+      // le nœud le plus récent gagne, rien n'est perdu — puis on repousse
+      // l'union si le local avait des choses que le cloud n'a pas.
+      mustPush = await pull(id, remote!);
       notifyPulled?.();
     }
+    if (mustPush) await push(id);
     setSyncState({ phase: "ok", at: Date.now(), detail: undefined });
   } catch (e) {
     console.warn("sync:", e);

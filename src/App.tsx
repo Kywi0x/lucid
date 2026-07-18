@@ -261,9 +261,18 @@ function App() {
   // watcher local + ping Realtime, filets boot/60 s/focus/fermeture — voir lib/sync.ts).
   useEffect(() => {
     return startAutoSync(() => {
-      // Un pull a remplacé le local : c'est un vrai cerveau, plus la démo.
+      // Un pull a fusionné du contenu : c'est un vrai cerveau, plus la démo.
       setDemoMode(false);
-      readBrainGraph().then((g) => { if (g) { setGraph(g); setRevealKey((k) => k + 1); } });
+      readBrainGraph().then((g) => {
+        if (!g) return;
+        setGraph((prev) => {
+          // Re-animation (revealKey) seulement si la structure change : un pull
+          // de contenu ne doit pas vider/reconstruire le canvas sous l'utilisateur.
+          const ids = (x: BrainGraph) => x.nodes.map((n) => n.id).sort().join("\n");
+          if (!prev || ids(prev) !== ids(g)) setRevealKey((k) => k + 1);
+          return g;
+        });
+      });
       listSpaces().then(setSpaces);
       connectorsStatus().then(setConnectors);
     }, () => setSyncChecked(true));

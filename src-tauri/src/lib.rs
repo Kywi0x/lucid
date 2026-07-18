@@ -42,9 +42,8 @@ pub fn run_pipeline_demo(limit: usize) -> Result<BrainGraph, String> {
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join("brain.md"), &graph.markdown);
         let _ = std::fs::write(dir.join("brain_report.md"), &graph.report);
-        if let Ok(json) = serde_json::to_string_pretty(&graph) {
-            let _ = std::fs::write(dir.join("brain.json"), json);
-        }
+        let mut graph = graph.clone();
+        let _ = backup::write_brain(&dir, &mut graph);
     }
     Ok(graph)
 }
@@ -754,8 +753,7 @@ fn save_node_content(node_id: String, content: String) -> Result<(), String> {
     // Sauvegarde l'ancienne version avant d'écraser
     save_node_content_history(&dir, &node_id, &node.content);
     node.content = content;
-    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    backup::write_brain(&dir, &mut graph)
 }
 
 /// Crée un nœud « note » (prise de note utilisateur) rattaché à `parent_id`.
@@ -790,7 +788,7 @@ fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, lab
     if graph.nodes.iter().any(|n| n.id == id) {
         return Err(format!("Nœud {id} déjà présent."));
     }
-    let node = BrainNode {
+    let node = BrainNode { updated_at: None,
         id: id.clone(),
         label: {
             let l = label.trim();
@@ -816,8 +814,7 @@ fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, lab
         source: parent_id, target: id, kind: "contains".into(), relation: "contains".into(),
     });
     graph.nodes.push(node.clone());
-    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    backup::write_brain(&dir, &mut graph)?;
     Ok(node)
 }
 
@@ -1056,7 +1053,7 @@ fn import_shared_space(payload: serde_json::Value, space_id: String) -> Result<B
         remap.insert(old.to_string(), format!("fork-{nanos}-{i}"));
     }
 
-    let proj = BrainNode {
+    let proj = BrainNode { updated_at: None,
         id: proj_id.clone(),
         label: name,
         kind: "group".into(),
@@ -1090,7 +1087,7 @@ fn import_shared_space(payload: serde_json::Value, space_id: String) -> Result<B
         graph.edges.push(BrainEdge {
             source: parent_new.clone(), target: new_id.clone(), kind: "contains".into(), relation: "contains".into(),
         });
-        graph.nodes.push(BrainNode {
+        graph.nodes.push(BrainNode { updated_at: None,
             id: new_id.clone(),
             label: { let l = str_of("label"); if l.is_empty() { "Sans titre".into() } else { l } },
             kind: { let k = str_of("kind"); if k.is_empty() { "note".into() } else { k } },
@@ -1128,8 +1125,7 @@ fn import_shared_space(payload: serde_json::Value, space_id: String) -> Result<B
         }
     }
 
-    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    backup::write_brain(&dir, &mut graph)?;
     Ok(proj)
 }
 
@@ -1166,6 +1162,25 @@ async fn import_backup(request: tauri::ipc::Request<'_>) -> Result<usize, String
     tauri::async_runtime::spawn_blocking(move || {
         let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.".to_string())?;
         backup::import_in(&dir, &bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Fusionne le zip de sync cloud dans les données locales (nœud par nœud, le
+/// plus récent gagne — voir backup::merge_in). Contrairement à import_backup
+/// (remplacement intégral, bouton « Restaurer »), rien n'est perdu.
+/// Renvoie { files, local_extra } — local_extra = le local avait des choses en
+/// plus, l'appelant doit repousser vers le cloud.
+#[tauri::command]
+async fn merge_backup(request: tauri::ipc::Request<'_>) -> Result<backup::MergeReport, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Payload binaire attendu.".into());
+    };
+    let bytes = bytes.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.".to_string())?;
+        backup::merge_in(&dir, &bytes)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1506,7 +1521,7 @@ concis) et \"children\" (liste de sous-pages, même format, 2 niveaux maximum, \
         fn insert(graph: &mut BrainGraph, parent: &str, spec: &ai::pipeline::StructureSpec, ts: u128, counter: &mut usize) {
             *counter += 1;
             let id = format!("note-{ts}-{counter}");
-            graph.nodes.push(BrainNode {
+            graph.nodes.push(BrainNode { updated_at: None,
                 id: id.clone(),
                 label: spec.label.clone(),
                 kind: "note".into(),
@@ -1535,8 +1550,7 @@ concis) et \"children\" (liste de sous-pages, même format, 2 niveaux maximum, \
         }
         insert(&mut graph, &parent, &spec, ts, &mut counter);
 
-        std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        backup::write_brain(&dir, &mut graph)?;
 
         // Rend les nœuds visibles dans l'espace actif (les ids sont déterministes :
         // note-{ts}-{1..=counter}).
@@ -1589,8 +1603,7 @@ fn set_node_parent(node_id: String, parent_id: String) -> Result<(), String> {
     graph.edges.push(BrainEdge {
         source: parent_id, target: node_id, kind: "contains".into(), relation: "contains".into(),
     });
-    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    backup::write_brain(&dir, &mut graph)
 }
 
 /// Renomme un nœud (change son `label`). Persisté dans brain.json.
@@ -1604,8 +1617,7 @@ fn rename_node(node_id: String, label: String) -> Result<(), String> {
         .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
     let l = label.trim();
     node.label = if l.is_empty() { "Sans titre".into() } else { l.to_string() };
-    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    backup::write_brain(&dir, &mut graph)
 }
 
 // ── Tombstones : une suppression doit survivre aux régénérations ─────────────
@@ -1665,11 +1677,7 @@ fn delete_node(node_id: String) -> Result<usize, String> {
     add_tombstones(&dir, &doomed); // la suppression survivra aux régénérations
     graph.nodes.retain(|n| !doomed.contains(&n.id));
     graph.edges.retain(|e| !doomed.contains(&e.source) && !doomed.contains(&e.target));
-    std::fs::write(
-        dir.join("brain.json"),
-        serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    backup::write_brain(&dir, &mut graph)?;
 
     // Les spaces ne doivent pas garder d'ids morts.
     let mut spaces = load_spaces(&dir);
@@ -1778,9 +1786,7 @@ CONTENU :\n{ctx}\n\n\
 
         let updated = node.clone();
 
-        if let Ok(json) = serde_json::to_string_pretty(&graph) {
-            let _ = std::fs::write(dir.join("brain.json"), json);
-        }
+        let _ = backup::write_brain(&dir, &mut graph);
 
         Ok(updated)
     })
@@ -1844,11 +1850,14 @@ fn list_snapshots() -> Vec<SnapshotInfo> {
 fn restore_snapshot(snapshot_id: String) -> Result<BrainGraph, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
     let src = dir.join("snapshots").join(format!("{snapshot_id}.json"));
-    let dest = dir.join("brain.json");
     save_snapshot_in(&dir); // snapshot de l'état actuel avant restauration
-    std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
-    let raw = std::fs::read_to_string(&dest).map_err(|e| e.to_string())?;
-    serde_json::from_str(&raw).map_err(|e| e.to_string())
+    let raw = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    // write_brain (et pas une copie brute) : les nœuds qui changent par rapport à
+    // l'état courant sont ré-estampillés, sinon la sync « annulerait » la restauration
+    // en re-fusionnant l'état cloud plus récent par-dessus.
+    backup::write_brain(&dir, &mut graph)?;
+    Ok(graph)
 }
 
 // ── Spaces ─────────────────────────────────────────────────────────────────
@@ -2007,7 +2016,7 @@ fn export_space_md(space_id: String) -> Result<String, String> {
 // `reset_demo` n'efface QUE si le flag existe → jamais de vrai cerveau supprimé.
 
 fn demo_leaf(id: &str, parent: &str, label: &str, content: &str) -> BrainNode {
-    BrainNode {
+    BrainNode { updated_at: None,
         id: id.into(), label: label.into(), kind: "leaf".into(), weight: 1,
         // Pas de summary : le bloc « Synthèse IA » ne doit pas mentir — l'user
         // pourra tester la vraie synthèse manuelle sur ces pages.
@@ -2022,7 +2031,7 @@ fn demo_leaf(id: &str, parent: &str, label: &str, content: &str) -> BrainNode {
 fn seed_demo() -> Result<BrainGraph, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
 
-    let container = |id: &str, label: &str, weight: usize| BrainNode {
+    let container = |id: &str, label: &str, weight: usize| BrainNode { updated_at: None,
         id: id.into(), label: label.into(), kind: "container".into(), weight,
         summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
         community: 1, parent_id: Some("root".into()), synthesized_at: None, date: None,
@@ -2030,7 +2039,7 @@ fn seed_demo() -> Result<BrainGraph, String> {
     };
 
     let mut nodes = vec![
-        BrainNode {
+        BrainNode { updated_at: None,
             id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 8,
             summary: "Contenu d'exemple — remplacé par tes vraies données au premier sync.".into(),
             keywords: vec![], decisions: vec![],
@@ -2153,15 +2162,14 @@ Base : [[Les atomes]].
         edge("demo-cours", "demo-atomes"), edge("demo-cours", "demo-reactions"),
     ];
 
-    let graph = BrainGraph {
+    let mut graph = BrainGraph {
         nodes, edges,
         markdown: "# Lucid — contenu d'exemple\n\nGraphe starter pour la prise en main.".into(),
         report: String::new(),
         generated_at: "demo".into(),
     };
 
-    std::fs::write(dir.join("brain.json"), serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    backup::write_brain(&dir, &mut graph)?;
     save_spaces(&dir, &[Space {
         id: "space_demo".into(), name: "Projet Alpha".into(),
         node_ids: Some(vec!["demo-plan".into(), "demo-meeting".into(), "demo-ideas".into()]),
@@ -2572,9 +2580,8 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
             save_snapshot_in(&dir); // snapshot avant écrasement
             let _ = std::fs::write(dir.join("brain.md"), &graph.markdown);
             let _ = std::fs::write(dir.join("brain_report.md"), &graph.report);
-            if let Ok(json) = serde_json::to_string_pretty(&graph) {
-                let _ = std::fs::write(dir.join("brain.json"), json);
-            }
+            let mut stamped = graph.clone();
+            let _ = backup::write_brain(&dir, &mut stamped);
         }
         Ok(graph)
     }
@@ -2824,6 +2831,7 @@ pub fn run() {
             disconnect_ai_client,
             export_backup,
             import_backup,
+            merge_backup,
             sync_fingerprint,
             set_node_parent,
             rename_node,
@@ -2868,7 +2876,7 @@ mod ask_tests {
     #[test]
     fn ask_context_selectionne_les_pages_pertinentes_et_reste_borne() {
         let mut nodes = vec![
-            BrainNode {
+            BrainNode { updated_at: None,
                 id: "root".into(), label: "Lucid".into(), kind: "root".into(), weight: 3,
                 summary: String::new(), keywords: vec![], decisions: vec![], patterns: vec![],
                 community: 0, parent_id: None, synthesized_at: None, date: None, content: String::new(),

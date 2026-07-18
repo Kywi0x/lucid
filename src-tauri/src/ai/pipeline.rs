@@ -334,7 +334,7 @@ pub fn generate_brain(
         }
 
         // Nœud feuille.
-        leaves.push(BrainNode {
+        leaves.push(BrainNode { updated_at: None,
             id: format!("leaf:{}", conv.summary.id),
             label: conv.summary.title.clone(),
             kind: "leaf".into(),
@@ -425,7 +425,7 @@ fn build_graph(
     let total_leaves = leaves.len();
     let root_containers = containers.values().filter(|c| c.parent_id == "root").count();
 
-    nodes.push(BrainNode {
+    nodes.push(BrainNode { updated_at: None,
         id: "root".into(),
         label: "Lucid".into(),
         kind: "root".into(),
@@ -447,7 +447,7 @@ fn build_graph(
 
     for (c_key, c) in containers {
         let cid = format!("p:{c_key}");
-        nodes.push(BrainNode {
+        nodes.push(BrainNode { updated_at: None,
             id: cid.clone(),
             label: c.display.clone(),
             kind: "container".into(),

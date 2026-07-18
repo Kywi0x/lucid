@@ -93,6 +93,11 @@ pub struct BrainNode {
     /// et utilisé par ask_brain — le cerveau reste exploitable hors app (MCP).
     #[serde(default)]
     pub source_text: String,
+    /// Epoch (secondes) de la dernière modification de CE nœud. Estampillé
+    /// automatiquement par `backup::write_brain` (diff avec la version
+    /// précédente) — sert à la fusion de la sync cloud : le plus récent gagne.
+    #[serde(default)]
+    pub updated_at: Option<u64>,
 }
 
 /// Une arête : relation de contenance dans l'arbre.

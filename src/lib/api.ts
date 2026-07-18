@@ -248,6 +248,12 @@ export function importBackup(bytes: Uint8Array): Promise<number> {
   return invoke("import_backup", bytes); // payload IPC brut, même raison
 }
 
+/** Fusionne le zip de sync cloud dans les données locales (nœud par nœud, le plus
+ *  récent gagne — rien n'est perdu). `local_extra` = il faut repousser vers le cloud. */
+export function mergeBackup(bytes: Uint8Array): Promise<{ files: number; local_extra: boolean }> {
+  return invoke("merge_backup", bytes);
+}
+
 /** Supprime un nœud et sa descendance (snapshot pris avant). Renvoie le nombre supprimé. */
 export function deleteNode(nodeId: string): Promise<number> {
   return invoke("delete_node", { nodeId });

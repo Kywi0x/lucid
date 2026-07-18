@@ -37,7 +37,7 @@ impl Draft {
             kind: "contains".into(),
             relation: "contains".into(),
         };
-        let node = BrainNode {
+        let node = BrainNode { updated_at: None,
             summary: self.summary_lines.join(" ").trim().to_string(),
             id: self.id,
             label: self.label,
@@ -82,7 +82,7 @@ fn parse_meta(line: &str) -> HashMap<String, String> {
 
 /// Parse un brain.md v3 → BrainGraph prêt à l'emploi.
 pub fn parse(content: &str) -> BrainGraph {
-    let mut nodes: Vec<BrainNode> = vec![BrainNode {
+    let mut nodes: Vec<BrainNode> = vec![BrainNode { updated_at: None,
         id: "root".into(),
         label: "Lucid".into(),
         kind: "root".into(),

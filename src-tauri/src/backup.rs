@@ -122,9 +122,260 @@ pub fn import_in(dir: &Path, bytes: &[u8]) -> Result<usize, String> {
     Ok(count)
 }
 
+// ── Fusion (sync cloud) ───────────────────────────────────────────────────────
+// Le remplacement intégral (import_in) perd des données dès que deux machines
+// vivent en même temps : chacune écrase le cerveau de l'autre. La sync passe
+// donc par une FUSION : nœud par nœud (le plus récent gagne via `updated_at`),
+// union des espaces/edges, tombstones honorées, fichiers annexes additifs.
+// import_in reste le remplacement explicite (bouton « Restaurer »).
+
+use crate::models::{BrainEdge, BrainGraph};
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Sérialise un nœud SANS son champ `updated_at` — pour comparer deux versions
+/// d'un nœud sans que l'estampille elle-même compte comme une différence.
+fn node_sig(n: &crate::models::BrainNode) -> String {
+    let mut v = serde_json::to_value(n).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() { o.remove("updated_at"); }
+    v.to_string()
+}
+
+/// Écrit brain.json en estampillant `updated_at` sur chaque nœud nouveau ou
+/// modifié par rapport à la version précédente du fichier. Point de passage
+/// unique : tous les writers de brain.json doivent l'utiliser, sinon les
+/// modifications ne se propagent pas dans la fusion de sync.
+pub fn write_brain(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
+    let old: Option<BrainGraph> = std::fs::read_to_string(dir.join("brain.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let old_by_id: std::collections::HashMap<String, (Option<u64>, String)> = old
+        .map(|g| g.nodes.into_iter().map(|n| (n.id.clone(), (n.updated_at, node_sig(&n)))).collect())
+        .unwrap_or_default();
+    let now = now_secs();
+    for n in &mut graph.nodes {
+        n.updated_at = match old_by_id.get(&n.id) {
+            Some((stamp, sig)) if *sig == node_sig(n) => stamp.or(Some(now)),
+            _ => Some(now),
+        };
+    }
+    std::fs::write(
+        dir.join("brain.json"),
+        serde_json::to_string_pretty(graph).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Résultat d'une fusion : l'appelant repousse vers le cloud si le local
+/// contenait des choses que le distant n'avait pas.
+#[derive(serde::Serialize)]
+pub struct MergeReport {
+    pub files: usize,
+    pub local_extra: bool,
+}
+
+fn zip_json<T: serde::de::DeserializeOwned>(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+) -> Option<T> {
+    let mut entry = archive.by_name(name).ok()?;
+    let mut raw = String::new();
+    entry.read_to_string(&mut raw).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Fusionne une sauvegarde distante dans les données locales (sync cloud).
+pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("Archive illisible : {e}"))?;
+
+    // Filet : brain.json actuel gardé avant fusion.
+    if dir.join("brain.json").exists() {
+        let _ = std::fs::copy(dir.join("brain.json"), dir.join("brain.json.avant-restauration"));
+    }
+
+    let mut local_extra = false;
+
+    // Tombstones : union des deux côtés — une suppression faite n'importe où tient partout.
+    let mut deleted: std::collections::HashSet<String> =
+        std::fs::read_to_string(dir.join("deleted_nodes.json"))
+            .ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    let remote_deleted: std::collections::HashSet<String> =
+        zip_json(&mut archive, "deleted_nodes.json").unwrap_or_default();
+    if !deleted.is_subset(&remote_deleted) { local_extra = true; }
+    deleted.extend(remote_deleted);
+    if let Ok(json) = serde_json::to_string_pretty(&deleted) {
+        let _ = std::fs::write(dir.join("deleted_nodes.json"), json);
+    }
+
+    // brain.json : nœud par nœud, le plus récent gagne ; union des deux côtés,
+    // moins les tombstones. Écrit tel quel (les estampilles fusionnées font foi).
+    let local_brain: Option<BrainGraph> = std::fs::read_to_string(dir.join("brain.json"))
+        .ok().and_then(|r| serde_json::from_str(&r).ok());
+    let remote_brain: Option<BrainGraph> = zip_json(&mut archive, "brain.json");
+    match (local_brain, remote_brain) {
+        (Some(local), Some(remote)) => {
+            let mut by_id: std::collections::HashMap<String, crate::models::BrainNode> =
+                remote.nodes.into_iter().map(|n| (n.id.clone(), n)).collect();
+            for ln in local.nodes {
+                // Distant strictement plus récent → il gagne ; sinon (égalité
+                // comprise) le local gagne : c'est ce que l'utilisateur regarde.
+                let keep_local = match by_id.get(&ln.id) {
+                    Some(rn) => {
+                        let remote_newer = rn.updated_at.unwrap_or(0) > ln.updated_at.unwrap_or(0);
+                        if !remote_newer && node_sig(rn) != node_sig(&ln) { local_extra = true; }
+                        !remote_newer
+                    }
+                    None => { local_extra = true; true }
+                };
+                if keep_local { by_id.insert(ln.id.clone(), ln); }
+            }
+            for id in &deleted { by_id.remove(id); }
+            let ids: std::collections::HashSet<&String> = by_id.keys().collect();
+            let mut edges: Vec<BrainEdge> = vec![];
+            let mut seen = std::collections::HashSet::new();
+            for e in remote.edges.into_iter().chain(local.edges.into_iter()) {
+                let key = format!("{}|{}|{}|{}", e.source, e.target, e.kind, e.relation);
+                if seen.insert(key) && ids.contains(&e.source) && ids.contains(&e.target) {
+                    edges.push(e);
+                }
+            }
+            // markdown/report : régénérables — on garde le plus récemment généré.
+            let (markdown, report, generated_at) = if remote.generated_at > local.generated_at {
+                (remote.markdown, remote.report, remote.generated_at)
+            } else {
+                (local.markdown, local.report, local.generated_at)
+            };
+            let merged = BrainGraph {
+                nodes: by_id.into_values().collect(),
+                edges,
+                markdown,
+                report,
+                generated_at,
+            };
+            std::fs::write(
+                dir.join("brain.json"),
+                serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?,
+            ).map_err(|e| e.to_string())?;
+        }
+        (None, Some(remote)) => {
+            std::fs::write(
+                dir.join("brain.json"),
+                serde_json::to_string_pretty(&remote).map_err(|e| e.to_string())?,
+            ).map_err(|e| e.to_string())?;
+        }
+        (Some(_), None) => { local_extra = true; }
+        (None, None) => {}
+    }
+
+    // spaces.json : union par id, le local gagne sur les ids communs.
+    // ponytail: pas de tombstone d'espace en v1 — un espace supprimé peut renaître.
+    let mut spaces: Vec<serde_json::Value> = std::fs::read_to_string(dir.join("spaces.json"))
+        .ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    let remote_spaces: Vec<serde_json::Value> = zip_json(&mut archive, "spaces.json").unwrap_or_default();
+    let local_ids: std::collections::HashSet<String> = spaces.iter()
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(String::from)).collect();
+    let remote_ids: std::collections::HashSet<String> = remote_spaces.iter()
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(String::from)).collect();
+    if !local_ids.is_subset(&remote_ids) { local_extra = true; }
+    for rs in remote_spaces {
+        let rid = rs.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if !local_ids.contains(&rid) { spaces.push(rs); }
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&spaces) {
+        let _ = std::fs::write(dir.join("spaces.json"), json);
+    }
+
+    // Fichiers annexes (historique, images, snapshots…) : additifs — on n'écrase
+    // jamais un fichier local existant, on ajoute ce qui manque.
+    let merged_by_hand = ["brain.json", "spaces.json", "deleted_nodes.json"];
+    let mut files = 0;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let Some(rel) = entry.enclosed_name() else {
+            return Err(format!("Chemin suspect dans l'archive : {}", entry.name()));
+        };
+        if entry.is_dir() || merged_by_hand.contains(&entry.name()) { continue; }
+        let dest = dir.join(rel);
+        if dest.exists() { continue; }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        std::fs::write(&dest, buf).map_err(|e| e.to_string())?;
+        files += 1;
+    }
+
+    // Des vraies données sont arrivées : l'état démo ne s'applique plus.
+    let _ = std::fs::remove_file(dir.join("demo.flag"));
+    Ok(MergeReport { files, local_extra })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn n(id: &str, label: &str, ts: u64) -> crate::models::BrainNode {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "label": label, "kind": "leaf", "weight": 1, "updated_at": ts
+        })).unwrap()
+    }
+
+    fn g(nodes: Vec<crate::models::BrainNode>) -> BrainGraph {
+        BrainGraph { nodes, edges: vec![], markdown: String::new(), report: String::new(), generated_at: "t".into() }
+    }
+
+    #[test]
+    fn merge_prend_le_plus_recent_et_ne_perd_rien() {
+        let remote = std::env::temp_dir().join("brainlink_test_merge_remote");
+        let local = std::env::temp_dir().join("brainlink_test_merge_local");
+        for d in [&remote, &local] { let _ = std::fs::remove_dir_all(d); std::fs::create_dir_all(d).unwrap(); }
+
+        // Distant : A modifié récemment, C nouveau, tombstone sur D.
+        std::fs::write(remote.join("brain.json"),
+            serde_json::to_string(&g(vec![n("A", "A-distant", 20), n("C", "C", 5), n("D", "D", 1)])).unwrap()).unwrap();
+        std::fs::write(remote.join("deleted_nodes.json"), r#"[]"#).unwrap();
+        let zip = export_in(&remote).unwrap();
+
+        // Local : A ancien, B local-only, D supprimé ici (tombstone locale).
+        std::fs::write(local.join("brain.json"),
+            serde_json::to_string(&g(vec![n("A", "A-local", 10), n("B", "B", 100)])).unwrap()).unwrap();
+        std::fs::write(local.join("deleted_nodes.json"), r#"["D"]"#).unwrap();
+
+        let report = merge_in(&local, &zip).unwrap();
+        assert!(report.local_extra, "B est local-only → il faut repousser");
+
+        let merged: BrainGraph = serde_json::from_str(
+            &std::fs::read_to_string(local.join("brain.json")).unwrap()).unwrap();
+        let label = |id: &str| merged.nodes.iter().find(|x| x.id == id).map(|x| x.label.clone());
+        assert_eq!(label("A").as_deref(), Some("A-distant"), "le plus récent gagne");
+        assert!(label("B").is_some(), "le nœud local-only survit");
+        assert!(label("C").is_some(), "le nœud distant arrive");
+        assert!(label("D").is_none(), "la suppression locale tient malgré le distant");
+        for d in [&remote, &local] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn write_brain_estampille_les_noeuds_modifies() {
+        let dir = std::env::temp_dir().join("brainlink_test_stamp");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"),
+            serde_json::to_string(&g(vec![n("A", "A", 10), n("B", "B", 10)])).unwrap()).unwrap();
+        // B change de label, A inchangé.
+        let mut graph = g(vec![n("A", "A", 0), n("B", "B2", 0)]);
+        write_brain(&dir, &mut graph).unwrap();
+        let a = graph.nodes.iter().find(|x| x.id == "A").unwrap();
+        let b = graph.nodes.iter().find(|x| x.id == "B").unwrap();
+        assert_eq!(a.updated_at, Some(10), "nœud inchangé → garde son estampille");
+        assert!(b.updated_at.unwrap() > 10, "nœud modifié → ré-estampillé maintenant");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn export_puis_import_round_trip() {
