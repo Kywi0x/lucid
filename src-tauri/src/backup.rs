@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 /// Fichiers / dossiers embarqués dans la sauvegarde (relatifs au dossier de données).
-const FILES: &[&str] = &[
+pub const FILES: &[&str] = &[
     "brain.json",
     "brain.md",
     "spaces.json",
@@ -16,7 +16,7 @@ const FILES: &[&str] = &[
     "notion_cache.json",
     "google_drive_conversations.json",
 ];
-const DIRS: &[&str] = &["snapshots", "node_history", "assets", "mcp_pending"];
+pub const DIRS: &[&str] = &["snapshots", "node_history", "assets", "mcp_pending"];
 
 /// Zippe les données du cerveau. Renvoie les octets du zip.
 pub fn export_in(dir: &Path) -> Result<Vec<u8>, String> {
@@ -56,6 +56,11 @@ pub fn export_in(dir: &Path) -> Result<Vec<u8>, String> {
 /// de sauvegarde. La sync cloud pousse quand elle change — une suppression seule
 /// ne la fait pas bouger, mais toute suppression réécrit brain.json à côté.
 pub fn fingerprint_in(dir: &Path) -> u64 {
+    // Contenu d'exemple (demo.flag) : empreinte 0 → la sync ne pousse jamais la
+    // démo vers le cloud, et le cloud la remplace (0 = « rien qui compte ici »).
+    if dir.join("demo.flag").exists() {
+        return 0;
+    }
     let mtime = |p: &Path| -> u64 {
         p.metadata().ok()
             .and_then(|md| md.modified().ok())
@@ -111,6 +116,9 @@ pub fn import_in(dir: &Path, bytes: &[u8]) -> Result<usize, String> {
         count += 1;
     }
     if count == 0 { return Err("Archive vide.".into()); }
+    // Les données restaurées sont un vrai cerveau : l'état démo ne s'applique plus
+    // (sinon la bannière « Contenu d'exemple » resterait par-dessus les vraies données).
+    let _ = std::fs::remove_file(dir.join("demo.flag"));
     Ok(count)
 }
 

@@ -2660,6 +2660,44 @@ fn parse_env(content: &str) {
 
 /// Watch auto : surveille `~/.claude/projects/` et régénère le cerveau tout seul
 /// quand une session Claude Code change. Cross-platform (crate notify).
+/// Watch du dossier de données : toute écriture dans le périmètre de backup
+/// (brain.json, notes, snapshots…) émet `user-data-changed` (débouncé) — le
+/// front pousse alors la sync cloud immédiatement, quelle que soit l'origine
+/// de la modif (commande Tauri, watch auto, MCP, import). Une seule porte,
+/// pas d'instrumentation par mutation.
+fn start_data_watcher(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use notify::Watcher;
+        use tauri::Emitter;
+        let Some(root) = ai::llama::shared_data_dir() else { return };
+        // Dans le périmètre de sync ? (exclut models/, llama.cpp/, fichiers témoins…)
+        fn in_scope(p: &std::path::Path) -> bool {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if backup::FILES.contains(&name) { return true; }
+            }
+            p.components().any(|c| matches!(c.as_os_str().to_str(), Some(d) if backup::DIRS.contains(&d)))
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(ev) = res {
+                if ev.paths.iter().any(|p| in_scope(p)) { let _ = tx.send(()); }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => { crate::elog!("⚠️ watch données indisponible : {e}"); return; }
+        };
+        if let Err(e) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
+            crate::elog!("⚠️ watch données indisponible : {e}");
+            return;
+        }
+        while rx.recv().is_ok() {
+            // Debounce : une génération/restauration écrit en rafale → attendre l'accalmie.
+            while rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok() {}
+            let _ = app.emit("user-data-changed", ());
+        }
+    });
+}
+
 fn start_watcher(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         use notify::Watcher;
@@ -2736,7 +2774,11 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .setup(|app| { start_watcher(app.handle().clone()); Ok(()) })
+        .setup(|app| {
+            start_watcher(app.handle().clone());
+            start_data_watcher(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_conversations,
             load_conversation,
