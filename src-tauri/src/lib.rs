@@ -690,7 +690,8 @@ struct NodeSnapshotInfo {
 }
 
 fn node_history_dir(dir: &std::path::Path, node_id: &str) -> std::path::PathBuf {
-    dir.join("node_history").join(node_id)
+    // safe_component : les ids contiennent `:` (interdit sur Windows, os error 123).
+    dir.join("node_history").join(backup::safe_component(node_id))
 }
 
 fn save_node_content_history(dir: &std::path::Path, node_id: &str, old_content: &str) {

@@ -18,8 +18,52 @@ pub const FILES: &[&str] = &[
 ];
 pub const DIRS: &[&str] = &["snapshots", "node_history", "assets", "mcp_pending"];
 
+/// Nom de fichier/dossier sûr multi-OS. Les ids de nœuds contiennent `:`
+/// (`leaf:<conv>`, `p:<projet>`) — légal sur macOS, interdit sur Windows
+/// (os error 123). Les caractères interdits sont encodés en %XX. Idempotent
+/// (le `%` n'est pas ré-encodé) : on n'a jamais besoin de décoder, les lecteurs
+/// encodent l'id brut pour retrouver le chemin.
+pub fn safe_component(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => {
+                out.push_str(&format!("%{:02X}", c as u32));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Renomme les dossiers/fichiers hérités dont le nom contient des caractères
+/// interdits sur Windows (créés par d'anciens builds Mac). Idempotent, appelé
+/// avant chaque export et fusion.
+pub fn migrate_unsafe_names(dir: &Path) {
+    for sub in DIRS {
+        let root = dir.join(sub);
+        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let safe = safe_component(&name);
+            if safe != name {
+                let _ = std::fs::rename(e.path(), root.join(safe));
+            }
+        }
+    }
+}
+
+/// Chemin relatif d'une entrée de zip, chaque composant assaini — les zips
+/// produits par d'anciens builds Mac contiennent des `:` qui feraient planter
+/// toute écriture sur Windows.
+fn safe_rel(rel: &Path) -> std::path::PathBuf {
+    rel.components()
+        .map(|c| safe_component(&c.as_os_str().to_string_lossy()))
+        .collect()
+}
+
 /// Zippe les données du cerveau. Renvoie les octets du zip.
 pub fn export_in(dir: &Path) -> Result<Vec<u8>, String> {
+    migrate_unsafe_names(dir);
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
@@ -105,7 +149,7 @@ pub fn import_in(dir: &Path, bytes: &[u8]) -> Result<usize, String> {
         let Some(rel) = entry.enclosed_name() else {
             return Err(format!("Chemin suspect dans l'archive : {}", entry.name()));
         };
-        let dest = dir.join(rel);
+        let dest = dir.join(safe_rel(&rel));
         if entry.is_dir() { continue; }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -191,6 +235,7 @@ fn zip_json<T: serde::de::DeserializeOwned>(
 
 /// Fusionne une sauvegarde distante dans les données locales (sync cloud).
 pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
+    migrate_unsafe_names(dir);
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("Archive illisible : {e}"))?;
 
@@ -301,7 +346,7 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
             return Err(format!("Chemin suspect dans l'archive : {}", entry.name()));
         };
         if entry.is_dir() || merged_by_hand.contains(&entry.name()) { continue; }
-        let dest = dir.join(rel);
+        let dest = dir.join(safe_rel(&rel));
         if dest.exists() { continue; }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -375,6 +420,30 @@ mod tests {
         assert_eq!(a.updated_at, Some(10), "nœud inchangé → garde son estampille");
         assert!(b.updated_at.unwrap() > 10, "nœud modifié → ré-estampillé maintenant");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn noms_windows_safe_encodage_et_migration() {
+        assert_eq!(safe_component("leaf:conv-1"), "leaf%3Aconv-1");
+        // Idempotent : ré-encoder ne change rien (sinon double-encodage au 2e passage).
+        assert_eq!(safe_component(&safe_component("leaf:conv-1")), "leaf%3Aconv-1");
+        assert_eq!(safe_component("note-1"), "note-1");
+
+        // Un zip contenant un chemin hérité avec `:` est écrit sous le nom encodé.
+        let src = std::env::temp_dir().join("brainlink_test_safe_src");
+        let dst = std::env::temp_dir().join("brainlink_test_safe_dst");
+        for d in [&src, &dst] { let _ = std::fs::remove_dir_all(d); }
+        std::fs::create_dir_all(src.join("node_history/leaf:conv-1")).unwrap();
+        std::fs::write(src.join("node_history/leaf:conv-1/v1.md"), "historique").unwrap();
+        std::fs::write(src.join("brain.json"), "{\"nodes\":[],\"edges\":[],\"markdown\":\"\",\"generated_at\":\"t\"}").unwrap();
+        // migrate_unsafe_names (via export_in) renomme le dossier hérité…
+        let zip = export_in(&src).unwrap();
+        assert!(src.join("node_history/leaf%3Aconv-1").exists(), "migration du dossier hérité");
+        // …et la fusion côté destinataire n'écrit que des chemins sûrs.
+        std::fs::create_dir_all(&dst).unwrap();
+        merge_in(&dst, &zip).unwrap();
+        assert!(dst.join("node_history/leaf%3Aconv-1/v1.md").exists());
+        for d in [&src, &dst] { let _ = std::fs::remove_dir_all(d); }
     }
 
     #[test]
