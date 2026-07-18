@@ -20,6 +20,7 @@ import { SpacesPanel, AssistantPanel } from "@/components/LeftSidebar";
 import { SettingsModal } from "@/components/SettingsModal";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { BetaBadge } from "@/components/BetaBadge";
 import {
   GenerateEmpty,
   GenerateProgress,
@@ -1035,6 +1036,7 @@ function App() {
                  paramètres, thème. Masqué quand le panneau détail est ouvert. ── */}
           {!selectedNode && (
             <div className="absolute right-3 top-3 z-20 flex items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)]/75 px-1.5 py-1 shadow-[var(--shadow-float)] backdrop-blur-md">
+              <BetaBadge />
               {graph && (
                 <button
                   onClick={() => handleGenerate()}
