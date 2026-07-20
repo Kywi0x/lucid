@@ -26,6 +26,48 @@ pub fn list_conversations_pub() -> Vec<ConversationSummary> {
     connectors::claude_code::list_conversations()
 }
 
+/// Insère (ou met à jour) une note « Parcours de démo » à la racine du cerveau —
+/// utilisée par `examples/seed_note.rs` pour déposer une note pédagogique dans
+/// l'app réelle. Id stable (`note-tour`) : ré-exécutable sans créer de doublon.
+pub fn seed_walkthrough_note(content: &str) -> Result<String, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let raw = std::fs::read_to_string(dir.join("brain.json"))
+        .map_err(|e| format!("brain.json introuvable ({e}) — génère d'abord un cerveau."))?;
+    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone())
+        .ok_or("Aucun nœud racine dans brain.json.")?;
+    let id = "note-tour".to_string();
+    if let Some(existing) = graph.nodes.iter_mut().find(|n| n.id == id) {
+        existing.content = content.to_string();
+    } else {
+        graph.nodes.push(BrainNode {
+            id: id.clone(),
+            label: "🧭 Parcours de démo — Lucid".into(),
+            kind: "note".into(),
+            weight: 0,
+            summary: String::new(),
+            keywords: vec![],
+            decisions: vec![],
+            patterns: vec![],
+            community: 0,
+            parent_id: Some(root_id.clone()),
+            synthesized_at: None,
+            date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            content: content.to_string(),
+            connector: None,
+            source_id: None,
+            source_project: None,
+            source_text: String::new(),
+            updated_at: None,
+        });
+        graph.edges.push(BrainEdge {
+            source: root_id, target: id.clone(), kind: "contains".into(), relation: "contains".into(),
+        });
+    }
+    backup::write_brain(&dir, &mut graph)?;
+    Ok(id)
+}
+
 /// Démo en ligne de commande du pipeline complet (utilisé par `examples/brain.rs`).
 /// Persiste le graphe (`brain.json` + `brain.md`) comme le ferait la commande Tauri.
 pub fn run_pipeline_demo(limit: usize) -> Result<BrainGraph, String> {

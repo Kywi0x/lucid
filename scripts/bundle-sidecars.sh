@@ -14,7 +14,7 @@ TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
 BIN_DIR="src-tauri/binaries"
 LIB_DIR="src-tauri/resources/libs"
 TESS_DIR="src-tauri/resources/tessdata"
-LLAMA_STATIC="$HOME/Library/Application Support/fr.ideeri.brainlink/llama.cpp/build-static/bin/llama-completion"
+LLAMA_STATIC="$HOME/Library/Application Support/com.lucidflow.lucid/llama.cpp/build-static/bin/llama-completion"
 
 rm -rf "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
 mkdir -p "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"

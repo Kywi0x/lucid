@@ -155,7 +155,7 @@ Le pipeline est **résilient** : une conversation qui échoue à l'analyse est i
   *déterministiquement* en Rust (concepts ≥ 2 occurrences = récurrents ; concepts présents
   dans ≥ 2 projets = connexions). → Résultat reproductible, robuste au bruit du petit modèle.
 - Code : `src-tauri/src/ai/{llama.rs,pipeline.rs}`. Modèle & binaire résolus depuis le dossier
-  de données applicatif (`~/Library/Application Support/fr.ideeri.brainlink/`) ou via les
+  de données applicatif (`~/Library/Application Support/com.lucidflow.lucid/`) ou via les
   variables `SECOND_BRAIN_MODEL` / `SECOND_BRAIN_LLAMA_BIN`.
 
 ---
@@ -190,9 +190,9 @@ Le pipeline est **résilient** : une conversation qui échoue à l'analyse est i
 - [ ] **Fusion de concepts proches** (« Supabase » / « Supabase Auth » → plus de ponts)
 - [ ] Landing page + waitlist
 
-> **Naming à trancher** : le header affiche **« Lucid »** ; le projet/identifiant Tauri reste
-> `brainlink` / `fr.ideeri.brainlink` / produit « Second Brain ». Décider d'un nom unique puis
-> aligner `package.json`, `Cargo.toml`, `tauri.conf.json` (productName + identifier), le header.
+> **Naming tranché (2026-07-20)** : produit = **Lucid** partout (header, `productName`,
+> identifiant Tauri `com.lucidflow.lucid`). `brainlink` ne subsiste que comme nom interne
+> du crate Rust (`Cargo.toml`), invisible à l'utilisateur.
 
 ### Phase 2 — Produit (3 mois)
 - [ ] Connecteurs Google Drive, WhatsApp, Codex

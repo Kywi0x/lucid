@@ -13,7 +13,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
-const APP_DIR: &str = "fr.ideeri.brainlink"; // = ai::llama::APP_DIR
+const APP_DIR: &str = "com.lucidflow.lucid"; // = ai::llama::APP_DIR
+const LEGACY_APP_DIR: &str = "fr.ideeri.brainlink"; // = ai::llama::LEGACY_APP_DIR
 
 #[derive(Deserialize)]
 struct Graph {
@@ -52,7 +53,12 @@ fn body_of(n: &Node) -> &str {
 /// Même résolution que `ai::llama::app_data_dir` : `users/<uuid>/` si un compte
 /// est connecté dans Lucid (fichier `active_user`), racine sinon (install legacy).
 fn data_dir() -> Result<std::path::PathBuf, String> {
-    let root = dirs::data_dir().ok_or("dossier de données introuvable")?.join(APP_DIR);
+    let base = dirs::data_dir().ok_or("dossier de données introuvable")?;
+    let root = base.join(APP_DIR);
+    if !root.exists() {
+        let legacy = base.join(LEGACY_APP_DIR);
+        if legacy.exists() { let _ = std::fs::rename(&legacy, &root); }
+    }
     Ok(match std::fs::read_to_string(root.join("active_user")) {
         Ok(id) if !id.trim().is_empty() => root.join("users").join(id.trim()),
         _ => root,

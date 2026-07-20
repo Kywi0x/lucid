@@ -7,7 +7,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-const APP_DIR: &str = "fr.ideeri.brainlink";
+const APP_DIR: &str = "com.lucidflow.lucid";
+/// Ancien identifiant (avant le 2026-07-20) — un `rename` best-effort au premier
+/// démarrage post-update rapatrie toutes les données (comptes, modèle IA ~2,3 Go)
+/// sans qu'un user ait à réinstaller. Silencieux si absent ou déjà migré.
+const LEGACY_APP_DIR: &str = "fr.ideeri.brainlink";
 /// Taille de la fenêtre de contexte passée à llama (`-c`). Exposée à l'UI via
 /// `ai_info` pour afficher la capacité et avertir si un prompt la dépasse.
 pub const CONTEXT_TOKENS: u32 = 8192;
@@ -32,7 +36,22 @@ pub struct ModelDef {
 /// Racine machine : assets partagés entre tous les comptes (llama.cpp, modèles,
 /// catalogue). Ne jamais y écrire de données utilisateur.
 pub fn shared_data_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join(APP_DIR))
+    let base = dirs::data_dir()?;
+    migrate_legacy_dir_in(&base);
+    Some(base.join(APP_DIR))
+}
+
+/// Rapatrie `LEGACY_APP_DIR` vers `APP_DIR` si ce dernier n'existe pas encore
+/// (renommage de l'identifiant, 2026-07-20) — `rename` est quasi instantané
+/// (même volume), contrairement à une copie du dossier (llama.cpp + modèles,
+/// plusieurs Go). Best-effort : une erreur (permissions, cross-device) laisse
+/// simplement l'app repartir à neuf plutôt que de planter.
+fn migrate_legacy_dir_in(base: &std::path::Path) {
+    let dir = base.join(APP_DIR);
+    let legacy = base.join(LEGACY_APP_DIR);
+    if !dir.exists() && legacy.exists() {
+        let _ = std::fs::rename(&legacy, &dir);
+    }
 }
 
 /// Dossier de données de l'utilisateur actif : `users/<uuid>/` si un compte est
@@ -119,7 +138,7 @@ fn raw_to_model(e: RawEntry) -> Option<ModelDef> {
 fn fetch_catalog() -> Vec<ModelDef> {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
-        .user_agent("brainlink/0.1")
+        .user_agent("lucid/0.1")
         .build()
     {
         Ok(c) => c,
@@ -347,7 +366,7 @@ pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
 
     let client = reqwest::blocking::Client::builder()
         .timeout(None)
-        .user_agent("brainlink/0.1")
+        .user_agent("lucid/0.1")
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -537,7 +556,37 @@ fn clean_output(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_output, format_prompt};
+    use super::{clean_output, format_prompt, migrate_legacy_dir_in, APP_DIR, LEGACY_APP_DIR};
+
+    #[test]
+    fn migre_le_dossier_legacy_si_le_nouveau_est_absent() {
+        let base = std::env::temp_dir().join("brainlink_test_migrate_legacy");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(LEGACY_APP_DIR)).unwrap();
+        std::fs::write(base.join(LEGACY_APP_DIR).join("marker.txt"), "présent").unwrap();
+
+        migrate_legacy_dir_in(&base);
+
+        assert!(!base.join(LEGACY_APP_DIR).exists(), "l'ancien dossier a été renommé");
+        assert_eq!(std::fs::read_to_string(base.join(APP_DIR).join("marker.txt")).unwrap(), "présent");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ne_touche_pas_a_un_nouveau_dossier_deja_present() {
+        let base = std::env::temp_dir().join("brainlink_test_migrate_noop");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(LEGACY_APP_DIR)).unwrap();
+        std::fs::write(base.join(LEGACY_APP_DIR).join("marker.txt"), "legacy").unwrap();
+        std::fs::create_dir_all(base.join(APP_DIR)).unwrap();
+        std::fs::write(base.join(APP_DIR).join("marker.txt"), "déjà migré").unwrap();
+
+        migrate_legacy_dir_in(&base);
+
+        assert!(base.join(LEGACY_APP_DIR).exists(), "le legacy n'est pas touché s'il existe déjà côté nouveau");
+        assert_eq!(std::fs::read_to_string(base.join(APP_DIR).join("marker.txt")).unwrap(), "déjà migré");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn strips_json_fences() {

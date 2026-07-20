@@ -1,4 +1,4 @@
-# CLAUDE.md — Lucid / Second Brain (projet `brainlink`)
+# CLAUDE.md — Lucid
 
 > Contexte pour reprendre le dev en session terminal. Vision produit complète dans
 > [`second-brain-project.md`](second-brain-project.md). Ce fichier = l'opérationnel.
@@ -15,8 +15,10 @@ machine, mais le cerveau (résultat, ~2 Mo) se synchronise entre appareils via l
 Principe clé : le **pipeline est agnostique de la source**. Un connecteur produit des
 `Conversation` normalisées ; le graphe, le drill-down et les ponts inter-sources marchent tout seuls.
 
-> ⚠️ **Naming** : header = « Lucid », projet/identifiant = `brainlink` / `fr.ideeri.brainlink`,
-> produit historique = « Second Brain ». À unifier (voir roadmap).
+> ✅ **Naming tranché (2026-07-20)** : le produit s'appelle **Lucid** partout — header,
+> identifiant Tauri (`com.lucidflow.lucid`), dossier de données. `brainlink` ne subsiste
+> que comme nom interne du crate/package Rust (`Cargo.toml`, invisible à l'utilisateur).
+> « Second Brain » est l'ancien nom produit, à ne plus utiliser.
 
 ## Stack
 
@@ -43,8 +45,8 @@ npx tsc --noEmit                # typecheck front
 
 ## IA locale — chemins & régénération
 
-- Binaire : `~/Library/Application Support/fr.ideeri.brainlink/llama.cpp/build/bin/llama-completion`
-- Modèle : `~/Library/Application Support/fr.ideeri.brainlink/models/gemma-3-4b-it-Q4_K_M.gguf` (~2.3 Go)
+- Binaire : `~/Library/Application Support/com.lucidflow.lucid/llama.cpp/build/bin/llama-completion`
+- Modèle : `~/Library/Application Support/com.lucidflow.lucid/models/gemma-3-4b-it-Q4_K_M.gguf` (~2.3 Go)
 - Override possible : env `SECOND_BRAIN_LLAMA_BIN` / `SECOND_BRAIN_MODEL`
 - Sorties persistées dans le même dossier : **`brain.json`** (graphe, lu au démarrage par l'app) + **`brain.md`**
 
@@ -104,7 +106,7 @@ les liens fichiers (chemin local ou URL Drive).
 3. **Watch auto** du dossier Claude Code (MAJ incrémentale).
 4. **Packaging** `.dmg`/`.exe` avec llama.cpp en sidecar + download modèle post-install.
 5. Polish visuel des bulles ; **fusion de concepts proches** (plus de ponts).
-6. Trancher le **naming** (Lucid vs Second Brain) et aligner partout.
+6. ~~Trancher le **naming** (Lucid vs Second Brain) et aligner partout.~~ Fait le 2026-07-20.
 
 ## Plugin ponytail
 
