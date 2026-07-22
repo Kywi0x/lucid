@@ -26,16 +26,6 @@ export interface Conversation extends ConversationSummary {
  *  `pending` = proposition MCP pas encore validée (bulle fantôme, jamais persistée). */
 export type NodeKind = "root" | "container" | "leaf" | "group" | "espace" | "page" | "source" | "note" | "pending";
 
-/** Client IA local (Claude Desktop/Code, Cursor…) connectable au MCP Lucid. */
-export interface AiClientStatus {
-  id: string;
-  name: string;
-  installed: boolean;
-  connected: boolean;
-  /** false = le client refuse les serveurs MCP locaux (ex. ChatGPT). */
-  supported: boolean;
-}
-
 /** Rapport de sync du connecteur « dossier local ». */
 export interface LocalFolderSyncReport {
   new: number;
@@ -44,12 +34,21 @@ export interface LocalFolderSyncReport {
   skipped: string[];
 }
 
-/** Proposition de création déposée par le serveur MCP, en attente de validation. */
+/** Proposition MCP en attente de validation — 5 formes (`action`), un seul
+ *  circuit. "create" : parent_id/label/content. "update" : target_id/content.
+ *  "move" : target_id/new_parent_id. "merge" : merge_ids (+ label optionnel du
+ *  survivant). "link" : target_id/link_target/relation. */
 export interface McpProposal {
   id: string;
+  action: "create" | "update" | "move" | "merge" | "link";
   parent_id: string;
   label: string;
   content: string;
+  target_id: string;
+  new_parent_id: string;
+  merge_ids: string[];
+  link_target: string;
+  relation: string;
   created_at: string;
 }
 
@@ -74,6 +73,9 @@ export interface BrainNode {
   connector?: string;
   source_id?: string;
   source_project?: string;
+  /** Front-only : proposition MCP en attente ciblant ce nœud (update/move/merge/link) —
+   *  jamais persisté, calculé depuis `proposals` (cf. App.tsx:graphWithGhosts). */
+  pendingAction?: "update" | "move" | "merge" | "link";
 }
 
 export interface BrainEdge {
@@ -95,6 +97,8 @@ export interface SnapshotInfo {
   id: string;
   created_at: number; // unix seconds
   node_count: number;
+  /** Origine : "mcp_accept" | "delete_node" | "pre_restore" | "regenerate" | "manual". */
+  reason: string;
 }
 
 export interface NodeSnapshotInfo {

@@ -3,8 +3,7 @@
   "bundle": {
     "targets": ["nsis"],
     "externalBin": [
-      "binaries/llama-completion",
-      "binaries/lucid_mcp"
+      "binaries/llama-completion"
     ],
     "resources": {
       "resources/win-libs/*.dll": "./",

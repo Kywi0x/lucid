@@ -1,81 +1,104 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Brain, Sparkles, Loader2, AlertTriangle, RotateCw, Plug } from "lucide-react";
+import { Sparkles, Loader2, AlertTriangle, RotateCw, Plug, Check } from "lucide-react";
 import type { BrainProgress } from "@/lib/api";
+import { NeuralBg, LucidOrb } from "@/components/NeuralBg";
 
-/** État vide : invite à connecter une source puis générer le second cerveau. */
+/** Écran d'accueil (1er lancement, pas encore de cerveau) : l'orbe Lucid sur le
+ *  même fond décoratif que le canvas, un seul geste ("Commencer à créer mon
+ *  cerveau") qui lance le scan puis la génération ; démo et connexion manuelle
+ *  restent des choix secondaires en retrait. */
 export function GenerateEmpty({
   error,
-  onGenerate,
+  onStartScan,
+  onExploreDemo,
   onOpenSettings,
 }: {
   error: string | null;
-  onGenerate: () => void;
-  /** Ouvre les Réglages (section Sources) — indispensable au 1er lancement sans données. */
+  /** Bouton principal : scan des dossiers locaux puis génération automatique. */
+  onStartScan: () => void;
+  /** Contenu d'exemple explorable sans rien connecter. */
+  onExploreDemo: () => void;
+  /** Ouvre les Réglages (Google Drive, import manuel…). */
   onOpenSettings: () => void;
 }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
-      <Brain className="size-12 text-[var(--color-accent)]" />
-      <div>
-        <h2 className="text-lg font-semibold">
-          Génère ta mind map intelligente
-        </h2>
-        <p className="mt-1 max-w-md text-sm text-[var(--color-muted)]">
-          L'IA locale analyse tes sources (Claude Code, Notion, Google Drive,
-          Obsidian, fichiers…) et en dessine une carte : projets, concepts et
-          leurs connexions. 100 % sur ta machine, rien ne part en ligne.
-        </p>
-        <p className="mt-2 max-w-md text-xs text-[var(--color-muted)]">
-          Astuce : tu peux aussi glisser-déposer des PDF, Word ou CSV
-          directement sur la carte une fois générée.
-        </p>
-      </div>
-      {error && (
-        <div className="flex items-center gap-2 rounded-md border border-[var(--color-err)]/40 bg-[var(--color-err)]/10 px-3 py-2 text-sm text-[var(--color-err)]">
-          <AlertTriangle className="size-4 shrink-0" />
-          {error}
+    <div className="relative flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
+      <NeuralBg />
+      <div className="lucid-rise relative flex flex-col items-center gap-4">
+        <LucidOrb size={56} />
+        <div>
+          <h2 className="text-lg font-semibold">Bienvenue dans Lucid</h2>
+          <p className="mt-1 max-w-md text-sm text-[var(--color-muted)]">
+            Lucid scanne ton Bureau, tes Documents et tes Téléchargements (PDF,
+            Word, PowerPoint, Excel, CSV…) et en dessine ta mind map, 100 % sur
+            ta machine — rien ne part en ligne.
+          </p>
         </div>
-      )}
-      <div className="flex flex-col items-center gap-2">
-        <button
-          onClick={onGenerate}
-          className="flex items-center gap-2 rounded-lg bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
-        >
-          <Sparkles className="size-4" />
-          Générer ma mind map
-        </button>
-        <button
-          onClick={onOpenSettings}
-          className="flex items-center gap-2 rounded-lg border border-[var(--color-border)] px-4 py-2 text-sm font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface-2)]"
-        >
-          <Plug className="size-4" />
-          Connecter une source / importer un fichier
-        </button>
+        {error && (
+          <div className="flex items-center gap-2 rounded-md border border-[var(--color-err)]/40 bg-[var(--color-err)]/10 px-3 py-2 text-sm text-[var(--color-err)]">
+            <AlertTriangle className="size-4 shrink-0" />
+            {error}
+          </div>
+        )}
+        <div className="flex flex-col items-center gap-2">
+          <button
+            onClick={onStartScan}
+            className="flex items-center gap-2 rounded-lg bg-[var(--color-accent)] px-5 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+          >
+            <Sparkles className="size-4" />
+            Commencer à créer mon cerveau
+          </button>
+          <button onClick={onExploreDemo} className="text-xs text-[var(--color-accent)] hover:underline">
+            Explorer une démo (sans scanner)
+          </button>
+        </div>
       </div>
-      <p className="max-w-md text-xs text-[var(--color-muted)]">
-        Aucune source détectée ? Connecte Notion, Google Drive ou importe un fichier
-        depuis les Réglages, puis génère ta carte.
-      </p>
+      <button
+        onClick={onOpenSettings}
+        className="relative flex items-center gap-1.5 text-xs text-[var(--color-muted)] transition-colors hover:text-[var(--color-text)]"
+      >
+        <Plug className="size-3.5" />
+        Ou connecte Google Drive / importe un fichier manuellement
+      </button>
     </div>
   );
 }
 
-/** Barre de progression pendant l'analyse IA. */
+/** Liste des auto-détections confirmées pendant le scan (Obsidian, Notes Apple,
+ *  Claude Desktop…) — affichée sous la barre de progression du scan/génération. */
+export function ScanSteps({ steps }: { steps: string[] }) {
+  if (steps.length === 0) return null;
+  return (
+    <ul className="mt-3 flex flex-col gap-1 text-left">
+      {steps.map((s, i) => (
+        <li key={i} className="flex items-center gap-1.5 text-xs text-[var(--color-ok)]">
+          <Check className="size-3 shrink-0" />
+          <span className="truncate text-[var(--color-muted)]">{s}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** Barre de progression pendant l'analyse IA (réutilisée pour le scan machine
+ *  avant la génération — même composant, `label` différencie le contexte). */
 export function GenerateProgress({
   progress,
+  label = "Analyse locale en cours…",
 }: {
   progress: BrainProgress | null;
+  label?: string;
 }) {
   const pct = progress
-    ? Math.round((progress.current / progress.total) * 100)
+    ? Math.round((progress.current / Math.max(progress.total, 1)) * 100)
     : 0;
   return (
     <div className="flex h-full flex-col items-center justify-center gap-5 px-8 text-center">
       <Loader2 className="size-10 animate-spin text-[var(--color-accent)]" />
       <div className="w-full max-w-md">
         <div className="mb-2 flex justify-between text-sm text-[var(--color-muted)]">
-          <span>Analyse locale en cours…</span>
+          <span>{label}</span>
           {progress && (
             <span>
               {progress.current}/{progress.total}

@@ -14,10 +14,45 @@ pub const FILES: &[&str] = &[
     "deleted_nodes.json",
     "deleted_spaces.json",
     "brain_cache.json",
-    "notion_cache.json",
     "google_drive_conversations.json",
 ];
 pub const DIRS: &[&str] = &["snapshots", "node_history", "assets", "mcp_pending"];
+
+// ── Cache mémoire de brain.json ──────────────────────────────────────────────
+// Chaque commande relisait le fichier entier depuis le disque, même pour une
+// action minime — coûteux sur un cerveau de plusieurs dizaines de Mo, et
+// aggravé par le mode autonome (MCP) qui enchaîne des actions rapidement (bug
+// remonté par Liam le 2026-07-21 : "il doit relire constamment tout, il l'a
+// pas en mémoire ?"). `write_brain` et `merge_in` sont les deux seuls writers
+// de brain.json (le second, seul, écrit hors de `write_brain` — sync cloud) ;
+// tous deux mettent ce cache à jour juste après avoir écrit, donc une lecture
+// via `load_brain_cached` n'est jamais périmée tant qu'un des deux chemins a
+// bien été utilisé pour la dernière écriture.
+static BRAIN_CACHE: std::sync::Mutex<Option<(std::path::PathBuf, crate::models::BrainGraph)>> =
+    std::sync::Mutex::new(None);
+
+fn cached_for(dir: &Path) -> Option<crate::models::BrainGraph> {
+    let cache = BRAIN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    match cache.as_ref() {
+        Some((cached_dir, graph)) if cached_dir == dir => Some(graph.clone()),
+        _ => None,
+    }
+}
+
+fn set_cache(dir: &Path, graph: &crate::models::BrainGraph) {
+    let mut cache = BRAIN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    *cache = Some((dir.to_path_buf(), graph.clone()));
+}
+
+/// Charge brain.json — depuis le cache mémoire s'il correspond au même dossier
+/// (compte actif inchangé), sinon relit le disque et peuple le cache.
+pub fn load_brain_cached(dir: &Path) -> Result<crate::models::BrainGraph, String> {
+    if let Some(g) = cached_for(dir) { return Ok(g); }
+    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
+    let graph: crate::models::BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    set_cache(dir, &graph);
+    Ok(graph)
+}
 
 /// Nom de fichier/dossier sûr multi-OS. Les ids de nœuds contiennent `:`
 /// (`leaf:<conv>`, `p:<projet>`) — légal sur macOS, interdit sur Windows
@@ -196,9 +231,13 @@ fn node_sig(n: &crate::models::BrainNode) -> String {
 /// unique : tous les writers de brain.json doivent l'utiliser, sinon les
 /// modifications ne se propagent pas dans la fusion de sync.
 pub fn write_brain(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
-    let old: Option<BrainGraph> = std::fs::read_to_string(dir.join("brain.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok());
+    // "old" vient du cache mémoire quand possible — évite une lecture complète
+    // de plus du disque en plus de celle déjà faite par l'appelant pour
+    // préparer `graph` (cf. `load_brain_cached`).
+    let old: Option<BrainGraph> = cached_for(dir).or_else(|| {
+        std::fs::read_to_string(dir.join("brain.json")).ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+    });
     let old_by_id: std::collections::HashMap<String, (Option<u64>, String)> = old
         .map(|g| g.nodes.into_iter().map(|n| (n.id.clone(), (n.updated_at, node_sig(&n)))).collect())
         .unwrap_or_default();
@@ -213,7 +252,9 @@ pub fn write_brain(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
         dir.join("brain.json"),
         serde_json::to_string_pretty(graph).map_err(|e| e.to_string())?,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    set_cache(dir, graph);
+    Ok(())
 }
 
 /// La structure de l'arbre a UNE seule vérité : `parent_id`. Les arêtes
@@ -341,12 +382,17 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
                 dir.join("brain.json"),
                 serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?,
             ).map_err(|e| e.to_string())?;
+            // Seul autre écrivain de brain.json en dehors de `write_brain` (sync
+            // cloud) — doit lui aussi tenir le cache mémoire à jour, sinon une
+            // lecture juste après une fusion servirait une version périmée.
+            set_cache(dir, &merged);
         }
         (None, Some(remote)) => {
             std::fs::write(
                 dir.join("brain.json"),
                 serde_json::to_string_pretty(&remote).map_err(|e| e.to_string())?,
             ).map_err(|e| e.to_string())?;
+            set_cache(dir, &remote);
         }
         (Some(_), None) => { local_extra = true; }
         (None, None) => {}

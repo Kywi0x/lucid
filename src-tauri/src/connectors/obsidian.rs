@@ -44,6 +44,45 @@ pub fn vault_path() -> Option<String> {
     load_vault()
 }
 
+// ─── Auto-détection ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ObsidianVaultEntry {
+    path: String,
+    #[serde(default)]
+    ts: u64,
+}
+
+#[derive(Deserialize)]
+struct ObsidianAppConfig {
+    #[serde(default)]
+    vaults: std::collections::HashMap<String, ObsidianVaultEntry>,
+}
+
+/// Fichier de config d'Obsidian lui-même (liste les vaults déjà ouverts sur
+/// cette machine) — même chemin sur Mac et Windows via `dirs::config_dir()`
+/// (`~/Library/Application Support` / `%APPDATA%`).
+fn obsidian_app_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("obsidian").join("obsidian.json"))
+}
+
+/// Détecte le vault Obsidian le plus récemment utilisé et le connecte
+/// automatiquement si aucun vault n'est déjà configuré. Renvoie le chemin
+/// connecté (existant ou nouvellement détecté), `None` si Obsidian n'a jamais
+/// tourné sur cette machine — absent, pas une erreur.
+pub fn auto_connect() -> Option<String> {
+    if let Some(existing) = load_vault() {
+        return Some(existing);
+    }
+    let raw = std::fs::read_to_string(obsidian_app_config_path()?).ok()?;
+    let cfg: ObsidianAppConfig = serde_json::from_str(&raw).ok()?;
+    let best = cfg.vaults.values()
+        .filter(|v| Path::new(&v.path).is_dir())
+        .max_by_key(|v| v.ts)?;
+    set_vault(&best.path).ok()?;
+    Some(best.path.clone())
+}
+
 // ─── Walk ─────────────────────────────────────────────────────────────────────
 
 fn walk_vault(root: &Path) -> Vec<(String, PathBuf)> {

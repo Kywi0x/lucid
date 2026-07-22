@@ -1,5 +1,11 @@
 import { supabase } from "./supabase";
+import { readBrainGraph } from "./api";
 import type { BrainGraph, Space } from "./types";
+
+/** Titre réservé du space "MCP personnel" (jamais affiché) — sert de clé
+ *  d'upsert stable via l'index unique (owner, title) déjà utilisé par les
+ *  spaces publiés classiques. */
+export const PERSONAL_SPACE_TITLE = "__lucid_personal_brain__";
 
 export interface ShareState {
   id: string;
@@ -102,6 +108,67 @@ export async function publishSpace(
     .single();
   if (error) throw new Error(error.message);
   return { ...(data as ShareState), url: shareUrl(data.id) };
+}
+
+/** Le space "MCP personnel" : TOUT le cerveau, tenu à jour à chaque sync cloud
+ *  (pas un choix éditorial de l'utilisateur, contrairement à un space publié
+ *  classique) — pour que Claude Desktop/Code (locaux) et claude.ai (distant)
+ *  se connectent au même serveur MCP avec les mêmes fonctionnalités (décision
+ *  2026-07-21). Toujours avec le texte des sources : c'est le compte du
+ *  propriétaire, pas un partage vers un tiers — pas d'opt-in à demander.
+ *  Best-effort : n'importe quelle erreur ne doit jamais bloquer la sync cloud
+ *  elle-même (appelant : `push()` dans sync.ts).
+ */
+// Même plafond que la lecture d'une page côté MCP (`brain_node`/`toolNode`,
+// 24 000 caractères ≈ 6 300 tokens) — un cerveau avec des PDF entiers embarqués
+// peut peser des dizaines de Mo si on envoie chaque contenu intégralement ;
+// sans ce plafond, l'upload (JSON.stringify + requête HTTP d'un coup dans la
+// fenêtre) pouvait faire planter l'app (bug remonté par Liam le 2026-07-21).
+const MAX_NODE_CONTENT = 24_000;
+function truncateForSync(s: string): string {
+  return s.length <= MAX_NODE_CONTENT ? s : s.slice(0, MAX_NODE_CONTENT) + "\n\n*[… tronqué]*";
+}
+
+export async function ensurePersonalMcpSpace(): Promise<void> {
+  if (!supabase) return;
+  const owner = await uid();
+  const graph = await readBrainGraph();
+  if (!graph) return;
+  const payload = {
+    title: PERSONAL_SPACE_TITLE,
+    nodes: graph.nodes.map((n) => ({
+      id: n.id, label: n.label, kind: n.kind, weight: n.weight,
+      summary: n.summary, keywords: n.keywords, parent_id: n.parent_id ?? null,
+      date: n.date ?? null,
+      content: truncateForSync(n.content || n.source_text || ""),
+    })),
+    edges: graph.edges.filter((e) => e.kind === "contains" || e.kind === "link"),
+  };
+  const { error } = await supabase
+    .from("shared_spaces")
+    .upsert(
+      { owner, title: PERSONAL_SPACE_TITLE, data: payload, visibility: "personal", updated_at: new Date().toISOString() },
+      { onConflict: "owner,title" },
+    );
+  if (error) throw new Error(error.message);
+}
+
+/** URL MCP personnelle (crée le space + son token au besoin). Nul si Supabase
+ *  n'est pas configuré ou si la migration SQL n'est pas encore appliquée. */
+export async function ensurePersonalMcpUrl(): Promise<string | null> {
+  if (!supabase) return null;
+  try {
+    await ensurePersonalMcpSpace();
+    const owner = await uid();
+    const { data } = await supabase
+      .from("shared_spaces").select("id")
+      .eq("owner", owner).eq("title", PERSONAL_SPACE_TITLE).maybeSingle();
+    if (!data) return null;
+    const token = await ensureMcpToken(data.id as string);
+    return token ? mcpUrl(token) : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface SharedWithMe {

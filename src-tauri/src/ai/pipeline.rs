@@ -1,7 +1,7 @@
 //! Pipeline d'analyse : conversations → extraction IA → arbre de nœuds → `brain.md`.
 //!
 //! Modèle de données : arbre récursif agnostique de la source.
-//! Feuille  = une source (conv Claude Code, page Notion, fichier Drive).
+//! Feuille  = une source (conv Claude Code, fichier Drive, note Obsidian…).
 //! Conteneur = espace / dossier, profondeur illimitée (container_path).
 //! Agrégation déterministe en Rust, aucun appel API après sync.
 
@@ -62,10 +62,6 @@ fn extraction_prompt(conv: &Conversation) -> String {
             "Analyse ce document ou fichier Google Drive.\n\
 Si le contenu est uniquement un nom de fichier, infère les concepts, \
 l'entité (client, fournisseur, entreprise) et le thème depuis ce nom."
-        }
-        "notion" => {
-            "Analyse cette page ou base de données Notion.\n\
-Extrais les concepts, entités, thèmes et décisions clés présents dans le contenu."
         }
         "obsidian" => {
             "Analyse cette note Obsidian (markdown).\n\

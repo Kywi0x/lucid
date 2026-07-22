@@ -1,16 +1,13 @@
 # ─── Lucid — sidecars du bundle Windows ──────────────────────────────────────
 # Prépare les binaires externes attendus par tauri.windows.conf.json :
-#   - lucid_mcp.exe        (compilé depuis ce repo)
 #   - llama-completion.exe (= llama-cli.exe de la release officielle llama.cpp, CPU)
 #     + les DLL de llama.cpp dans resources/win-libs/ (posées à côté de l'exe)
 #   - poppler (pdftotext/pdftoppm + DLL) dans resources/win-poppler/ → bundle poppler/
 #   - tesseract (+ DLL) dans resources/win-tesseract/               → bundle tesseract/
 #   - tessdata fra+eng+osd dans resources/win-tessdata/             → bundle tessdata/
 # Parité Mac/Windows (ADR-0015) : PDF texte, tableaux ET scannés (OCR) sur Windows.
-#
-# ⚠️ Ordre important : llama (exe + DLL) AVANT `cargo build --bin lucid_mcp`, car
-# build.rs (tauri_build::build) valide l'existence des externalBin + resources dès
-# qu'on compile le crate. lucid_mcp reçoit un placeholder le temps de se compiler.
+# Le MCP est désormais 100% distant (supabase/functions/lucid-mcp) — plus de
+# binaire local à compiler/bundler ici.
 #
 # Usage (runner windows-latest ou PC Windows) : pwsh scripts/bundle-sidecars.ps1
 $ErrorActionPreference = "Stop"
@@ -30,7 +27,7 @@ New-Item -ItemType Directory -Force -Path $BinDir, $LibDir, $PopDir, $TesDir, $T
 $ghHeaders = @{ "User-Agent" = "lucid-ci" }
 if ($env:GITHUB_TOKEN) { $ghHeaders["Authorization"] = "Bearer $($env:GITHUB_TOKEN)" }
 
-Write-Host "── 1/4 llama-completion (release officielle llama.cpp, CPU x64)"
+Write-Host "── 1/3 llama-completion (release officielle llama.cpp, CPU x64)"
 # On veut STRICTEMENT l'archive CPU x64 (contient llama-cli.exe + DLL ggml).
 # `latest` publie ses assets par vagues : l'exe CPU peut manquer quelques minutes
 # alors que les zips cudart/cuda sont déjà là. On balaie donc les dernières releases
@@ -58,7 +55,7 @@ Get-ChildItem -Path $cli.DirectoryName -Filter "*.dll" | ForEach-Object {
     Copy-Item $_.FullName (Join-Path $LibDir $_.Name)
 }
 
-Write-Host "── 2/4 poppler (pdftotext + pdftoppm, release oschwartz10612/poppler-windows)"
+Write-Host "── 2/3 poppler (pdftotext + pdftoppm, release oschwartz10612/poppler-windows)"
 $rel = Invoke-RestMethod "https://api.github.com/repos/oschwartz10612/poppler-windows/releases/latest" -Headers $ghHeaders
 $asset = $rel.assets | Where-Object { $_.name -like "Release-*.zip" } | Select-Object -First 1
 if (-not $asset) { throw "Aucun asset Release-*.zip dans la dernière release poppler-windows." }
@@ -76,7 +73,7 @@ foreach ($f in @("pdftotext.exe", "pdftoppm.exe")) {
 }
 Get-ChildItem -Path $pdftotext.DirectoryName -Filter "*.dll" | Copy-Item -Destination $PopDir
 
-Write-Host "── 3/4 tesseract + tessdata (fra+eng+osd)"
+Write-Host "── 3/3 tesseract + tessdata (fra+eng+osd)"
 # Installeur UB Mannheim (NSIS) extrait via 7-Zip — pas d'archive portable officielle.
 $7z = @("7z", "$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe") |
     Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
@@ -117,15 +114,6 @@ foreach ($lang in @("fra", "eng", "osd")) {
     Invoke-WebRequest "https://github.com/tesseract-ocr/tessdata_fast/raw/main/$lang.traineddata" `
         -OutFile (Join-Path $TdaDir "$lang.traineddata")
 }
-
-Write-Host "── 4/4 lucid_mcp (release)"
-# Placeholder : build.rs valide l'existence de tous les externalBin (dont lucid_mcp)
-# pendant sa propre compilation. Le vrai binaire l'écrase juste après.
-New-Item -ItemType File -Force "$BinDir/lucid_mcp-$Triple.exe" | Out-Null
-Push-Location src-tauri
-cargo build --release --bin lucid_mcp --quiet
-Pop-Location
-Copy-Item "src-tauri/target/release/lucid_mcp.exe" "$BinDir/lucid_mcp-$Triple.exe" -Force
 
 Write-Host ""
 Write-Host "✅ Sidecars Windows prêts :"

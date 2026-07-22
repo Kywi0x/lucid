@@ -101,18 +101,19 @@ export function toolNode(p: Payload, nodeId: string): string {
   return out;
 }
 
-// ── Chargement du space (RLS : la clé anon ne voit que les spaces publics) ────
+// ── Chargement du space ───────────────────────────────────────────────────────
+// Clé service partout ici (pas la clé anon) : l'accès est déjà tranché en amont
+// par `spaceIdFromToken` (token MCP valide → space_id), qu'il s'agisse d'un
+// space publié classique OU du space "personnel" (visibility='personal', tout
+// le cerveau du compte — cf. décision 2026-07-21 : mêmes outils, locaux ou
+// distants). La RLS anon (spaces publics uniquement) reste en place pour le
+// viewer web, mais ne concerne plus ce chemin MCP.
 
 function env(k: string): string | undefined {
   // Edge runtime = Deno.env ; tests locaux (tsx/node) = process.env.
   return typeof Deno !== "undefined" && Deno.env
     ? Deno.env.get(k)
     : (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env[k];
-}
-
-function anonHeaders(): Record<string, string> {
-  const anon = env("SUPABASE_ANON_KEY")!;
-  return { apikey: anon, Authorization: `Bearer ${anon}` };
 }
 
 /// Le token MCP est une capability SÉPARÉE du lien de partage : il n'est lisible
@@ -132,13 +133,14 @@ async function spaceIdFromToken(token: string): Promise<string> {
 
 async function loadSpace(spaceId: string): Promise<Payload> {
   const base = env("SUPABASE_URL")!;
+  const key = env("SUPABASE_SERVICE_ROLE_KEY")!;
   const r = await fetch(
-    `${base}/rest/v1/shared_spaces?id=eq.${encodeURIComponent(spaceId)}&select=title,data,visibility`,
-    { headers: anonHeaders() },
+    `${base}/rest/v1/shared_spaces?id=eq.${encodeURIComponent(spaceId)}&select=title,data`,
+    { headers: { apikey: key, Authorization: `Bearer ${key}` } },
   );
   if (!r.ok) throw new Error(`stockage indisponible (${r.status})`);
   const rows = await r.json();
-  if (!rows.length) throw new Error("space introuvable ou privé — seuls les spaces publics sont accessibles via le MCP distant (v1)");
+  if (!rows.length) throw new Error("space introuvable — le lien MCP a peut-être été révoqué, republie-le dans Lucid");
   return rows[0].data as Payload;
 }
 
@@ -156,41 +158,90 @@ async function proposalExists(id: string, spaceId: string): Promise<boolean> {
   return ((await r.json()) as unknown[]).length > 0;
 }
 
-/// Vérifie que `parentId` est une page du space OU une proposition déjà déposée.
-async function assertParent(spaceId: string, parentId: string): Promise<void> {
-  const payload = await loadSpace(spaceId); // vérifie aussi que le space est public
-  if (!payload.nodes.some((n) => n.id === parentId) && !(await proposalExists(parentId, spaceId))) {
-    throw new Error(`parent \`${parentId}\` introuvable — utilise brain_overview/brain_search pour l'id d'une page existante, ou l'id renvoyé par un dépôt précédent pour créer une sous-page`);
+/// Vérifie que `id` est une page du space OU une proposition déjà déposée —
+/// réutilisée pour valider n'importe quelle référence à un nœud existant
+/// (parent d'une création, ou cible d'une modification/déplacement/fusion/lien).
+async function assertParent(spaceId: string, id: string): Promise<void> {
+  const payload = await loadSpace(spaceId);
+  if (!payload.nodes.some((n) => n.id === id) && !(await proposalExists(id, spaceId))) {
+    throw new Error(`\`${id}\` introuvable — utilise brain_overview/brain_search pour l'id d'une page existante, ou l'id renvoyé par un dépôt précédent`);
   }
 }
 
 async function insertProposals(rows: ProposalRow[]): Promise<void> {
-  // Uuids générés côté function : pas de RETURNING (la RLS interdit — à raison —
-  // la relecture des propositions à l'anon, et PostgREST exige un droit select
-  // pour representation).
+  // Clé service : l'accès est déjà tranché par le token MCP (spaceIdFromToken)
+  // et par assertParent — pas besoin de la RLS anon pour ce POST.
+  const key = env("SUPABASE_SERVICE_ROLE_KEY")!;
   const r = await fetch(`${env("SUPABASE_URL")}/rest/v1/mcp_proposals`, {
     method: "POST",
-    headers: { ...anonHeaders(), "content-type": "application/json", Prefer: "return=minimal" },
+    headers: { apikey: key, Authorization: `Bearer ${key}`, "content-type": "application/json", Prefer: "return=minimal" },
     body: JSON.stringify(rows),
   });
-  if (!r.ok) throw new Error(`dépôt refusé (${r.status}) — le space est-il toujours public ?`);
+  if (!r.ok) throw new Error(`dépôt refusé (${r.status})`);
 }
+
+// Le serveur ne connaît jamais le mode local (autonome/validation manuelle) —
+// formulation neutre, valable dans les deux cas, sur tous les messages de dépôt.
+const PENDING_NOTE = "En attente de validation dans Lucid, ou appliqué tout de suite si le mode autonome est actif.";
 
 /// Dépose une PROPOSITION de note (jamais d'écriture directe) : elle transite
 /// par la table mcp_proposals, l'app du propriétaire la rapatrie dans son
-/// circuit local de validation (bulles fantômes), puis la supprime.
+/// circuit local de validation (bulles fantômes/badges), puis la supprime.
 async function addProposal(spaceId: string, parentId: string, label: string, content: string): Promise<string> {
   if (!label.trim()) throw new Error("label vide");
   await assertParent(spaceId, parentId);
   const proposalId = crypto.randomUUID();
-  await insertProposals([{ id: proposalId, space_id: spaceId, parent_id: parentId, label: label.trim(), content }]);
-  return `Proposition \`${proposalId}\` déposée. Elle apparaîtra dans l'app Lucid du propriétaire (bulle en attente) et sera visible dans le cerveau seulement s'il l'accepte. Pour proposer une sous-page de celle-ci, rappelle brain_add_note avec parent_id="${proposalId}".`;
+  await insertProposals([{ id: proposalId, space_id: spaceId, action: "create", parent_id: parentId, label: label.trim(), content }]);
+  return `Proposition \`${proposalId}\` déposée. ${PENDING_NOTE} Pour proposer une sous-page de celle-ci, rappelle brain_add_note avec parent_id="${proposalId}".`;
+}
+
+/// PROPOSE l'écrasement du contenu d'une page EXISTANTE (jamais la création).
+async function updateNode(spaceId: string, targetId: string, content: string): Promise<string> {
+  if (!targetId.trim()) throw new Error("node_id vide");
+  await assertParent(spaceId, targetId);
+  const proposalId = crypto.randomUUID();
+  await insertProposals([{ id: proposalId, space_id: spaceId, action: "update", target_id: targetId, content }]);
+  return `Proposition \`${proposalId}\` déposée : remplace le contenu de \`${targetId}\`. ${PENDING_NOTE}`;
+}
+
+/// PROPOSE de reparenter une page existante sous une autre.
+async function moveNode(spaceId: string, targetId: string, newParentId: string): Promise<string> {
+  if (!targetId.trim() || !newParentId.trim()) throw new Error("node_id et new_parent_id requis");
+  await assertParent(spaceId, targetId);
+  await assertParent(spaceId, newParentId);
+  const proposalId = crypto.randomUUID();
+  await insertProposals([{ id: proposalId, space_id: spaceId, action: "move", target_id: targetId, new_parent_id: newParentId }]);
+  return `Proposition \`${proposalId}\` déposée : déplace \`${targetId}\` sous \`${newParentId}\`. ${PENDING_NOTE}`;
+}
+
+/// PROPOSE la fusion de 2+ pages existantes (la première de `nodeIds` survit).
+async function mergeNodes(spaceId: string, nodeIds: string[], label?: string): Promise<string> {
+  if (nodeIds.length < 2) throw new Error("node_ids demande au moins 2 ids");
+  for (const nid of nodeIds) await assertParent(spaceId, nid);
+  const proposalId = crypto.randomUUID();
+  await insertProposals([{ id: proposalId, space_id: spaceId, action: "merge", merge_ids: nodeIds, label: label?.trim() ?? "" }]);
+  return `Proposition \`${proposalId}\` déposée : fusionne ${nodeIds.length} pages (\`${nodeIds[0]}\` survit, les autres seront retirées). ${PENDING_NOTE}`;
+}
+
+/// PROPOSE un pont conceptuel entre deux pages existantes.
+async function linkNodes(spaceId: string, a: string, b: string, relation?: string): Promise<string> {
+  if (!a.trim() || !b.trim()) throw new Error("node_id_a et node_id_b requis");
+  if (a === b) throw new Error("une page ne peut pas être liée à elle-même");
+  await assertParent(spaceId, a);
+  await assertParent(spaceId, b);
+  const proposalId = crypto.randomUUID();
+  await insertProposals([{ id: proposalId, space_id: spaceId, action: "link", target_id: a, link_target: b, relation: relation?.trim() ?? "" }]);
+  return `Proposition \`${proposalId}\` déposée : lie \`${a}\` et \`${b}\`. ${PENDING_NOTE}`;
 }
 
 // ── Arbre de propositions (plusieurs nœuds/sous-nœuds en UN appel) ────────────
 
 type NoteTree = { label: string; content?: string; children?: NoteTree[] };
-type ProposalRow = { id: string; space_id: string; parent_id: string; label: string; content: string };
+type ProposalRow = {
+  id: string; space_id: string; action: string;
+  parent_id?: string; label?: string; content?: string;
+  target_id?: string; new_parent_id?: string; merge_ids?: string[]; link_target?: string; relation?: string;
+};
 
 /// Aplati un arbre imbriqué en lignes mcp_proposals chaînées par parent_id.
 /// Pur (hors uuid) — exporté pour les tests. Bornes anti-abus alignées sur les
@@ -207,7 +258,7 @@ export function flattenTree(spaceId: string, rootParentId: string, nodes: NoteTr
       if (content.length > 100_000) throw new Error(`content trop long pour « ${label} » (100k max)`);
       if (rows.length >= 60) throw new Error("60 notes max par appel — découpe l'arbre en plusieurs appels");
       const id = crypto.randomUUID();
-      rows.push({ id, space_id: spaceId, parent_id: parent, label, content });
+      rows.push({ id, space_id: spaceId, action: "create", parent_id: parent, label, content });
       outline += `${"  ".repeat(depth)}- ${label} → \`${id}\`\n`;
       if (n.children?.length) walk(n.children, id, depth + 1);
     }
@@ -221,26 +272,35 @@ async function addTree(spaceId: string, parentId: string, nodes: NoteTree[]): Pr
   await assertParent(spaceId, parentId);
   const { rows, outline } = flattenTree(spaceId, parentId, nodes);
   await insertProposals(rows);
-  return `${rows.length} proposition(s) déposée(s) sous \`${parentId}\` :\n${outline}\nElles apparaîtront dans l'app Lucid du propriétaire (bulles en attente) — accepter une note accepte automatiquement ses parents. Pour prolonger une branche, rappelle brain_add_tree (ou brain_add_note) avec l'id de la note concernée.`;
+  return `${rows.length} proposition(s) déposée(s) sous \`${parentId}\` :\n${outline}\n${PENDING_NOTE} Accepter une note accepte automatiquement ses parents. Pour prolonger une branche, rappelle brain_add_tree (ou brain_add_note) avec l'id de la note concernée.`;
 }
 
 // ── Protocole MCP (JSON-RPC 2.0 sur POST, stateless) ─────────────────────────
 
+// annotations : readOnlyHint=true sur les 3 lectures → les clients MCP (Claude
+// Desktop/Code) peuvent proposer "toujours autoriser" au lieu de reconfirmer à
+// chaque appel. Les propositions restent readOnlyHint=false (elles ÉCRIVENT
+// une ligne mcp_proposals, même si brain.json n'est jamais touché directement)
+// mais destructiveHint=false (rien n'est jamais perdu tant que ce n'est pas
+// accepté). Miroir des annotations déjà en place côté MCP local historique.
 const TOOLS = [
   {
     name: "brain_overview",
-    description: "Vue d'ensemble du second cerveau partagé : sections, résumés, compteurs. Commence toujours par ça.",
+    description: "Vue d'ensemble du second cerveau de l'utilisateur : sections, résumés, compteurs. Utilise cet outil SYSTÉMATIQUEMENT avant de répondre à toute question sur son travail, ses projets ou ses notes — même si tu penses déjà savoir. Commence toujours par ça.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { title: "Vue d'ensemble", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "brain_search",
-    description: "Recherche des pages par mots-clés dans le cerveau partagé. Renvoie les 8 meilleures avec extraits.",
+    description: "Recherche des pages par mots-clés dans le cerveau de l'utilisateur. Renvoie les 8 meilleures avec extraits. Utilise-le systématiquement dès qu'une question touche un sujet précis, avant de répondre depuis ta seule mémoire.",
     inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+    annotations: { title: "Recherche", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "brain_node",
-    description: "Lit une page complète (contenu, chemin, sous-pages) à partir de son id.",
+    description: "Lit une page complète (contenu, chemin, sous-pages) à partir de son id. À appeler après brain_overview/brain_search dès qu'une page semble pertinente, pour lire son contenu réel avant de répondre.",
     inputSchema: { type: "object", properties: { node_id: { type: "string" } }, required: ["node_id"] },
+    annotations: { title: "Lire une page", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "brain_add_note",
@@ -254,6 +314,7 @@ const TOOLS = [
       },
       required: ["parent_id", "label"],
     },
+    annotations: { title: "Proposer une page", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: "brain_add_tree",
@@ -278,6 +339,60 @@ const TOOLS = [
       },
       required: ["parent_id", "nodes"],
     },
+    annotations: { title: "Proposer une arborescence", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "update_node",
+    description: "PROPOSE de remplacer le contenu d'une page EXISTANTE (obsolète, à corriger) sans changer sa place dans l'arbre. Pour créer une nouvelle page, utilise brain_add_note. N'écrit jamais directement : le propriétaire valide dans Lucid (ou c'est appliqué aussitôt s'il a activé le mode autonome).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node_id: { type: "string", description: "id de la page à modifier (via brain_search/brain_overview)" },
+        content: { type: "string", description: "nouveau contenu markdown, remplace l'ancien" },
+      },
+      required: ["node_id", "content"],
+    },
+    annotations: { title: "Proposer une modification", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "move_node",
+    description: "PROPOSE de déplacer une page existante sous un nouveau parent (reparenter dans l'arbre). N'écrit jamais directement.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node_id: { type: "string", description: "id de la page à déplacer" },
+        new_parent_id: { type: "string", description: "id du nouveau parent" },
+      },
+      required: ["node_id", "new_parent_id"],
+    },
+    annotations: { title: "Proposer un déplacement", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "merge_nodes",
+    description: "PROPOSE de fusionner 2+ pages en une seule (doublons, sujets redondants). La PREMIÈRE page de node_ids survit : elle garde les enfants et le contenu concaténé des autres, qui disparaissent. N'écrit jamais directement.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node_ids: { type: "array", items: { type: "string" }, description: "2+ ids ; le premier survit" },
+        label: { type: "string", description: "titre final du survivant (optionnel, garde son titre actuel sinon)" },
+      },
+      required: ["node_ids"],
+    },
+    annotations: { title: "Proposer une fusion", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "link_nodes",
+    description: "PROPOSE un pont conceptuel entre deux pages existantes, sans les fusionner ni changer l'arbre (deux sujets liés, par exemple). N'écrit jamais directement.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node_id_a: { type: "string" },
+        node_id_b: { type: "string" },
+        relation: { type: "string", description: "nature du lien (optionnel, ex. \"voir aussi\")" },
+      },
+      required: ["node_id_a", "node_id_b"],
+    },
+    annotations: { title: "Proposer un lien", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
 ];
 
@@ -347,6 +462,24 @@ export async function handler(req: Request): Promise<Response> {
           const nodes = typeof args.nodes === "string" ? JSON.parse(args.nodes) : args.nodes;
           if (!Array.isArray(nodes)) throw new Error("nodes doit être un tableau [{label, content?, children?}]");
           const text = await addTree(spaceId, args.parent_id ?? "", nodes as NoteTree[]);
+          return rpcResult(id, { content: [{ type: "text", text }] });
+        }
+        if (name === "update_node") {
+          const text = await updateNode(spaceId, args.node_id ?? "", args.content ?? "");
+          return rpcResult(id, { content: [{ type: "text", text }] });
+        }
+        if (name === "move_node") {
+          const text = await moveNode(spaceId, args.node_id ?? "", args.new_parent_id ?? "");
+          return rpcResult(id, { content: [{ type: "text", text }] });
+        }
+        if (name === "merge_nodes") {
+          const nodeIds = typeof args.node_ids === "string" ? JSON.parse(args.node_ids) : args.node_ids;
+          if (!Array.isArray(nodeIds)) throw new Error("node_ids doit être un tableau d'ids");
+          const text = await mergeNodes(spaceId, nodeIds as string[], args.label);
+          return rpcResult(id, { content: [{ type: "text", text }] });
+        }
+        if (name === "link_nodes") {
+          const text = await linkNodes(spaceId, args.node_id_a ?? "", args.node_id_b ?? "", args.relation);
           return rpcResult(id, { content: [{ type: "text", text }] });
         }
         const payload = await loadSpace(spaceId);

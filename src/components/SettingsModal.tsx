@@ -18,10 +18,12 @@ import {
   Trash2,
   Plus,
   User,
+  StickyNote,
+  Copy,
+  Check,
 } from "lucide-react";
 import claudeLogo from "@/assets/claude-logo.png";
 import googleDriveLogo from "@/assets/google_drive.svg.png";
-import cursorLogo from "@/assets/cursor.svg";
 import openaiLogo from "@/assets/openai.svg";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -30,24 +32,25 @@ import {
   googleDriveSync,
   importClaudeAi,
   importChatGpt,
-  localFolderSet,
-  localFolderPath,
+  localFolderConnect,
+  localFolderList,
+  localFolderAdd,
+  localFolderRemove,
   localFolderDisconnect,
   localFolderSync,
-  notionConnect,
-  notionDisconnect,
-  notionSync,
   obsidianSetVault,
   obsidianVaultPath,
   obsidianDisconnect,
+  appleNotesConnect,
+  appleNotesSync,
+  appleNotesDisconnect,
   claudeCodeAvailable,
   claudeCodeDisconnect,
   claudeCodeReconnect,
   listModels,
   setActiveModel,
-  aiClientsStatus,
-  connectAiClient,
-  disconnectAiClient,
+  mcpManualValidationEnabled,
+  setMcpManualValidation,
   exportBackup,
   importBackup,
   resetEnvironment,
@@ -57,11 +60,11 @@ import {
   crashTest,
   type ModelInfo,
 } from "@/lib/api";
-import type { AiClientStatus } from "@/lib/types";
 import { supabase, BACKUP_BUCKET } from "@/lib/supabase";
 import type { ConnectorStatus, Space } from "@/lib/types";
-import { cn, relativeDate } from "@/lib/utils";
+import { cn, relativeDate, copyText } from "@/lib/utils";
 import { McpConnectGuide } from "@/components/McpConnectGuide";
+import { ensurePersonalMcpUrl } from "@/lib/share";
 
 // ── Brand logos ───────────────────────────────────────────────────────────────
 
@@ -83,18 +86,6 @@ function LogoClaudeAi() {
 
 function LogoGoogleDrive() {
   return <LogoImg src={googleDriveLogo} alt="Google Drive" bg="bg-white" />;
-}
-
-function LogoNotion() {
-  return (
-    <div className="flex size-7 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-[var(--color-border)] bg-white">
-      <svg viewBox="0 0 24 24" className="size-5" aria-hidden fill="none">
-        <path d="M4 4.5C4 3.67 4.67 3 5.5 3H17l3 3v13.5c0 .83-.67 1.5-1.5 1.5h-13C4.67 21 4 20.33 4 19.5V4.5z" fill="#fff" stroke="#e5e5e5" strokeWidth="1"/>
-        <path d="M7 8h10M7 12h7M7 16h5" stroke="#37352f" strokeWidth="1.5" strokeLinecap="round"/>
-        <path d="M17 3v3h3" stroke="#e5e5e5" strokeWidth="1"/>
-      </svg>
-    </div>
-  );
 }
 
 function LogoObsidian() {
@@ -127,15 +118,23 @@ function LogoCowork() {
   );
 }
 
+function LogoAppleNotes() {
+  return (
+    <div className="flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--color-border)] bg-[#FFD60A]">
+      <StickyNote className="size-4 text-[#7a5c00]" />
+    </div>
+  );
+}
+
 export function ConnectorLogo({ id }: { id: string }) {
   if (id === "claude-code")  return <LogoClaudeCode />;
   if (id === "claude-ai")    return <LogoClaudeAi />;
   if (id === "chatgpt")      return <LogoChatGpt />;
   if (id === "google-drive") return <LogoGoogleDrive />;
-  if (id === "notion")       return <LogoNotion />;
   if (id === "obsidian")     return <LogoObsidian />;
   if (id === "local-folder") return <LogoLocalFolder />;
   if (id === "cowork")       return <LogoCowork />;
+  if (id === "apple-notes")  return <LogoAppleNotes />;
   return (
     <div className="flex size-7 items-center justify-center rounded-lg bg-[var(--color-surface-2)]">
       <Plug className="size-4 text-[var(--color-muted)]" />
@@ -192,10 +191,10 @@ interface ModalProps {
   c: ConnectorStatus;
   busy: boolean;
   msg: string;
-  notionToken?: string;
-  onNotionTokenChange?: (v: string) => void;
   obsidianVault?: string | null;
-  localFolder?: string | null;
+  localFolders?: string[];
+  onAddFolder?: () => void;
+  onRemoveFolder?: (path: string) => void;
   onClose: () => void;
   onConnect: () => void;
   onSync: () => void;
@@ -203,7 +202,7 @@ interface ModalProps {
   onImport: () => void;
 }
 
-function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidianVault, localFolder, onClose, onConnect, onSync, onDisconnect, onImport }: ModalProps) {
+function ConnectorModal({ c, busy, msg, obsidianVault, localFolders, onAddFolder, onRemoveFolder, onClose, onConnect, onSync, onDisconnect, onImport }: ModalProps) {
   const isSoon = c.id === "cowork";
 
   // Échap ferme cette sous-modale AVANT la modale Paramètres : écouteur en phase
@@ -304,39 +303,10 @@ function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidi
               </>
             )}
 
-            {c.id === "notion" && !c.connected && (
-              <div className="flex flex-col gap-2">
-                <input
-                  type="password"
-                  value={notionToken ?? ""}
-                  onChange={(e) => onNotionTokenChange?.(e.target.value)}
-                  placeholder="secret_xxxxxxxxxxxx"
-                  className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs outline-none placeholder:text-[var(--color-muted)] focus:border-[var(--color-accent)]"
-                />
-                <p className="text-[10px] text-[var(--color-muted)]">
-                  Crée un token sur <span className="text-[var(--color-accent)]">notion.so/my-integrations</span> puis colle-le ici.
-                </p>
-                <ActionBtn busy={busy} icon={<CheckCircle2 className="size-3.5" />} onClick={onConnect} primary>
-                  Connecter Notion
-                </ActionBtn>
-              </div>
-            )}
-
             {c.id === "google-drive" && !c.connected && (
               <ActionBtn busy={busy} icon={<CheckCircle2 className="size-3.5" />} onClick={onConnect} primary>
                 Connecter Google Drive
               </ActionBtn>
-            )}
-
-            {c.id === "notion" && c.connected && (
-              <>
-                <ActionBtn busy={busy} icon={<RefreshCw className="size-3.5" />} onClick={onSync} primary>
-                  Synchroniser les pages
-                </ActionBtn>
-                <ActionBtn busy={busy} icon={<LogOut className="size-3.5" />} onClick={onDisconnect} danger>
-                  Déconnecter
-                </ActionBtn>
-              </>
             )}
 
             {c.id === "google-drive" && c.connected && (
@@ -375,26 +345,63 @@ function ConnectorModal({ c, busy, msg, notionToken, onNotionTokenChange, obsidi
             {c.id === "local-folder" && !c.connected && (
               <>
                 <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
-                  Choisis un dossier (cours, projets…) : PDF, Word, PowerPoint, Markdown, texte et CSV seront lus, 100 % en local.
+                  Indexe automatiquement ton Bureau, tes Documents et tes Téléchargements
+                  (PDF, Word, PowerPoint, Excel, CSV — 100 % en local). Les fichiers
+                  de code/projets ne sont jamais ramassés. Tu pourras ajouter ou
+                  retirer des dossiers ensuite.
                 </p>
                 <ActionBtn busy={busy} icon={<Folder className="size-3.5" />} onClick={onConnect} primary>
-                  Choisir le dossier
+                  Connecter
                 </ActionBtn>
               </>
             )}
 
             {c.id === "local-folder" && c.connected && (
               <>
-                {localFolder && (
-                  <p className="truncate rounded-lg bg-[var(--color-surface-2)] px-2.5 py-1.5 text-[10px] text-[var(--color-muted)]" title={localFolder}>
-                    {localFolder}
-                  </p>
+                {localFolders && localFolders.length > 0 && (
+                  <ul className="flex flex-col gap-1">
+                    {localFolders.map((f) => (
+                      <li key={f} className="flex items-center gap-1.5 rounded-lg bg-[var(--color-surface-2)] px-2.5 py-1.5">
+                        <span className="min-w-0 flex-1 truncate text-[10px] text-[var(--color-muted)]" title={f}>{f}</span>
+                        <button
+                          onClick={() => onRemoveFolder?.(f)}
+                          title="Retirer ce dossier"
+                          className="shrink-0 rounded p-0.5 text-[var(--color-muted)] hover:text-[var(--color-err)] transition-colors"
+                        >
+                          <X className="size-3" />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
                 )}
+                <ActionBtn busy={busy} icon={<Folder className="size-3.5" />} onClick={() => onAddFolder?.()}>
+                  Ajouter un dossier
+                </ActionBtn>
                 <ActionBtn busy={busy} icon={<RefreshCw className="size-3.5" />} onClick={onSync} primary>
                   Synchroniser
                 </ActionBtn>
-                <ActionBtn busy={busy} icon={<Folder className="size-3.5" />} onClick={onConnect}>
-                  Changer de dossier
+                <ActionBtn busy={busy} icon={<LogOut className="size-3.5" />} onClick={onDisconnect} danger>
+                  Déconnecter
+                </ActionBtn>
+              </>
+            )}
+
+            {c.id === "apple-notes" && !c.connected && (
+              <>
+                <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
+                  Lecture seule via l'automatisation native de macOS — jamais la base
+                  interne de Notes. macOS te demandera d'autoriser Lucid à contrôler Notes.
+                </p>
+                <ActionBtn busy={busy} icon={<CheckCircle2 className="size-3.5" />} onClick={onConnect} primary>
+                  Connecter Notes Apple
+                </ActionBtn>
+              </>
+            )}
+
+            {c.id === "apple-notes" && c.connected && (
+              <>
+                <ActionBtn busy={busy} icon={<RefreshCw className="size-3.5" />} onClick={onSync} primary>
+                  Synchroniser
                 </ActionBtn>
                 <ActionBtn busy={busy} icon={<LogOut className="size-3.5" />} onClick={onDisconnect} danger>
                   Déconnecter
@@ -518,8 +525,6 @@ function ConnectorsSection({
     finally { set("google-drive", false); }
   }
 
-  const [notionToken, setNotionToken] = useState("");
-
   const [obsidianVault, setObsidianVault] = useState<string | null>(null);
   useEffect(() => { obsidianVaultPath().then(setObsidianVault); }, []);
 
@@ -547,18 +552,38 @@ function ConnectorsSection({
     finally { set("obsidian", false); }
   }
 
-  const [localFolder, setLocalFolder] = useState<string | null>(null);
-  useEffect(() => { localFolderPath().then(setLocalFolder); }, []);
+  const [localFolders, setLocalFolders] = useState<string[]>([]);
+  useEffect(() => { localFolderList().then(setLocalFolders); }, []);
 
   async function handleLocalFolderConnect() {
+    set("local-folder", true); msg("local-folder", "");
+    try {
+      const folders = await localFolderConnect();
+      setLocalFolders(folders);
+      msg("local-folder", `${folders.length} dossier${folders.length > 1 ? "s" : ""} détecté${folders.length > 1 ? "s" : ""} — lance une synchronisation.`);
+      onRefresh();
+    } catch (e) { msg("local-folder", `Erreur : ${e}`); }
+    finally { set("local-folder", false); }
+  }
+
+  async function handleLocalFolderAddFolder() {
     const selected = await open({ directory: true, multiple: false });
     if (!selected || typeof selected !== "string") return;
     set("local-folder", true); msg("local-folder", "");
     try {
-      await localFolderSet(selected);
-      setLocalFolder(selected);
-      msg("local-folder", "Dossier configuré — lance une synchronisation.");
-      onRefresh();
+      const folders = await localFolderAdd(selected);
+      setLocalFolders(folders);
+      msg("local-folder", "Dossier ajouté — lance une synchronisation.");
+    } catch (e) { msg("local-folder", `Erreur : ${e}`); }
+    finally { set("local-folder", false); }
+  }
+
+  async function handleLocalFolderRemoveFolder(path: string) {
+    set("local-folder", true);
+    try {
+      const folders = await localFolderRemove(path);
+      setLocalFolders(folders);
+      msg("local-folder", "Dossier retiré.");
     } catch (e) { msg("local-folder", `Erreur : ${e}`); }
     finally { set("local-folder", false); }
   }
@@ -569,7 +594,7 @@ function ConnectorsSection({
       const r = await localFolderSync();
       const skipped = r.skipped.length ? ` — ${r.skipped.length} illisibles` : "";
       msg("local-folder", (r.new > 0 ? `${r.new} nouveaux sur ${r.total}` : `${r.total} fichiers indexés`) + skipped);
-      if (r.skipped.length) console.warn("Dossier local — fichiers ignorés :", r.skipped);
+      if (r.skipped.length) console.warn("Dossiers locaux — fichiers ignorés :", r.skipped);
       onRefresh();
       if (r.total > 0) onSyncDone();
     } catch (e) { msg("local-folder", `Erreur : ${e}`); }
@@ -580,11 +605,42 @@ function ConnectorsSection({
     set("local-folder", true);
     try {
       await localFolderDisconnect();
-      setLocalFolder(null);
+      setLocalFolders([]);
       msg("local-folder", "Déconnecté");
       onRefresh();
     } catch (e) { msg("local-folder", `Erreur : ${e}`); }
     finally { set("local-folder", false); }
+  }
+
+  async function handleAppleNotesConnect() {
+    set("apple-notes", true); msg("apple-notes", "");
+    try {
+      const n = await appleNotesConnect();
+      msg("apple-notes", `${n} note${n > 1 ? "s" : ""} importée${n > 1 ? "s" : ""}`);
+      onRefresh();
+    } catch (e) { msg("apple-notes", `Erreur : ${e}`); }
+    finally { set("apple-notes", false); }
+  }
+
+  async function handleAppleNotesSync() {
+    set("apple-notes", true); msg("apple-notes", "Synchronisation…");
+    try {
+      const n = await appleNotesSync();
+      msg("apple-notes", `${n} note${n > 1 ? "s" : ""} synchronisée${n > 1 ? "s" : ""}`);
+      onRefresh();
+      onSyncDone();
+    } catch (e) { msg("apple-notes", `Erreur : ${e}`); }
+    finally { set("apple-notes", false); }
+  }
+
+  async function handleAppleNotesDisconnect() {
+    set("apple-notes", true);
+    try {
+      await appleNotesDisconnect();
+      msg("apple-notes", "Déconnecté");
+      onRefresh();
+    } catch (e) { msg("apple-notes", `Erreur : ${e}`); }
+    finally { set("apple-notes", false); }
   }
 
   async function handleClaudeCodeDisconnect() {
@@ -606,38 +662,6 @@ function ConnectorsSection({
       onRefresh();
     } catch (e) { msg("claude-code", `Erreur : ${e}`); }
     finally { set("claude-code", false); }
-  }
-
-  async function handleNotionConnect() {
-    set("notion", true); msg("notion", "");
-    try {
-      await notionConnect(notionToken.trim());
-      msg("notion", "Connecté !");
-      setNotionToken("");
-      onRefresh();
-    } catch (e) { msg("notion", `Erreur : ${e}`); }
-    finally { set("notion", false); }
-  }
-
-  async function handleNotionSync() {
-    set("notion", true); msg("notion", "Synchronisation…");
-    try {
-      const [newPages, total] = await notionSync();
-      msg("notion", newPages > 0 ? `${newPages} nouvelles pages sur ${total}` : `${total} pages synchronisées`);
-      onRefresh();
-      onSyncDone(); // toujours régénérer si sync réussie
-    } catch (e) { msg("notion", `${e}`); }
-    finally { set("notion", false); }
-  }
-
-  async function handleNotionDisconnect() {
-    set("notion", true);
-    try {
-      await notionDisconnect();
-      msg("notion", "Déconnecté");
-      onRefresh();
-    } catch (e) { msg("notion", `Erreur : ${e}`); }
-    finally { set("notion", false); }
   }
 
   const openModal = modalId ? connectors.find((c) => c.id === modalId) : null;
@@ -678,28 +702,28 @@ function ConnectorsSection({
           c={openModal}
           busy={busy[openModal.id] ?? false}
           msg={msgs[openModal.id] ?? ""}
-          notionToken={notionToken}
-          onNotionTokenChange={setNotionToken}
           obsidianVault={obsidianVault}
-          localFolder={localFolder}
+          localFolders={localFolders}
+          onAddFolder={handleLocalFolderAddFolder}
+          onRemoveFolder={handleLocalFolderRemoveFolder}
           onClose={() => setModalId(null)}
           onConnect={
             openModal.id === "claude-code" ? handleClaudeCodeConnect :
-            openModal.id === "notion" ? handleNotionConnect :
             openModal.id === "obsidian" ? handleObsidianConnect :
             openModal.id === "local-folder" ? handleLocalFolderConnect :
+            openModal.id === "apple-notes" ? handleAppleNotesConnect :
             handleGoogleConnect
           }
           onSync={
-            openModal.id === "notion" ? handleNotionSync :
             openModal.id === "local-folder" ? handleLocalFolderSync :
+            openModal.id === "apple-notes" ? handleAppleNotesSync :
             handleGoogleSync
           }
           onDisconnect={
             openModal.id === "claude-code" ? handleClaudeCodeDisconnect :
-            openModal.id === "notion" ? handleNotionDisconnect :
             openModal.id === "obsidian" ? handleObsidianDisconnect :
             openModal.id === "local-folder" ? handleLocalFolderDisconnect :
+            openModal.id === "apple-notes" ? handleAppleNotesDisconnect :
             handleGoogleDisconnect
           }
           onImport={openModal.id === "chatgpt" ? handleImportChatGpt : handleImportClaudeAi}
@@ -1243,116 +1267,116 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
   );
 }
 
-// ── Section « Mes IA » : connexion one-click du serveur MCP Lucid ────────────
-
-function AiClientLogo({ id }: { id: string }) {
-  switch (id) {
-    case "claude-desktop": return <LogoImg src={claudeLogo} alt="Claude Desktop" bg="bg-[#1a1a1a]" />;
-    case "claude-code":    return <LogoClaudeCode />;
-    case "chatgpt":        return <LogoImg src={openaiLogo} alt="ChatGPT" />;
-    case "cursor":         return <LogoImg src={cursorLogo} alt="Cursor" />;
-    case "codex":          return <LogoImg src={openaiLogo} alt="Codex (OpenAI)" />;
-    default:               return <LogoImg src={claudeLogo} alt={id} />;
-  }
-}
+// ── Section « Mes IA » : une URL MCP unique, pour n'importe quelle IA ────────
+// Locale (Claude Desktop/Code sur cette machine) ou distante (claude.ai…) :
+// même serveur, même URL, mêmes fonctionnalités (décision 2026-07-21) — plus
+// de connexion par client, une seule chose à copier-coller.
 
 export function AiClientsSection() {
-  const [clients, setClients] = useState<AiClientStatus[]>([]);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [msgs, setMsgs] = useState<Record<string, string>>({});
+  const [manualValidation, setManualValidationState] = useState(false);
+  const [mcpUrl, setMcpUrl] = useState<string | null>(null);
+  const [loadingUrl, setLoadingUrl] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const refresh = () => aiClientsStatus().then(setClients).catch(console.error);
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    mcpManualValidationEnabled().then(setManualValidationState).catch(() => {});
+  }, []);
 
-  async function handle(id: string, connect: boolean) {
-    setBusy(id);
+  async function copyUrl(u: string) {
+    if (await copyText(u)) { setCopied(true); setTimeout(() => setCopied(false), 2000); }
+  }
+
+  async function handleGetUrl() {
+    setLoadingUrl(true);
+    setError(null);
     try {
-      if (connect) {
-        const m = await connectAiClient(id);
-        setMsgs((s) => ({ ...s, [id]: m }));
-      } else {
-        await disconnectAiClient(id);
-        setMsgs((s) => ({ ...s, [id]: "Déconnecté." }));
+      const url = await ensurePersonalMcpUrl();
+      if (!url) {
+        setError("Indisponible — connecte-toi à ton compte Lucid, ou applique les migrations docs/supabase-mcp-personal.sql et docs/supabase-mcp-proposals-v2.sql dans Supabase.");
+        return;
       }
-      await refresh();
+      setMcpUrl(url);
+      localStorage.setItem("lucid.mcp.connected", "1"); // checklist onboarding (App.tsx)
+      await copyUrl(url);
     } catch (e) {
-      setMsgs((s) => ({ ...s, [id]: String(e) }));
+      setError(String(e instanceof Error ? e.message : e));
     } finally {
-      setBusy(null);
+      setLoadingUrl(false);
     }
   }
 
   return (
     <div className="h-full overflow-y-auto p-5">
       <p className="mb-4 text-xs leading-relaxed text-[var(--color-muted)]">
-        Branche tes IA en un clic : elles pourront consulter ton cerveau
-        (recherche, lecture) et proposer des pages — que tu valides dans Lucid.
-        Tout passe en local, rien n'est envoyé en ligne.
+        Une seule URL branche n'importe quelle IA à ton cerveau — Claude Desktop,
+        Claude Code, claude.ai en ligne… Elles peuvent le consulter et proposer des
+        changements, que tu valides dans Lucid (ou qui s'appliquent aussitôt en
+        mode autonome, réglable ci-dessous).
       </p>
-      <div className="space-y-2">
-        {clients.map((c) => (
-          <div key={c.id} className={cn(
-            "rounded-xl border border-[var(--color-border)] px-4 py-3 transition-opacity",
-            !c.installed && "opacity-50",
-          )}>
-            <div className="flex items-center gap-3">
-              <AiClientLogo id={c.id} />
-              <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-[var(--color-text)]">{c.name}</p>
-                <p className="flex items-center gap-1.5 text-[11px] text-[var(--color-muted)]">
-                  <span className={
-                    "size-1.5 shrink-0 rounded-full " +
-                    (c.connected ? "bg-[var(--color-ok)]" : c.installed ? "bg-[#e0a33c]" : "bg-[var(--color-border)]")
-                  } />
-                  {!c.supported
-                    ? "Connexion locale impossible — ChatGPT n'accepte que des serveurs distants (HTTPS)"
-                    : c.connected ? "Connecté au cerveau Lucid" : c.installed ? "Détecté — pas encore connecté" : "Non détecté sur cette machine"}
-                </p>
-              </div>
-              {!c.supported ? (
-                <span className="shrink-0 rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-xs text-[var(--color-muted)]">
-                  Non disponible
-                </span>
-              ) : c.connected ? (
-                <button
-                  onClick={() => handle(c.id, false)}
-                  disabled={busy === c.id}
-                  className="rounded-lg px-3 py-1.5 text-xs text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] disabled:opacity-40"
-                >
-                  {busy === c.id ? <Loader2 className="size-3.5 animate-spin" /> : "Déconnecter"}
-                </button>
-              ) : (
-                <button
-                  onClick={() => handle(c.id, true)}
-                  disabled={busy === c.id || !c.installed}
-                  className="rounded-lg bg-[var(--color-accent)] px-3 py-1.5 text-xs text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-40"
-                >
-                  {busy === c.id ? <Loader2 className="size-3.5 animate-spin" /> : "Connecter"}
-                </button>
-              )}
+
+      <div className="rounded-xl border border-[var(--color-border)] px-4 py-3">
+        {mcpUrl ? (
+          <div className="flex items-center gap-2.5">
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium text-[var(--color-text)]">URL MCP personnelle</p>
+              <p className="truncate font-mono text-[10.5px] text-[var(--color-muted)]">{mcpUrl}</p>
             </div>
-            {msgs[c.id] && (
-              <p className="mt-2 text-[11px] text-[var(--color-muted)]">{msgs[c.id]}</p>
-            )}
+            <button
+              onClick={() => copyUrl(mcpUrl)}
+              title="Copier"
+              className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
+            >
+              {copied ? <Check className="size-3.5 text-[var(--color-ok)]" /> : <Copy className="size-3.5" />}
+            </button>
           </div>
-        ))}
+        ) : (
+          <button
+            onClick={handleGetUrl}
+            disabled={loadingUrl}
+            className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--color-accent)] px-3 py-2 text-sm text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-40"
+          >
+            {loadingUrl ? <Loader2 className="size-4 animate-spin" /> : <Copy className="size-4" />}
+            Copier l'URL MCP personnelle
+          </button>
+        )}
+        {error && <p className="mt-2 text-[11px] text-[var(--color-err)]">{error}</p>}
+        <McpConnectGuide url={mcpUrl} />
       </div>
+
       <p className="mt-4 text-[11px] leading-relaxed text-[var(--color-muted)]">
         Après connexion, demande par exemple : « Qu'est-ce qu'il y a dans mon second
         cerveau sur … ? » ou « Crée-moi une structure de révision dans Lucid ».
       </p>
 
-      {/* IA distantes : claude.ai / ChatGPT / agents — via un space publié */}
+      {/* Archiviste : autonomie par défaut, filet de sécurité toujours actif
+          (snapshot avant chaque action, annulable depuis l'Historique). */}
       <div className="mt-5 border-t border-[var(--color-border)] pt-4">
-        <p className="mb-1 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
-          IA distantes · claude.ai, ChatGPT…
+        <p className="mb-1.5 font-mono text-[10px] uppercase tracking-widest text-[var(--color-muted)]">
+          Archiviste
         </p>
-        <p className="text-[11px] leading-relaxed text-[var(--color-muted)]">
-          Les IA hors de cette machine (claude.ai web/mobile, ChatGPT…) accèdent à ton
-          cerveau via un <strong>space publié</strong> : ouvre un space → Partager →
-          Public → copie l'<strong>URL du connecteur IA</strong>, puis suis le guide.
-        </p>
-        <McpConnectGuide />
+        <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--color-border)] px-3.5 py-2.5">
+          <input
+            type="checkbox"
+            checked={manualValidation}
+            onChange={async (e) => {
+              const on = e.target.checked;
+              setManualValidationState(on);
+              try { await setMcpManualValidation(on); } catch { setManualValidationState(!on); }
+            }}
+            className="mt-0.5 accent-[var(--color-accent)]"
+          />
+          <span className="min-w-0">
+            <span className="block text-sm text-[var(--color-text)]">Valider manuellement les actions de l'Archiviste</span>
+            <span className="block text-xs leading-relaxed text-[var(--color-muted)]">
+              Décoché (défaut) : l'Archiviste écrit directement dans ton cerveau. Coché :
+              chaque action attend ta validation (bulle ou badge à accepter/refuser). Dans
+              les deux cas, un snapshot est pris avant chaque action et reste annulable
+              depuis l'icône Historique en haut de l'écran. S'applique pareil, que l'IA
+              soit locale ou distante — même mécanisme, un seul réglage.
+            </span>
+          </span>
+        </label>
       </div>
     </div>
   );

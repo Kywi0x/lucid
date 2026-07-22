@@ -54,6 +54,13 @@ export interface BrainProgress {
   label: string;
 }
 
+/** Payload de l'event `local-folder-progress`, émis fichier par fichier pendant le scan. */
+export interface LocalFolderProgress {
+  current: number;
+  total: number;
+  label: string;
+}
+
 /** Statut des connecteurs (actifs + dernière synchro). */
 export function connectorsStatus(): Promise<ConnectorStatus[]> {
   return invoke("connectors_status");
@@ -79,22 +86,33 @@ export function importChatGpt(path: string): Promise<number> {
   return invoke("import_chatgpt", { path });
 }
 
-/** Configure le dossier local à indexer. */
-export function localFolderSet(path: string): Promise<void> {
-  return invoke("local_folder_set", { path });
+/** Première connexion : ajoute Bureau/Documents/Téléchargements (ceux qui existent).
+ *  Idempotent si déjà connecté. Renvoie la liste des dossiers configurés. */
+export function localFolderConnect(): Promise<string[]> {
+  return invoke("local_folder_connect");
 }
 
-/** Renvoie le chemin du dossier local configuré (null si pas encore configuré). */
-export function localFolderPath(): Promise<string | null> {
-  return invoke("local_folder_path");
+/** Renvoie les dossiers actuellement configurés (vide si pas encore connecté). */
+export function localFolderList(): Promise<string[]> {
+  return invoke("local_folder_list");
 }
 
-/** Déconnecte le dossier local (supprime config + cache). */
+/** Ajoute un dossier supplémentaire à indexer. Renvoie la liste à jour. */
+export function localFolderAdd(path: string): Promise<string[]> {
+  return invoke("local_folder_add", { path });
+}
+
+/** Retire un dossier de la liste (le disque n'est pas touché). Renvoie la liste à jour. */
+export function localFolderRemove(path: string): Promise<string[]> {
+  return invoke("local_folder_remove", { path });
+}
+
+/** Déconnecte tous les dossiers locaux (supprime config + cache). */
 export function localFolderDisconnect(): Promise<void> {
   return invoke("local_folder_disconnect");
 }
 
-/** Synchronise le dossier local (extraction incrémentale des fichiers). */
+/** Synchronise tous les dossiers locaux configurés (extraction incrémentale). */
 export function localFolderSync(): Promise<import("./types").LocalFolderSyncReport> {
   return invoke("local_folder_sync");
 }
@@ -122,26 +140,6 @@ export function googleDriveDisconnect(): Promise<void> {
 /** Synchronise les fichiers Drive. Renvoie [ingérés, total]. */
 export function googleDriveSync(): Promise<[number, number]> {
   return invoke("google_drive_sync");
-}
-
-/** Enregistre le token Notion (secret_xxx). */
-export function notionConnect(token: string): Promise<void> {
-  return invoke("notion_connect", { token });
-}
-
-/** Synchronise les pages Notion. Renvoie [nouvelles, total]. */
-export function notionSync(): Promise<[number, number]> {
-  return invoke("notion_sync");
-}
-
-/** Déconnecte Notion (supprime token + cache). */
-export function notionDisconnect(): Promise<void> {
-  return invoke("notion_disconnect");
-}
-
-/** Fetch le contenu markdown d'une page Notion par ID (liens notion:ID). */
-export function notionLoadPage(id: string): Promise<string> {
-  return invoke("notion_load_page", { id });
 }
 
 /** Chat local sur le brain.md (réponse générée par Gemma). */
@@ -269,6 +267,15 @@ export function resetEnvironment(): Promise<void> {
   return invoke("reset_environment");
 }
 
+/** Mode de l'Archiviste : false (défaut) = écrit directement, true = chaque
+ *  action passe par les bulles fantômes (validation manuelle). */
+export function mcpManualValidationEnabled(): Promise<boolean> {
+  return invoke("mcp_manual_validation_enabled");
+}
+export function setMcpManualValidation(enabled: boolean): Promise<void> {
+  return invoke("set_mcp_manual_validation", { enabled });
+}
+
 /** Rapports de crash (Sentry) — opt-in, effet au redémarrage de l'app. */
 export function telemetryEnabled(): Promise<boolean> {
   return invoke("telemetry_enabled");
@@ -283,22 +290,6 @@ export function sentryActive(): Promise<boolean> {
 /** Panic Rust volontaire (dev) pour tester la chaîne Sentry. */
 export function crashTest(): Promise<void> {
   return invoke("crash_test");
-}
-
-/** Statut des clients IA installés (Claude Desktop/Code, Cursor) vis-à-vis du MCP Lucid. */
-export function aiClientsStatus(): Promise<import("./types").AiClientStatus[]> {
-  return invoke("ai_clients_status");
-}
-
-/** Connecte le serveur MCP Lucid au client (écrit sa config, backup préalable).
- *  Renvoie un message d'instruction (ex. « redémarre Claude Desktop »). */
-export function connectAiClient(id: string): Promise<string> {
-  return invoke("connect_ai_client", { id });
-}
-
-/** Retire le MCP Lucid de la config du client. */
-export function disconnectAiClient(id: string): Promise<void> {
-  return invoke("disconnect_ai_client", { id });
 }
 
 /** Sauvegarde une image collée (éditeur) dans le dossier de données ; renvoie
@@ -318,9 +309,22 @@ export function resolveMcpProposal(id: string, accept: boolean): Promise<string[
   return invoke("resolve_mcp_proposal", { id, accept });
 }
 
-/** Rapatrie une proposition MCP distante dans le circuit local de validation. */
-export function importMcpProposal(id: string, parentId: string, label: string, content: string): Promise<void> {
-  return invoke("import_mcp_proposal", { id, parentId, label, content });
+/** Accepte TOUTES les propositions en attente en un seul cycle lecture/écriture
+ *  de brain.json — à préférer à `resolveMcpProposal` en boucle sur un gros lot
+ *  (ex. une arborescence de 17 pages), qui ferait un aller-retour disque complet
+ *  par proposition et rendait l'app très lente/saccadée. */
+export function resolveAllMcpProposals(): Promise<string[]> {
+  return invoke("resolve_all_mcp_proposals");
+}
+
+/** Rapatrie une proposition MCP distante dans le circuit local de validation
+ *  (bulles fantômes/badges) — 5 formes possibles (`action`), cf. `McpProposal`. */
+export function importMcpProposal(p: import("./types").McpProposal): Promise<void> {
+  return invoke("import_mcp_proposal", {
+    id: p.id, action: p.action, parentId: p.parent_id, label: p.label, content: p.content,
+    targetId: p.target_id, newParentId: p.new_parent_id, mergeIds: p.merge_ids,
+    linkTarget: p.link_target, relation: p.relation,
+  });
 }
 
 /** Fork V1 : copie un space partagé (payload publié) comme nouveau projet dans
@@ -352,6 +356,28 @@ export function obsidianVaultPath(): Promise<string | null> {
 /** Déconnecte Obsidian (supprime la config locale). */
 export function obsidianDisconnect(): Promise<void> {
   return invoke("obsidian_disconnect");
+}
+
+/** Détecte le vault Obsidian le plus récent et le connecte automatiquement.
+ *  Renvoie son chemin, ou null si Obsidian n'a jamais tourné sur cette machine. */
+export function obsidianAutoConnect(): Promise<string | null> {
+  return invoke("obsidian_auto_connect");
+}
+
+/** Première connexion : synchronise les notes Apple (déclenche le prompt
+ *  d'autorisation macOS). Renvoie le nombre de notes importées. */
+export function appleNotesConnect(): Promise<number> {
+  return invoke("apple_notes_connect");
+}
+
+/** Resynchronise les notes Apple. */
+export function appleNotesSync(): Promise<number> {
+  return invoke("apple_notes_sync");
+}
+
+/** Déconnecte les notes Apple (supprime config + cache). */
+export function appleNotesDisconnect(): Promise<void> {
+  return invoke("apple_notes_disconnect");
 }
 
 /** Liste les snapshots disponibles (triés du plus récent au plus ancien). */

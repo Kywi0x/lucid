@@ -13,8 +13,6 @@ interface Props {
   selectedId: string | null;
   query: string;
   revealKey?: number;
-  streamLabels?: string[];
-  streamTotal?: number;
   spaces?: Space[];
   onAddNodeToSpace?: (nodeId: string, spaceId: string) => void;
   onMoveNode?: (nodeId: string, parentId: string) => void;
@@ -203,8 +201,26 @@ function jitter(id: string, axis: string, scale: number): number {
 
 // ─── Layout sectoriel proportionnel (réutilisé tel quel de l'ancienne version) ──
 
+/** Accroche une position fraîchement calculée à sa position précédente connue
+ *  (si on en a une) : 85 % ancienne position, 15 % nouvelle cible. Sans ça, le
+ *  layout radial (parts de tarte proportionnelles au poids des frères/sœurs)
+ *  replace TOUT le monde à chaque nouveau nœud — vu en direct pendant une
+ *  génération, ça lit comme un reshuffle permanent puis une coupure nette au
+ *  moment où le graphe final remplace le graphe provisoire. Avec l'ancrage,
+ *  une bulle déjà placée glisse doucement vers sa cible au lieu de s'y
+ *  téléporter — la structure finale se dessine progressivement, sans à-coup.
+ *  N'affecte pas un premier rendu à froid (aucune ancre connue = position brute). */
+function withAnchor(
+  id: string, x: number, y: number, anchors?: Map<string, { x: number; y: number }>,
+): { x: number; y: number } {
+  const a = anchors?.get(id);
+  if (!a) return { x, y };
+  return { x: a.x + (x - a.x) * 0.15, y: a.y + (y - a.y) * 0.15 };
+}
+
 function buildLayout(
   graph: BrainGraph,
+  anchors?: Map<string, { x: number; y: number }>,
 ): { infos: Map<string, NodeInfo>; childrenOf: Map<string, string[]> } {
   const infos = new Map<string, NodeInfo>();
 
@@ -277,12 +293,13 @@ function buildLayout(
         }
         ang += jitter(kid.id, "ang", Math.min(0.09, w * 0.18));
         const d = dist + dR + jitter(kid.id, "rad", dR * 0.3);
-        const kx = Math.cos(ang) * d, ky = Math.sin(ang) * d;
+        const raw = { x: Math.cos(ang) * d, y: Math.sin(ang) * d };
+        const { x: kx, y: ky } = withAnchor(kid.id, raw.x, raw.y, anchors);
         infos.set(kid.id, {
           id: kid.id, node: kid, r: radiusOf(kid),
           finalX: kx, finalY: ky, parentId,
         });
-        place(kid.id, cursor, cursor + w, d, depth + 1);
+        place(kid.id, cursor, cursor + w, Math.hypot(kx, ky), depth + 1);
         cursor += w;
       });
     }
@@ -303,8 +320,9 @@ function buildLayout(
         const tanX = -outY, tanY = outX;
         const along = gaussOf(kid.id, "t") * sigmaT;
         const away = baseAway + Math.abs(gaussOf(kid.id, "a")) * sigmaA;
-        const kx = px + outX * away + tanX * along + jitter(kid.id, "jx", 9);
-        const ky = py + outY * away + tanY * along + jitter(kid.id, "jy", 9);
+        const rawX = px + outX * away + tanX * along + jitter(kid.id, "jx", 9);
+        const rawY = py + outY * away + tanY * along + jitter(kid.id, "jy", 9);
+        const { x: kx, y: ky } = withAnchor(kid.id, rawX, rawY, anchors);
         infos.set(kid.id, {
           id: kid.id, node: kid, r: radiusOf(kid),
           finalX: kx, finalY: ky, parentId,
@@ -316,6 +334,13 @@ function buildLayout(
 
   place(rootId, -Math.PI / 2, Math.PI * 1.5, 0, 1);
   resolveOverlaps(infos, 60, GAP);
+
+  // Mémorise les positions définitives (post-collision) pour ancrer le prochain
+  // recalcul — voir withAnchor(). Ignoré si l'appelant ne fournit pas d'ancres
+  // (ex. rendu figé du viewer public : pas de session vivante à stabiliser).
+  if (anchors) {
+    for (const info of infos.values()) anchors.set(info.id, { x: info.finalX, y: info.finalY });
+  }
 
   const childrenOf = new Map<string, string[]>();
   for (const info of infos.values()) {
@@ -350,7 +375,7 @@ function hexA(hex: string, a: number): string {
 
 export function BrainMap({
   graph, onSelect, selectedId, query,
-  revealKey = 0, streamLabels = [], streamTotal = 0,
+  revealKey = 0,
   spaces, onAddNodeToSpace, onMoveNode, onDeleteNode, onImportFiles,
   onBackgroundClick, panelOffset = 0, focus = null,
   busy = false, busyMessage = null,
@@ -362,7 +387,6 @@ export function BrainMap({
   const [movePicker, setMovePicker] = useState<string | null>(null); // nodeId à déplacer
   const [theme, setTheme] = useState<CanvasTheme>(readTheme);
 
-  const isGenesis = streamLabels.length > 0;
   const q = query.trim().toLowerCase();
 
   const rootId = useMemo(() => graph.nodes.find((n) => n.kind === "root")?.id ?? "", [graph]);
@@ -373,7 +397,11 @@ export function BrainMap({
   // Ponts wikilinks ([[Page]] dans les contenus, calculés par App).
   const linkEdges = useMemo(() => graph.edges.filter((e) => e.kind === "link"), [graph]);
 
-  const { infos, childrenOf } = useMemo(() => buildLayout(graph), [graph]);
+  // Positions passées d'un recalcul à l'autre — voir withAnchor() dans buildLayout :
+  // stabilise le layout pendant qu'un graphe grandit en direct (scan, génération,
+  // watch auto) au lieu de tout reshuffler à chaque nouveau nœud.
+  const layoutAnchors = useRef(new Map<string, { x: number; y: number }>());
+  const { infos, childrenOf } = useMemo(() => buildLayout(graph, layoutAnchors.current), [graph]);
 
   // Couleur par nœud : racine = accent du thème, sinon couleur du cluster.
   const { colorOf, neighbors, maxR } = useMemo(() => {
@@ -444,7 +472,7 @@ export function BrainMap({
   const S = useRef<any>(null);
   S.current = {
     infos, childrenOf, colorOf, neighbors, q, selectedId, theme, linkEdges,
-    onSelect, onMoveNode, onImportFiles, onBackgroundClick, isGenesis, streamLabels, streamTotal, rootId,
+    onSelect, onMoveNode, onImportFiles, onBackgroundClick, rootId,
     busy, busyMessage, maxR, recentK,
   };
 
@@ -634,35 +662,6 @@ export function BrainMap({
       ctx.fillStyle = t.dot;
       for (let x = gox; x < W; x += gap) for (let y = goy; y < H; y += gap) { ctx.beginPath(); ctx.arc(x, y, 0.9, 0, Math.PI * 2); ctx.fill(); }
 
-      // ── Genèse (pendant la génération) ──
-      if (s.isGenesis) {
-        const lighter = t.dark ? "lighter" : "source-over";
-        ctx.globalCompositeOperation = lighter;
-        const G = Math.max(s.streamTotal, s.streamLabels.length, 1);
-        // orbe racine
-        const rr = 34 + Math.sin(time * 1.6) * 3;
-        let rg = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, rr * 3);
-        rg.addColorStop(0, t.dark ? "rgba(255,255,255,0.9)" : hexA(t.accent, 0.55));
-        rg.addColorStop(0.3, hexA(t.accent, 0.7)); rg.addColorStop(1, hexA(t.accent, 0));
-        ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(W / 2, H / 2, rr * 3, 0, Math.PI * 2); ctx.fill();
-        const R = Math.min(W, H) * 0.32;
-        s.streamLabels.forEach((label: string, i: number) => {
-          const a = (i / G) * Math.PI * 2 - Math.PI / 2;
-          const nx = W / 2 + Math.cos(a) * R, ny = H / 2 + Math.sin(a) * R;
-          const col = t.palette[i % t.palette.length];
-          let ng = ctx.createRadialGradient(nx, ny, 0, nx, ny, 40);
-          ng.addColorStop(0, t.dark ? hexA("#ffffff", 0.7) : hexA(col, 0.55));
-          ng.addColorStop(0.4, hexA(col, 0.5)); ng.addColorStop(1, hexA(col, 0));
-          ctx.fillStyle = ng; ctx.beginPath(); ctx.arc(nx, ny, 40, 0, Math.PI * 2); ctx.fill();
-          ctx.globalCompositeOperation = "source-over";
-          ctx.font = "500 11px ui-monospace, SFMono-Regular, Menlo, monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-          ctx.fillStyle = t.label; ctx.fillText(label, nx, ny + 26);
-          ctx.globalCompositeOperation = lighter;
-        });
-        raf = requestAnimationFrame(draw);
-        return;
-      }
-
       const hv = hovered.current;
       const near = hv ? (id: string) => id === hv || (s.neighbors.get(hv)?.has(id) ?? false) : null;
       const visible = (info: NodeInfo) => (isLeafKind(info.node.kind) ? leafA > 0.02 : true);
@@ -767,6 +766,19 @@ export function BrainMap({
         ctx.strokeStyle = hexA(color, 0.35 + boost * 0.4 + (isRoot ? 0.1 + 0.06 * pulse : 0));
         ctx.lineWidth = 1 / c.zoom;
         ctx.stroke();
+
+        // Modification MCP en attente (update/move/merge/link) : anneau orange
+        // pointillé distinct de l'ambre des créations — le nœud existe déjà,
+        // seul son état va changer si la proposition est acceptée.
+        if (info.node.pendingAction) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, r + 3 / c.zoom, 0, Math.PI * 2);
+          ctx.setLineDash([3 / c.zoom, 3 / c.zoom]);
+          ctx.strokeStyle = hexA("#f97316", 0.85);
+          ctx.lineWidth = 1.6 / c.zoom;
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
         if (isRoot) {
           ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.5, 0, Math.PI * 2);
           ctx.strokeStyle = hexA(color, 0.12 + 0.05 * pulse);

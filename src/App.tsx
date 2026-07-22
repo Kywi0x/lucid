@@ -13,6 +13,7 @@ import {
   Plus,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { BrainMap, isLeafKind } from "@/components/BrainMap";
 import { CommandPalette } from "@/components/CommandPalette";
 import { FolderView } from "@/components/FolderView";
@@ -24,18 +25,17 @@ import { BetaBadge } from "@/components/BetaBadge";
 import {
   GenerateEmpty,
   GenerateProgress,
+  ScanSteps,
   MarkdownView,
 } from "@/components/BrainView";
 import { NodeDetail } from "@/components/NodeDetail";
 import { NodePicker } from "@/components/NodePicker";
 import { StarterChecklist, type ChecklistItem } from "@/components/StarterChecklist";
 import { TimelineBar } from "@/components/TimelineBar";
-import { Onboarding } from "@/components/Onboarding";
 import {
   generateBrain,
   readBrainGraph,
   connectorsStatus,
-  notionSync,
   googleDriveSync,
   aiSetupNeeded,
   listSnapshots,
@@ -45,22 +45,30 @@ import {
   addNodeToSpace,
   deleteSpace,
   renameSpace,
-  aiClientsStatus,
   createNoteNode,
   deleteNode,
   importFile,
   listMcpProposals,
   resolveMcpProposal,
+  resolveAllMcpProposals,
+  mcpManualValidationEnabled,
   importMcpProposal,
   setNodeParent,
   seedDemo,
+  localFolderConnect,
+  localFolderSync,
+  obsidianAutoConnect,
+  appleNotesConnect,
+  claudeCodeAvailable,
+  claudeCodeReconnect,
   type BrainProgress,
+  type LocalFolderProgress,
 } from "@/lib/api";
-import { syncNow, startAutoSync } from "@/lib/sync";
+import { syncNow } from "@/lib/sync"; // startAutoSync désactivé temporairement, cf. plus bas
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { ShareModal } from "@/components/ShareModal";
 import { RemoteSpaceView } from "@/components/RemoteSpaceView";
-import { fetchSharedWithMe, type SharedWithMe } from "@/lib/share";
+import { fetchSharedWithMe, ensurePersonalMcpSpace, type SharedWithMe } from "@/lib/share";
 import { supabase } from "@/lib/supabase";
 import type { McpProposal, SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
@@ -90,6 +98,53 @@ function filterGraphBySpace(graph: BrainGraph, nodeIds: string[]): BrainGraph {
   return { ...graph, nodes, edges };
 }
 
+/** Notification macOS/Windows native — l'Archiviste en mode autonome n'affiche
+ *  rien à l'écran (ni bulle ni panneau), donc sans ça l'utilisateur n'a aucun
+ *  moyen de savoir qu'une action a eu lieu, ou qu'une proposition reste bloquée
+ *  (demandé par Liam le 2026-07-21). Best-effort : jamais bloquant si refusée. */
+async function notify(title: string, body: string) {
+  try {
+    let granted = await isPermissionGranted();
+    if (!granted) granted = (await requestPermission()) === "granted";
+    if (granted) sendNotification({ title, body });
+  } catch { /* pas grave, juste pas de notification cette fois */ }
+}
+
+/** Libellés FR du panneau Historique — le plus récent tagué "mcp_accept" est
+ *  de facto « annuler la dernière action de l'Archiviste » (bouton Restaurer). */
+const SNAPSHOT_REASON_LABELS: Record<string, string> = {
+  mcp_accept: "Archiviste (MCP)",
+  delete_node: "Suppression",
+  pre_restore: "Avant restauration",
+  regenerate: "Régénération",
+  manual: "Manuel",
+};
+
+/** Libellé + détail d'une proposition MCP dans le panneau, selon son `action`
+ *  (create garde le comportement historique : titre = label, détail = parent). */
+function describeProposal(
+  p: import("@/lib/types").McpProposal,
+  labelOf: (id: string) => string,
+): { title: string; detail: string } {
+  switch (p.action) {
+    case "update":
+      return { title: `Modifier « ${labelOf(p.target_id)} »`, detail: "" };
+    case "move":
+      return { title: `Déplacer « ${labelOf(p.target_id)} »`, detail: `→ ${labelOf(p.new_parent_id)}` };
+    case "merge": {
+      const [survivor, ...rest] = p.merge_ids;
+      return {
+        title: `Fusionner ${p.merge_ids.length} pages`,
+        detail: `${rest.map(labelOf).join(", ")} → ${labelOf(survivor)}`,
+      };
+    }
+    case "link":
+      return { title: `Lier « ${labelOf(p.target_id)} » ↔ « ${labelOf(p.link_target)} »`, detail: p.relation || "" };
+    default:
+      return { title: p.label, detail: `→ ${labelOf(p.parent_id)}` };
+  }
+}
+
 function App() {
   const [view, setView]       = useState<View>("map");
   const [query, setQuery]     = useState("");
@@ -101,10 +156,18 @@ function App() {
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
   const [graph, setGraph]           = useState<BrainGraph | null>(null);
   const [revealKey, setRevealKey]   = useState(0);
-  const [streamLabels, setStreamLabels] = useState<string[]>([]);
-  const [streamTotal, setStreamTotal]   = useState(0);
   const [connectors, setConnectors] = useState<ConnectorStatus[]>([]);
   const [generating, setGenerating] = useState(false);
+  // Scan initial (bouton "Commencer à créer mon cerveau") : connecte + synchronise
+  // les dossiers locaux avec un retour en direct, avant d'enchaîner sur la génération.
+  const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<LocalFolderProgress | null>(null);
+  // Fichiers vus pendant le scan → bulles-feuilles synthétiques sous un root
+  // "Lucid" (mêmes composants/animation de pop que le vrai graphe — pas un
+  // effet séparé) : voir `scanGraph` plus bas.
+  const [scanFiles, setScanFiles] = useState<string[]>([]);
+  // Auto-détections annexes affichées en direct (Obsidian, Notes Apple, Claude Desktop).
+  const [scanSteps, setScanSteps] = useState<string[]>([]);
   // Genesis = la carte se construit à l'écran (1er cerveau). En régénération
   // (re-sync), on garde la carte affichée et on ajoute les nouveaux nœuds.
   const [genesisRun, setGenesisRun] = useState(false);
@@ -132,6 +195,9 @@ function App() {
   const [parentPickerOpen, setParentPickerOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Mode autonome : `proposals` reste toujours vide (cf. le poll plus bas) →
+  // aucune bulle/badge/panneau ne s'affiche jamais, l'IA écrit silencieusement.
+  // Mode validation manuelle : affichage inchangé (bulle ambre, badge orange, panneau).
   const [proposals, setProposals] = useState<McpProposal[]>([]);
 
   // ── Checklist « Bien démarrer » : flags persistés + statut IA ──
@@ -147,19 +213,9 @@ function App() {
     () => localStorage.getItem("lucid.checklist.dismissed") === "1",
   );
 
-  // ── Onboarding premier lancement : auto-seed starter → (1re génération) → brancher son IA ──
-  // Plus d'écran bloquant : on atterrit sur la carte pré-remplie, la modale
-  // « brancher son IA » n'apparaît qu'après la première vraie génération.
   const [booted, setBooted] = useState(false); // évite le flash avant le chargement initial
-  const [onboarding, setOnboarding] = useState<null | "waiting" | "connect">(null);
   // Mode démo : carte explorable sans connecteur, données jetables (reset à la sortie).
   const [demoMode, setDemoMode] = useState(() => localStorage.getItem("lucid.demo") === "1");
-  // Pull cloud initial effectué (réussi ou non) — gate du seed démo.
-  const [syncChecked, setSyncChecked] = useState(false);
-  function finishOnboarding() {
-    localStorage.setItem("lucid.onboarded", "1");
-    setOnboarding(null);
-  }
   async function handleSeedDemo() {
     const g = await seedDemo();
     setGraph(g);
@@ -168,25 +224,77 @@ function App() {
     localStorage.setItem("lucid.demo", "1");
     setDemoMode(true);
   }
-  // Premier lancement (modèle prêt, pas de cerveau, jamais onboardé) :
-  // seed automatique du contenu starter — jamais d'écran bloquant. On attend
-  // la vérification cloud (syncChecked) : si un cerveau existe là-haut, c'est
-  // lui qui doit apparaître, pas la démo.
-  useEffect(() => {
-    if (!booted || !syncChecked || needsSetup !== false || graph || generating || demoMode) return;
-    if (localStorage.getItem("lucid.onboarded") === "1") return;
-    handleSeedDemo().catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [booted, syncChecked, needsSetup, graph]);
-  // Première vraie génération terminée → propose de brancher ses IA.
-  useEffect(() => {
-    if (graph && onboarding === "waiting") setOnboarding("connect");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graph]);
+
+  /** Bouton "Commencer à créer mon cerveau" : connecte + synchronise les dossiers
+   *  locaux (Bureau/Documents/Téléchargements) avec un retour fichier par fichier
+   *  en direct, puis enchaîne sur la génération du cerveau. Le 1er accès à ces
+   *  dossiers déclenche la demande d'autorisation native de l'OS (Mac : prompts
+   *  TCC par dossier ; Windows : accès direct, pas de prompt système). */
+  async function handleStartScan() {
+    setScanning(true);
+    setError(null);
+    setScanSteps([]);
+    setGenesisRun(!graph); // même mise en scène "genesis" que la 1ère génération, dès le scan
+    setScanFiles([]);
+    const unlisten = await listen<LocalFolderProgress>("local-folder-progress", (e) => {
+      setScanProgress(e.payload);
+      setScanFiles((prev) => [...prev, e.payload.label]);
+    });
+    let ok = true;
+    try {
+      // Claude Code : opt-in par défaut sur un compte neuf (vie privée — voir
+      // set_active_user_in côté Rust, qui pose un flag "disabled" au 1er login).
+      // Le scan machine est le geste "tout récupérer" : `reconnect` retire ce
+      // flag s'il existe (no-op sinon, sûr à appeler même si le dossier est
+      // absent) — puis on vérifie que ~/.claude/projects existe vraiment.
+      try {
+        await claudeCodeReconnect();
+        if (await claudeCodeAvailable()) {
+          setScanSteps((s) => [...s, "Claude Code connecté"]);
+        }
+      } catch { /* absent sur cette machine */ }
+
+      // Obsidian : détecte le vault le plus récent si Obsidian a déjà tourné
+      // sur cette machine (lit sa propre config, pas de dialogue à l'user).
+      try {
+        const vault = await obsidianAutoConnect();
+        if (vault) setScanSteps((s) => [...s, `Obsidian connecté (${vault.split(/[/\\]/).pop()})`]);
+      } catch { /* absent ou déjà configuré autrement : silencieux, pas une erreur */ }
+
+      await localFolderConnect();
+      await localFolderSync();
+      setScanSteps((s) => [...s, "Bureau, Documents et Téléchargements scannés"]);
+
+      // Notes Apple : Mac uniquement. Sur Windows ou si l'autorisation est
+      // refusée, l'échec est attendu — on ne bloque pas le scan pour ça
+      // (gérable ensuite depuis les Réglages, qui affiche le vrai message).
+      try {
+        const n = await appleNotesConnect();
+        setScanSteps((s) => [...s, `${n} note${n > 1 ? "s" : ""} Apple importée${n > 1 ? "s" : ""}`]);
+      } catch { /* non-Mac ou autorisation refusée */ }
+
+      connectorsStatus().then(setConnectors);
+    } catch (e) {
+      ok = false;
+      setError(String(e));
+    } finally {
+      unlisten();
+      setScanning(false);
+      setScanProgress(null);
+    }
+    if (ok) await handleGenerate();
+  }
+  // Premier lancement (modèle prêt, pas de cerveau, jamais onboardé) : plus de
+  // seed automatique (décision Liam, 2026-07-21) — l'utilisateur atterrit sur
+  // l'écran GenerateEmpty et choisit explicitement : scanner sa machine ou
+  // explorer la démo. La modale "brancher ses IA" a été retirée (2026-07-21) :
+  // un seul MCP distant maintenant (2026-07-21) — plus de connexion silencieuse
+  // par client, juste une URL à copier dans Réglages ; on retient ce cap franchi
+  // en local (pas de round-trip réseau pour une simple coche de checklist).
   const [aiConnected, setAiConnected] = useState(false);
   useEffect(() => {
     if (needsSetup) return;
-    aiClientsStatus().then((cs) => setAiConnected(cs.some((c) => c.connected))).catch(() => {});
+    setAiConnected(localStorage.getItem("lucid.mcp.connected") === "1");
   }, [needsSetup, settingsOpen]); // re-check quand on ferme les Settings
 
   const rootId = useMemo(() => graph?.nodes.find((n) => n.kind === "root")?.id ?? "", [graph]);
@@ -199,13 +307,31 @@ function App() {
     return syncs.length ? syncs[syncs.length - 1] : null;
   }, [connectors]);
 
-  // Petite phrase « Lucid » affichée sous le root pendant une régénération.
+  // Graphe synthétique du scan : un root "Lucid" + une bulle-feuille par fichier
+  // déjà vu. Mêmes composants/animations que le vrai graphe (BrainMap ne fait
+  // aucune différence) — donc "petit à petit, comme le canvas fini", pas un
+  // effet séparé. Remplacé par le vrai graphe dès que la génération démarre.
+  const scanGraph: BrainGraph = useMemo(() => ({
+    nodes: [
+      { id: "scan-root", label: "Lucid", kind: "root", weight: 0, summary: "", keywords: [], decisions: [], patterns: [], community: 0, parent_id: null, synthesized_at: null, content: "" },
+      ...scanFiles.map((f, i) => ({
+        id: `scan-${i}`, label: f.split(/[/\\]/).pop() || f, kind: "leaf" as const, weight: 0,
+        summary: "", keywords: [], decisions: [], patterns: [], community: 0, parent_id: "scan-root", synthesized_at: null, content: "",
+      })),
+    ],
+    edges: [], markdown: "", report: "", generated_at: "",
+  }), [scanFiles]);
+
+  // Petite phrase « Lucid » affichée sous le root pendant le scan/une régénération.
   const busyMessage = useMemo(() => {
+    if (scanning) {
+      return scanProgress ? `Lucid scanne tes fichiers (${scanProgress.current}/${scanProgress.total})` : "Lucid se prépare";
+    }
     if (!generating) return null;
     if (!progress) return "Lucid se prépare";
     if (progress.label.startsWith("Synthèse")) return "Lucid tisse l'arborescence";
     return `Lucid analyse tes contenus (${progress.current}/${progress.total})`;
-  }, [generating, progress]);
+  }, [scanning, scanProgress, generating, progress]);
 
   useEffect(() => {
     // L'IA locale est optionnelle : si l'user a passé le setup, on n'affiche
@@ -215,7 +341,7 @@ function App() {
     );
     readBrainGraph().then((g) => {
       if (g) { setGraph(g); setRevealKey((k) => k + 1); }
-      setBooted(true); // graphe initial chargé (ou absent) → l'onboarding peut se prononcer
+      setBooted(true); // graphe initial chargé (ou absent) → évite le flash de GenerateEmpty
     });
     connectorsStatus().then(setConnectors);
     listSpaces().then(setSpaces);
@@ -225,14 +351,6 @@ function App() {
     const unlisten = listen<BrainProgress>("brain-progress", (e) =>
       setProgress(e.payload),
     );
-    return () => { unlisten.then((fn) => fn()); };
-  }, []);
-
-  useEffect(() => {
-    const unlisten = listen<{ label: string; total: number }>("brain-node", (e) => {
-      setStreamLabels((prev) => [...prev, e.payload.label]);
-      setStreamTotal(e.payload.total);
-    });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
@@ -259,7 +377,11 @@ function App() {
 
   // Sync cloud : le cerveau suit le compte entre machines (événementiel :
   // watcher local + ping Realtime, filets boot/60 s/focus/fermeture — voir lib/sync.ts).
+  // ponytail: désactivée temporairement (bug pendant la démo) — réactiver en
+  // remettant l'appel à startAutoSync ci-dessous.
   useEffect(() => {
+    return undefined;
+    /*
     return startAutoSync(() => {
       // Un pull a fusionné du contenu : c'est un vrai cerveau, plus la démo.
       setDemoMode(false);
@@ -275,20 +397,17 @@ function App() {
       });
       listSpaces().then(setSpaces);
       connectorsStatus().then(setConnectors);
-    }, () => setSyncChecked(true));
+    });
+    */
   }, []);
 
   // `skipSync` : la sync a déjà été faite par le connecteur (bouton Synchroniser)
   // → on régénère seulement, sans re-synchroniser tous les connecteurs.
   async function handleGenerate(opts?: { skipSync?: boolean }) {
     setGenesisRun(!graph); // genesis uniquement s'il n'y a pas encore de carte
-    // Première vraie génération (on quitte le contenu starter) → à la fin,
-    // proposer de brancher ses IA (phase "connect").
-    if (localStorage.getItem("lucid.onboarded") !== "1") setOnboarding("waiting");
     setGenerating(true);
     setError(null);
     setProgress(null);
-    setStreamLabels([]);
     setPartialGraph(null);
     setTimeCutoff(null);
     try {
@@ -297,14 +416,12 @@ function App() {
         const syncs: Promise<unknown>[] = [];
         for (const c of connectors) {
           if (!c.connected) continue;
-          if (c.id === "notion") syncs.push(notionSync().catch(() => {}));
           if (c.id === "google-drive") syncs.push(googleDriveSync().catch(() => {}));
         }
         if (syncs.length) await Promise.all(syncs);
       }
 
       setGraph(await generateBrain());
-      setStreamLabels([]);
       setRevealKey((k) => k + 1);
       connectorsStatus().then(setConnectors);
       // Le cerveau réel remplace le contenu starter (côté Rust, demo.flag est retiré).
@@ -419,7 +536,17 @@ function App() {
 
   async function refreshGraph() {
     const g = await readBrainGraph();
-    if (g) { setGraph(g); setRevealKey((k) => k + 1); }
+    if (!g) return;
+    setGraph((prev) => {
+      // Ne relance l'animation d'apparition (revealKey) QUE si l'ensemble des
+      // nœuds a vraiment changé — sinon un rafraîchissement (ex. après chaque
+      // lot MCP en mode autonome) faisait "sauter" tout le canvas à chaque
+      // fois, même quand rien de nouveau n'était arrivé (bug remonté par Liam
+      // le 2026-07-21 : "le canvas se remet à sa forme initiale").
+      const ids = (x: BrainGraph) => x.nodes.map((n) => n.id).sort().join("\n");
+      if (!prev || ids(prev) !== ids(g)) setRevealKey((k) => k + 1);
+      return g;
+    });
   }
 
   // Après une restauration manuelle (Réglages → Compte) : les données restaurées
@@ -455,39 +582,128 @@ function App() {
     setSelectedNode(n);
   }
 
-  // ── Propositions MCP : polling léger (2 s) + validation ──
+  // ── Propositions MCP : événementiel (watcher Rust sur mcp_pending/) + validation ──
+  // Mode autonome (défaut) : toute proposition détectée est auto-acceptée dans
+  // la foulée, locale ou distante — le toggle ne regarde jamais l'origine,
+  // juste "il y a une proposition en attente" (même tuyau pour les deux MCP).
+  // Mode validation manuelle : comportement inchangé, on attend le clic.
+  // ponytail: un poll toutes les 2s tournait en continu même sans IA active —
+  // remplacé par l'évènement "mcp-proposal-changed" (watcher `notify` côté
+  // Rust) + un filet à 30s au cas où l'évènement serait raté (bug remonté par
+  // Liam le 2026-07-21 : "les polls en continu consomment trop").
   useEffect(() => {
     if (needsSetup) return;
     let stop = false;
+    let running = false; // évite qu'un tick auto-accept en cours (brain.json volumineux
+    // → accepter peut prendre plusieurs secondes) chevauche le suivant et écrase son travail.
+    // Propositions qui restent en attente d'un tick à l'autre malgré la tentative —
+    // au-delà du seuil, un vrai problème (ex. id-parent qui n'existera jamais),
+    // pas juste "l'IA n'a pas fini" : on le signale plutôt que de laisser filer en
+    // silence (bug remonté par Liam le 2026-07-21 : "44 pages jamais reçues").
+    const stuckSince = new Map<string, number>();
+    const notifiedStuck = new Set<string>();
+    const STUCK_THRESHOLD_MS = 90_000;
     const tick = async () => {
+      if (running) return;
+      running = true;
       try {
+        const manual = await mcpManualValidationEnabled();
         const p = await listMcpProposals();
-        if (!stop) setProposals((prev) => (JSON.stringify(prev) === JSON.stringify(p) ? prev : p));
+        if (stop) return;
+        // Autonome : jamais affiché (ni bulle ni panneau), juste accepté en silence —
+        // `proposals` reste vide pour ne pas déclencher le moindre rendu de plus.
+        if (manual) {
+          setProposals((prev) => (JSON.stringify(prev) === JSON.stringify(p) ? prev : p));
+        } else if (p.length > 0) {
+          // Bascule manuel → autonome avec des bulles déjà affichées : les faire
+          // disparaître tout de suite plutôt que d'attendre la fin de la résolution.
+          setProposals((prev) => (prev.length === 0 ? prev : []));
+          // Un seul appel pour tout le lot (pas une boucle par proposition) :
+          // un gros lot (arborescence de N pages) ne doit faire qu'un cycle de
+          // lecture/écriture de brain.json, pas N (bug remonté par Liam le
+          // 2026-07-21 : 17 pages d'un coup rendaient l'app très lente/saccadée).
+          const resolvedIds = await resolveAllMcpProposals().catch(() => [] as string[]);
+          // Sans ça, l'écriture est réelle (brain.json à jour) mais invisible tant
+          // que l'utilisateur ne régénère/rouvre pas — le mode autonome doit se voir.
+          if (!stop) { await refreshGraph(); setSpaces(await listSpaces()); }
+          if (resolvedIds.length) {
+            supabase?.from("mcp_proposals").delete().in("id", resolvedIds).then(() => {}, () => {});
+            const n = resolvedIds.length;
+            void notify("Archiviste", `${n} page${n > 1 ? "s" : ""} mise${n > 1 ? "s" : ""} à jour dans ton cerveau.`);
+          }
+          // Suivi des propositions encore en attente malgré cette tentative.
+          const resolvedSet = new Set(resolvedIds);
+          const now = Date.now();
+          const stillPending = new Set(p.filter((x) => !resolvedSet.has(x.id)).map((x) => x.id));
+          for (const id of stillPending) if (!stuckSince.has(id)) stuckSince.set(id, now);
+          for (const id of [...stuckSince.keys()]) {
+            if (!stillPending.has(id)) { stuckSince.delete(id); notifiedStuck.delete(id); continue; }
+            if (now - stuckSince.get(id)! > STUCK_THRESHOLD_MS && !notifiedStuck.has(id)) {
+              notifiedStuck.add(id);
+              void notify(
+                "Archiviste — action bloquée",
+                "Une proposition de l'IA n'arrive pas à s'appliquer depuis plus d'une minute. Vérifie Lucid.",
+              );
+            }
+          }
+        } else {
+          setProposals((prev) => (prev.length === 0 ? prev : []));
+        }
       } catch { /* app pas prête : silencieux */ }
+      finally { running = false; }
+    };
+    // Débounce du DÉCLENCHEMENT (pas de tick() lui-même) : une IA qui appelle
+    // ses outils un par un (ex. réorganiser 17 pages avec 17 move_node séparés
+    // dans le temps) faisait repartir un cycle complet à chaque arrivée —
+    // regrouper celles qui se suivent de près avant de traiter le lot en un
+    // coup (bug remonté par Liam le 2026-07-21 : "réorganisé 17 nœuds, l'app
+    // plante beaucoup trop").
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+    const scheduleTick = () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(() => { debounce = null; void tick(); }, 1500);
     };
     tick();
-    const iv = setInterval(tick, 2000);
-    return () => { stop = true; clearInterval(iv); };
+    const unlisten = listen("mcp-proposal-changed", scheduleTick);
+    const iv = setInterval(tick, 30_000); // filet, pas le mécanisme principal
+    return () => {
+      stop = true;
+      clearInterval(iv);
+      if (debounce) clearTimeout(debounce);
+      unlisten.then((fn) => fn());
+    };
   }, [needsSetup]);
 
   // ── Propositions MCP distantes (IA via connecteur claude.ai/ChatGPT) :
   //    rapatriées de Supabase vers le circuit local mcp_pending/ (mêmes bulles
   //    fantômes, même validation), puis supprimées de la table. RLS : on ne
   //    voit que les propositions de SES spaces. ──
+  // ponytail: pollait la table toutes les 10s en continu, même IA à l'arrêt —
+  // remplacé par une souscription Realtime (INSERT sur mcp_proposals, déjà le
+  // même mécanisme que la sync cloud dans lib/sync.ts) + un filet à 60s au cas
+  // où le websocket serait coupé. Nécessite `docs/supabase-mcp-proposals-realtime.sql`.
   useEffect(() => {
     if (needsSetup || !supabase) return;
     let stop = false;
+    let running = false;
     const tick = async () => {
+      if (running) return;
+      running = true;
       try {
         const { data: sess } = await supabase!.auth.getSession();
         if (!sess.session || stop) return;
         const { data, error } = await supabase!
           .from("mcp_proposals")
-          .select("id,parent_id,label,content,created_at")
+          .select("id,action,parent_id,label,content,target_id,new_parent_id,merge_ids,link_target,relation,created_at")
           .limit(20);
         if (error || !data?.length || stop) return;
         for (const p of data) {
-          await importMcpProposal(p.id, p.parent_id, p.label, p.content);
+          await importMcpProposal({
+            id: p.id, action: p.action ?? "create", parent_id: p.parent_id ?? "", label: p.label ?? "",
+            content: p.content ?? "", target_id: p.target_id ?? "", new_parent_id: p.new_parent_id ?? "",
+            merge_ids: p.merge_ids ?? [], link_target: p.link_target ?? "", relation: p.relation ?? "",
+            created_at: p.created_at,
+          });
           // La ligne reste 10 min dans la table : l'IA distante peut chaîner des
           // sous-pages (l'edge function vérifie que le parent existe encore).
           // L'import est idempotent → la relire aux ticks suivants est sans effet,
@@ -498,10 +714,50 @@ function App() {
           }
         }
       } catch { /* hors-ligne ou table absente : silencieux */ }
+      finally { running = false; }
+    };
+    // Même regroupement que le poll local : une IA qui pose ses 17 outils un
+    // par un dans le temps déclenchait 17 imports (et donc 17 résolutions)
+    // séparés au lieu d'un lot groupé.
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+    const scheduleTick = () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(() => { debounce = null; void tick(); }, 1500);
     };
     tick();
-    const iv = setInterval(tick, 10_000);
-    return () => { stop = true; clearInterval(iv); };
+    const channel = supabase
+      .channel("mcp-proposals-watch")
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "mcp_proposals" }, scheduleTick)
+      .subscribe();
+    const iv = setInterval(tick, 60_000); // filet, pas le mécanisme principal
+    return () => {
+      stop = true;
+      clearInterval(iv);
+      if (debounce) clearTimeout(debounce);
+      void channel.unsubscribe();
+    };
+  }, [needsSetup]);
+
+  // ── Espace "MCP personnel" : tenu à jour indépendamment de la sync cloud
+  //    complète (désactivée actuellement, cf. plus haut) ──
+  // Sans ça, l'instantané publié pour les IA distantes peut dater de la
+  // dernière fois où `syncNow()` a tourné (rare) — une IA (ChatGPT, claude.ai)
+  // se retrouve alors à proposer des pages sous un id-parent qui a changé ou
+  // disparu depuis côté local, et ces propositions ne se résolvent JAMAIS
+  // (bug remonté par Liam le 2026-07-21 : "44 pages créées, jamais reçues").
+  useEffect(() => {
+    if (needsSetup || !supabase) return;
+    let lastRun = 0;
+    const REFRESH_THROTTLE_MS = 30_000; // pas plus d'un envoi Supabase toutes les 30s
+    const refresh = () => {
+      const now = Date.now();
+      if (now - lastRun < REFRESH_THROTTLE_MS) return;
+      lastRun = now;
+      void ensurePersonalMcpSpace().catch((e) => console.warn("mcp personnel:", e));
+    };
+    refresh();
+    const unlisten = listen("user-data-changed", refresh);
+    return () => { unlisten.then((fn) => fn()); };
   }, [needsSetup]);
 
   async function handleProposal(id: string, accept: boolean) {
@@ -519,10 +775,18 @@ function App() {
   }
 
   async function handleAllProposals(accept: boolean) {
-    const resolved: string[] = [];
-    for (const p of proposals) {
-      try { resolved.push(...await resolveMcpProposal(p.id, accept)); } catch { /* déjà traitée via une chaîne parent/enfant */ }
-    }
+    // Accepter : un seul cycle lecture/écriture pour tout le lot (pas une
+    // boucle par proposition, cf. resolveAllMcpProposals). Refuser reste une
+    // boucle : ça ne fait que retirer de petits fichiers, rien à batcher.
+    const resolved = accept
+      ? await resolveAllMcpProposals().catch(() => [] as string[])
+      : await (async () => {
+          const ids: string[] = [];
+          for (const p of proposals) {
+            try { ids.push(...await resolveMcpProposal(p.id, false)); } catch { /* déjà traitée via une chaîne parent/enfant */ }
+          }
+          return ids;
+        })();
     // Purge Supabase comme le clic unitaire : sinon le poll de rapatriement
     // ré-importe tout en bulles zombies dans les 10 s.
     if (resolved.length) supabase?.from("mcp_proposals").delete().in("id", resolved).then(() => {}, () => {});
@@ -539,9 +803,9 @@ function App() {
 
   /** Drag & drop OS sur le canvas : import séquentiel (brain.json n'aime pas les écritures parallèles). */
   async function handleImportDrop(paths: string[], parentId: string) {
-    const supported = new Set(["pdf", "doc", "docx", "pptx", "rtf", "txt", "md", "markdown", "csv"]);
+    const supported = new Set(["pdf", "doc", "docx", "pptx", "xlsx", "rtf", "txt", "md", "markdown", "csv"]);
     const ok = paths.filter((p) => supported.has(p.split(".").pop()?.toLowerCase() ?? ""));
-    if (!ok.length) { showToast("Formats supportés : PDF, Word, PowerPoint (.pptx), RTF, TXT, Markdown, CSV"); return; }
+    if (!ok.length) { showToast("Formats supportés : PDF, Word, PowerPoint (.pptx), Excel (.xlsx), RTF, TXT, Markdown, CSV"); return; }
     showToast(`Import de ${ok.length} fichier${ok.length > 1 ? "s" : ""}…`, 0);
     let last: BrainNode | null = null;
     const errs: string[] = [];
@@ -558,7 +822,7 @@ function App() {
   async function handleImportFile(parentId: string) {
     const path = await openFileDialog({
       multiple: false,
-      filters: [{ name: "Documents", extensions: ["pdf", "doc", "docx", "pptx", "rtf", "txt", "md", "csv"] }],
+      filters: [{ name: "Documents", extensions: ["pdf", "doc", "docx", "pptx", "xlsx", "rtf", "txt", "md", "csv"] }],
     });
     if (typeof path !== "string") return;
     setImporting(true);
@@ -606,7 +870,7 @@ function App() {
     },
     {
       id: "source", label: "Connecter une source", done: connectors.some((c) => c.connected),
-      hint: "Claude Code, Notion, Drive, Obsidian…", onClick: () => setSettingsOpen(true),
+      hint: "Claude Code, Google Drive, Obsidian…", onClick: () => setSettingsOpen(true),
     },
     {
       // Le graphe starter (generated_at "demo") ne compte pas comme cerveau généré.
@@ -626,26 +890,19 @@ function App() {
     ? filterGraphBySpace(graph, activeSpace.node_ids)
     : graph;
 
-  // Graphe affiché sur le canvas : graphe (filtré par space) + bulles fantômes
-  // MCP + arêtes wikilinks. Fantômes et liens ne sont jamais persistés.
-  const graphWithGhosts = useMemo(() => {
-    if (!displayGraph) return displayGraph;
-    const nodes = proposals.length === 0 ? displayGraph.nodes : [
-      ...displayGraph.nodes,
-      ...proposals.map((p): BrainNode => ({
-        id: p.id, label: p.label, kind: "pending", weight: 0,
-        summary: "Proposition de votre IA — à valider", keywords: [], decisions: [], patterns: [],
-        community: 0, parent_id: p.parent_id, synthesized_at: null, content: p.content,
-      })),
-    ];
-    const edges = [
-      ...displayGraph.edges,
-      ...proposals.map((p) => ({ source: p.parent_id, target: p.id, kind: "contains", relation: "contains" })),
-    ];
-    // Wikilinks [[Page]] dans les contenus → ponts entre bulles (kind "link").
-    const byLabel = new Map(nodes.map((n) => [n.label.toLowerCase(), n.id]));
+  // Wikilinks [[Page]] → ponts "link" entre bulles. Isolé dans SON PROPRE memo,
+  // dépendant UNIQUEMENT de displayGraph (pas de `proposals`) : c'est un scan
+  // de TOUT le texte de TOUTES les pages (regex sur potentiellement des Mo de
+  // contenu) — le recalculer à chaque poll MCP (toutes les 2s, y compris pendant
+  // une rafale d'auto-acceptations) gelait l'app sur un gros cerveau. Il ne
+  // recalcule maintenant que quand le cerveau change réellement (bug remonté
+  // par Liam le 2026-07-21).
+  const wikilinkEdges = useMemo(() => {
+    if (!displayGraph) return [];
+    const byLabel = new Map(displayGraph.nodes.map((n) => [n.label.toLowerCase(), n.id]));
     const seen = new Set<string>();
-    for (const n of nodes) {
+    const edges: { source: string; target: string; kind: string; relation: string }[] = [];
+    for (const n of displayGraph.nodes) {
       if (!n.content) continue;
       for (const m of n.content.matchAll(/\[\[([^[\]\n]+)\]\]/g)) {
         const tid = byLabel.get(m[1].trim().toLowerCase());
@@ -656,8 +913,43 @@ function App() {
         edges.push({ source: n.id, target: tid, kind: "link", relation: "wikilink" });
       }
     }
+    return edges;
+  }, [displayGraph]);
+
+  // Graphe affiché sur le canvas : graphe (filtré par space) + bulles fantômes
+  // MCP + arêtes wikilinks. Fantômes et liens ne sont jamais persistés.
+  // "create" = bulle fantôme ambre (nouveau nœud, comme avant). Les 4 autres
+  // actions (update/move/merge/link) ciblent des nœuds RÉELS déjà existants —
+  // pas de bulle en plus, juste un badge orange (`pendingAction`) sur ces nœuds.
+  // Mode autonome : `proposals` reste toujours vide (cf. le poll plus haut) —
+  // aucune bulle/badge ne s'affiche jamais, l'IA écrit sans bruit visuel.
+  const graphWithGhosts = useMemo(() => {
+    if (!displayGraph) return displayGraph;
+    if (proposals.length === 0) return { ...displayGraph, edges: [...displayGraph.edges, ...wikilinkEdges] };
+    const createProposals = proposals.filter((p) => p.action === "create");
+    const otherProposals = proposals.filter((p) => p.action !== "create");
+    const pendingByNode = new Map<string, BrainNode["pendingAction"]>();
+    for (const p of otherProposals) {
+      const targets = p.action === "merge" ? p.merge_ids : [p.target_id];
+      for (const id of targets) if (id) pendingByNode.set(id, p.action as BrainNode["pendingAction"]);
+    }
+    const baseNodes = pendingByNode.size === 0 ? displayGraph.nodes
+      : displayGraph.nodes.map((n) => pendingByNode.has(n.id) ? { ...n, pendingAction: pendingByNode.get(n.id) } : n);
+    const nodes = createProposals.length === 0 ? baseNodes : [
+      ...baseNodes,
+      ...createProposals.map((p): BrainNode => ({
+        id: p.id, label: p.label, kind: "pending", weight: 0,
+        summary: "Proposition de votre IA — à valider", keywords: [], decisions: [], patterns: [],
+        community: 0, parent_id: p.parent_id, synthesized_at: null, content: p.content,
+      })),
+    ];
+    const edges = [
+      ...displayGraph.edges,
+      ...wikilinkEdges,
+      ...createProposals.map((p) => ({ source: p.parent_id, target: p.id, kind: "contains", relation: "contains" })),
+    ];
     return { ...displayGraph, nodes, edges };
-  }, [displayGraph, proposals]);
+  }, [displayGraph, proposals, wikilinkEdges]);
 
   // ── Timeline : bornes temporelles du cerveau (nœuds datés) ──
   const timeRange = useMemo(() => {
@@ -719,26 +1011,32 @@ function App() {
   return (
     <div className="relative h-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
 
-      {!graph && !generating ? (
-        <GenerateEmpty error={error} onGenerate={handleGenerate} onOpenSettings={() => setSettingsOpen(true)} />
+      {!booted ? null : !graph && !generating && !scanning ? (
+        <GenerateEmpty
+          error={error}
+          onStartScan={handleStartScan}
+          onExploreDemo={handleSeedDemo}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
       ) : (
         <>
-          {/* ── Canvas principal ── */}
-          {view === "map" && (graph || generating) && (
+          {/* ── Canvas principal — monté dès le scan : les bulles apparaissent
+                 en direct, avec la même animation de "pop" que le vrai graphe
+                 (pas un effet séparé), canvas déjà interactif pendant que ça tourne. ── */}
+          {view === "map" && (graph || generating || scanning) && (
             <BrainMap
               graph={
+                scanning ? scanGraph :
                 (generating && partialGraph) ||
                 timelineGraph ||
                 { nodes: [], edges: [], markdown: "", report: "", generated_at: "" }
               }
-              onSelect={generating ? () => {} : selectNode}
+              onSelect={generating || scanning ? () => {} : selectNode}
               selectedId={selectedNode?.id ?? null}
               query={query}
               revealKey={revealKey}
-              streamLabels={generating && genesisRun && !partialGraph ? streamLabels : []}
-              busy={generating && !genesisRun}
+              busy={generating || scanning}
               busyMessage={busyMessage}
-              streamTotal={streamTotal}
               spaces={spaces}
               onAddNodeToSpace={handleAddNodeToSpace}
               onMoveNode={handleMoveNode}
@@ -761,12 +1059,17 @@ function App() {
             <MarkdownView markdown={graph.markdown} onRegenerate={handleGenerate} />
           )}
 
-          {/* ── Overlay progression : uniquement au 1er cerveau (genesis). En
+          {/* ── Overlay progression : scan machine puis 1er cerveau (genesis) —
+                 même carte flottante pour les deux, jamais bloquante. En
                  régénération, c'est le root « Lucid » qui pulse et parle. ── */}
-          {generating && genesisRun && (
+          {(scanning || (generating && genesisRun)) && (
             <div className="absolute inset-0 z-20 flex items-end justify-center pb-24 pointer-events-none">
               <div className="pointer-events-auto rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] px-6 py-4 shadow-[var(--shadow-float)] min-w-[320px]">
-                <GenerateProgress progress={progress} />
+                <GenerateProgress
+                  progress={scanning ? scanProgress : progress}
+                  label={scanning ? "Lucid scanne ton ordinateur…" : undefined}
+                />
+                {scanning && <ScanSteps steps={scanSteps} />}
               </div>
             </div>
           )}
@@ -858,15 +1161,23 @@ function App() {
               </div>
               <div className="max-h-72 overflow-y-auto">
                 {proposals.map((p) => {
-                  const parent = graphWithGhosts?.nodes.find((n) => n.id === p.parent_id);
+                  const labelOf = (id: string) => {
+                    if (!id) return id;
+                    const n = graphWithGhosts?.nodes.find((n) => n.id === id);
+                    return n ? (n.kind === "root" ? "Lucid (racine)" : n.label) : id;
+                  };
+                  const { title, detail } = describeProposal(p, labelOf);
                   return (
                     <div key={p.id} className="border-b border-[var(--color-border)] px-4 py-2.5 last:border-b-0">
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
-                          <p className="truncate text-sm text-[var(--color-text)]">{p.label}</p>
-                          <p className="truncate text-[11px] text-[var(--color-muted)]">
-                            → {parent ? (parent.kind === "root" ? "Lucid (racine)" : parent.label) : p.parent_id}
+                          <p className="truncate text-sm text-[var(--color-text)]">
+                            {p.action !== "create" && (
+                              <span className="mr-1 inline-block size-1.5 rounded-full bg-[#f97316]" />
+                            )}
+                            {title}
                           </p>
+                          {detail && <p className="truncate text-[11px] text-[var(--color-muted)]">{detail}</p>}
                         </div>
                         <div className="flex shrink-0 gap-1">
                           <button onClick={() => handleProposal(p.id, true)} title="Accepter"
@@ -954,7 +1265,7 @@ function App() {
                     onClick={() => handleImportFile(noteParent || rootId)}
                     disabled={importing}
                     className="rounded-lg border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] disabled:opacity-50"
-                    title="PDF, Word, PowerPoint (.pptx), RTF, TXT, Markdown ou CSV — converti en markdown"
+                    title="PDF, Word, PowerPoint (.pptx), Excel (.xlsx), RTF, TXT, Markdown ou CSV — converti en markdown"
                   >
                     {importing ? "Import…" : "Importer un fichier"}
                   </button>
@@ -1085,7 +1396,9 @@ function App() {
                               <p className="text-xs font-medium text-[var(--color-text)] truncate">
                                 {relativeTime(s.created_at)}
                               </p>
-                              <p className="text-[10px] text-[var(--color-muted)]">{s.node_count} nœuds</p>
+                              <p className="text-[10px] text-[var(--color-muted)]">
+                                {s.node_count} nœuds · {SNAPSHOT_REASON_LABELS[s.reason] ?? s.reason}
+                              </p>
                             </div>
                             <button
                               onClick={() => handleRestore(s.id)}
@@ -1178,19 +1491,8 @@ function App() {
         </>
       )}
 
-      {/* ── Onboarding : modale « brancher ses IA » après la 1re vraie génération ── */}
-      {booted && !generating && onboarding === "connect" && (
-        <Onboarding
-          phase={onboarding}
-          connectors={connectors}
-          onOpenSettings={() => setSettingsOpen(true)}
-          onGenerate={() => { setOnboarding("waiting"); handleGenerate(); }}
-          onDone={finishOnboarding}
-          onSeedDemo={handleSeedDemo}
-        />
-      )}
       {/* Bannière contenu starter : remplacé dès la première source connectée. */}
-      {demoMode && !onboarding && (
+      {demoMode && (
         <div className="absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-3 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-1.5 shadow-[var(--shadow-float)]">
           <span className="text-xs text-[var(--color-muted)]">Contenu d'exemple — connecte une source pour le remplacer par tes données</span>
           <button

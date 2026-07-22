@@ -5,7 +5,6 @@
     "macOS": { "signingIdentity": "-" },
     "externalBin": [
       "binaries/llama-completion",
-      "binaries/lucid_mcp",
       "binaries/pdftotext",
       "binaries/pdftoppm",
       "binaries/tesseract"

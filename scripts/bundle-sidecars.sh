@@ -1,8 +1,9 @@
 #!/bin/bash
 # ─── Lucid — prépare les sidecars du bundle ─────────────────────────────────
-# Collecte tous les binaires externes (llama-completion statique, lucid_mcp,
-# pdftotext, pdftoppm, tesseract) + leurs dylibs + tessdata, aux emplacements
-# attendus par tauri.conf.json (externalBin + resources).
+# Collecte tous les binaires externes (llama-completion statique, pdftotext,
+# pdftoppm, tesseract) + leurs dylibs + tessdata, aux emplacements attendus
+# par tauri.conf.json (externalBin + resources). Le MCP est désormais 100%
+# distant (supabase/functions/lucid-mcp) — plus de binaire local à bundler.
 #
 # Prérequis : brew install poppler tesseract tesseract-lang dylibbundler
 #             + llama.cpp compilé en statique (build-static) — voir journal.
@@ -20,18 +21,13 @@ rm -rf "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
 mkdir -p "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
 
 # tauri-build (build.rs) valide l'existence de TOUS les externalBin dès qu'on
-# compile le crate — y compris `cargo build --bin lucid_mcp` ci-dessous. On crée
-# des placeholders vides pour satisfaire cette vérification ; les vrais binaires
-# les écrasent aux étapes suivantes.
-for b in llama-completion lucid_mcp pdftotext pdftoppm tesseract; do
+# compile le crate. On crée des placeholders vides pour satisfaire cette
+# vérification ; les vrais binaires les écrasent aux étapes suivantes.
+for b in llama-completion pdftotext pdftoppm tesseract; do
   : > "$BIN_DIR/$b-$TRIPLE"
 done
 
-echo "── 1/5 lucid_mcp (release)"
-(cd src-tauri && cargo build --release --bin lucid_mcp --quiet)
-cp "src-tauri/target/release/lucid_mcp" "$BIN_DIR/lucid_mcp-$TRIPLE"
-
-echo "── 2/5 llama-completion"
+echo "── 1/4 llama-completion"
 # Local : build statique (self-contained, pas de dylib). CI : release officielle
 # llama.cpp (dynamique → ses dylibs seront embarqués par dylibbundler ci-dessous).
 LLAMA_DYLIBS=""; LLAMA_SRC=""
@@ -56,12 +52,12 @@ else
   LLAMA_SRC=$(dirname "$cli")          # dossier des dylibs @rpath (libllama, libggml…)
 fi
 
-echo "── 3/5 poppler (pdftotext + pdftoppm) + dylibs"
+echo "── 2/4 poppler (pdftotext + pdftoppm) + dylibs"
 for b in pdftotext pdftoppm; do
   cp "/opt/homebrew/bin/$b" "$BIN_DIR/$b-$TRIPLE"
 done
 
-echo "── 4/5 tesseract + dylibs + tessdata (fra+eng+osd)"
+echo "── 3/4 tesseract + dylibs + tessdata (fra+eng+osd)"
 cp /opt/homebrew/bin/tesseract "$BIN_DIR/tesseract-$TRIPLE"
 for lang in fra eng osd; do
   cp "/opt/homebrew/share/tessdata/$lang.traineddata" "$TESS_DIR/"
@@ -85,7 +81,7 @@ if [ -n "$LLAMA_DYLIBS" ]; then
     -s /opt/homebrew/lib -s "$LLAMA_SRC" < /dev/null > /dev/null
 fi
 
-echo "── 5/5 bit exécutable + re-signature ad-hoc (dylibbundler invalide les signatures)"
+echo "── 4/4 bit exécutable + re-signature ad-hoc (dylibbundler invalide les signatures)"
 chmod +x "$BIN_DIR"/*-"$TRIPLE"   # le llama téléchargé perd parfois son +x après cp/bundle
 codesign -f -s - "$BIN_DIR"/*-"$TRIPLE" "$LIB_DIR"/*.dylib 2>/dev/null
 

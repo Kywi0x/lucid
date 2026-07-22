@@ -79,17 +79,17 @@ pub struct BrainNode {
     #[serde(default)]
     pub content: String,
     // ─── Provenance (nœuds feuilles uniquement) ────────────────────────────
-    /// Connecteur d'origine : "notion" | "claude-code" | "google-drive".
+    /// Connecteur d'origine : "claude-code" | "google-drive" | "obsidian"…
     #[serde(default)]
     pub connector: Option<String>,
-    /// Identifiant de la source (page_id Notion, session_id Claude Code, file_id Drive).
+    /// Identifiant de la source (session_id Claude Code, file_id Drive…).
     #[serde(default)]
     pub source_id: Option<String>,
     /// Slug projet (utilisé uniquement par Claude Code pour localiser le fichier JSONL).
     #[serde(default)]
     pub source_project: Option<String>,
-    /// Texte source de la page (markdown issu du connecteur : PDF converti,
-    /// page Notion…). Rempli à la génération, sans IA. Embarqué dans brain.md
+    /// Texte source de la page (markdown issu du connecteur : PDF converti…).
+    /// Rempli à la génération, sans IA. Embarqué dans brain.md
     /// et utilisé par ask_brain — le cerveau reste exploitable hors app (MCP).
     #[serde(default)]
     pub source_text: String,

@@ -14,8 +14,8 @@ macro_rules! elog {
 mod ai;
 mod backup;
 mod connectors;
-mod mcp_clients;
 mod models;
+mod secrets;
 
 use ai::{pipeline, LlamaEngine};
 use models::{BrainEdge, BrainGraph, BrainNode, ConnectorStatus, Conversation, ConversationSummary};
@@ -31,9 +31,8 @@ pub fn list_conversations_pub() -> Vec<ConversationSummary> {
 /// l'app réelle. Id stable (`note-tour`) : ré-exécutable sans créer de doublon.
 pub fn seed_walkthrough_note(content: &str) -> Result<String, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json"))
+    let mut graph: BrainGraph = backup::load_brain_cached(&dir)
         .map_err(|e| format!("brain.json introuvable ({e}) — génère d'abord un cerveau."))?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone())
         .ok_or("Aucun nœud racine dans brain.json.")?;
     let id = "note-tour".to_string();
@@ -96,9 +95,9 @@ fn load_all_conversations() -> Vec<Conversation> {
     convs.extend(connectors::claude_ai::load_conversations());
     convs.extend(connectors::chatgpt::load_conversations());
     convs.extend(connectors::google_drive::load_conversations());
-    convs.extend(connectors::notion::load_conversations());
     convs.extend(connectors::obsidian::load_all_conversations());
     convs.extend(connectors::local_folder::load_conversations());
+    convs.extend(connectors::apple_notes::load_conversations());
     convs
 }
 
@@ -202,9 +201,9 @@ fn load_conversation(project_slug: String, id: String, source: Option<String>) -
         Some("claude-ai")    => connectors::claude_ai::load_by_id(&id),
         Some("chatgpt")      => connectors::chatgpt::load_by_id(&id),
         Some("google-drive") => connectors::google_drive::load_by_id(&id),
-        Some("notion")       => connectors::notion::load_by_id(&id),
         Some("obsidian")     => connectors::obsidian::load_by_id(&id),
         Some("local-folder") => connectors::local_folder::load_by_id(&id),
+        Some("apple-notes")  => connectors::apple_notes::load_by_id(&id),
         _                    => connectors::claude_code::load_conversation(&project_slug, &id),
     }
 }
@@ -243,7 +242,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
     let ai_connected = !ai_convs.is_empty();
     let ai_sync = ai_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max();
 
-    vec![
+    let mut list = vec![
         ConnectorStatus {
             id: "claude-code".into(),
             name: "Claude Code".into(),
@@ -292,18 +291,6 @@ fn connectors_status() -> Vec<ConnectorStatus> {
                 needs_setup: false,
             }
         },
-        {
-            let n_convs = connectors::notion::load_conversations();
-            let n_sync  = n_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max();
-            ConnectorStatus {
-                id: "notion".into(),
-                name: "Notion".into(),
-                connected: connectors::notion::is_connected(),
-                last_sync: n_sync,
-                conversation_count: n_convs.len(),
-                needs_setup: false,
-            }
-        },
         ConnectorStatus {
             id: "obsidian".into(),
             name: "Obsidian".into(),
@@ -317,14 +304,31 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             let lf_sync = lf_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max();
             ConnectorStatus {
                 id: "local-folder".into(),
-                name: "Dossier local".into(),
+                name: "Dossiers locaux".into(),
                 connected: connectors::local_folder::is_connected(),
                 last_sync: lf_sync,
                 conversation_count: lf_convs.len(),
                 needs_setup: !connectors::local_folder::is_connected(),
             }
         },
-    ]
+    ];
+
+    // Mac uniquement : Notes.app n'existe pas sur Windows, la carte n'a rien à
+    // faire dans la grille là-bas plutôt que d'afficher un connecteur inerte.
+    if connectors::apple_notes::available() {
+        let an_convs = connectors::apple_notes::load_conversations();
+        let an_sync = an_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max();
+        list.push(ConnectorStatus {
+            id: "apple-notes".into(),
+            name: "Notes Apple".into(),
+            connected: connectors::apple_notes::is_connected(),
+            last_sync: an_sync,
+            conversation_count: an_convs.len(),
+            needs_setup: !connectors::apple_notes::is_connected(),
+        });
+    }
+
+    list
 }
 
 /// Lance le flux OAuth loopback Google. Ouvre le navigateur, attend le redirect.
@@ -395,20 +399,6 @@ fn import_chatgpt(path: String) -> Result<usize, String> {
     Ok(count)
 }
 
-/// Enregistre le token Notion et valide la connexion.
-#[tauri::command]
-async fn notion_connect(token: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if !token.starts_with("secret_") && !token.starts_with("ntn_") {
-            return Err("Token invalide — il doit commencer par « secret_ » ou « ntn_ ».".into());
-        }
-        connectors::notion::validate_token(&token)?;
-        connectors::notion::save_token(&token)
-    })
-    .await
-    .map_err(|e| format!("Erreur : {e}"))?
-}
-
 /// Modèle IA actif + taille de sa fenêtre de contexte (pour l'UI des assistants).
 #[derive(serde::Serialize)]
 struct AiInfo {
@@ -422,36 +412,6 @@ fn ai_info() -> AiInfo {
         model: ai::llama::active_model_stored().map(|m| m.name).unwrap_or_else(|| "—".into()),
         context_tokens: ai::llama::CONTEXT_TOKENS,
     }
-}
-
-/// Synchronise les pages Notion. Renvoie (nouvelles, total).
-#[tauri::command]
-async fn notion_sync() -> Result<(usize, usize), String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let result = connectors::notion::sync()?;
-        // Invalide le cache de synthèse pour que le pipeline régénère
-        // les nœuds Notion avec les nouvelles pages.
-        if let Some(dir) = ai::llama::app_data_dir() {
-            let _ = std::fs::remove_file(dir.join("brain_synth_cache.json"));
-        }
-        Ok(result)
-    })
-    .await
-    .map_err(|e| format!("Sync interrompue : {e}"))?
-}
-
-/// Déconnecte Notion (supprime token + cache).
-#[tauri::command]
-fn notion_disconnect() {
-    connectors::notion::disconnect();
-}
-
-/// Lit le contenu d'une page Notion depuis le cache local (0 appel API).
-#[tauri::command]
-fn notion_load_page(id: String) -> Result<String, String> {
-    let conv = connectors::notion::load_by_id(&id)
-        .ok_or_else(|| "Page absente du cache — relancez un Sync Notion.".to_string())?;
-    Ok(conv.messages.into_iter().map(|m| m.text).collect::<Vec<_>>().join("\n\n"))
 }
 
 /// Contexte BORNÉ pour ask_brain : aperçu compact (report) + pages les plus
@@ -519,9 +479,8 @@ fn ask_context(graph: &BrainGraph, question: &str, report: &str) -> String {
 async fn ask_brain(question: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-        let raw = std::fs::read_to_string(dir.join("brain.json"))
+        let graph: BrainGraph = backup::load_brain_cached(&dir)
             .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
-        let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         let report = std::fs::read_to_string(dir.join("brain_report.md")).unwrap_or_default();
         let engine = LlamaEngine::detect()?;
         let system = "Tu es l'assistant du second cerveau de l'utilisateur. Réponds en \
@@ -539,9 +498,8 @@ par leur titre. Si l'information n'y figure pas, dis-le clairement.";
 async fn ask_node(node_id: String, question: String, include_children: bool) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-        let raw = std::fs::read_to_string(dir.join("brain.json"))
+        let graph: BrainGraph = backup::load_brain_cached(&dir)
             .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
-        let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         let node = graph.nodes.iter().find(|n| n.id == node_id)
             .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
 
@@ -581,9 +539,8 @@ ses sous-pages). Si l'information n'y figure pas, dis-le clairement plutôt que 
 async fn generate_content(node_id: String, instruction: String, include_children: bool) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-        let raw = std::fs::read_to_string(dir.join("brain.json"))
+        let graph: BrainGraph = backup::load_brain_cached(&dir)
             .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
-        let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         let node = graph.nodes.iter().find(|n| n.id == node_id)
             .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
 
@@ -655,8 +612,7 @@ fn read_brain_graph() -> Option<BrainGraph> {
 #[tauri::command]
 fn export_node_md(node_id: String, path: String) -> Result<(), String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let graph: BrainGraph = backup::load_brain_cached(&dir)?;
 
     let mut queue: std::collections::VecDeque<(&models::BrainNode, usize)> =
         std::collections::VecDeque::new();
@@ -683,12 +639,11 @@ fn export_node_md(node_id: String, path: String) -> Result<(), String> {
 }
 
 /// Charge le contenu d'un nœud feuille depuis le cache local (0 appel API).
-/// Route selon connector : notion → notion_cache.json, claude-code → .jsonl, etc.
+/// Route selon connector : google-drive → cache JSON, claude-code → .jsonl, etc.
 #[tauri::command]
 fn load_node_content(node_id: String) -> Result<String, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let graph: BrainGraph = backup::load_brain_cached(&dir)?;
 
     let node = graph.nodes.iter().find(|n| n.id == node_id)
         .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
@@ -698,13 +653,13 @@ fn load_node_content(node_id: String) -> Result<String, String> {
     let project_slug = node.source_project.as_deref().unwrap_or("");
 
     let conv = match connector {
-        "notion"       => connectors::notion::load_by_id(source_id),
         "google-drive" => connectors::google_drive::load_by_id(source_id),
         "claude-ai"    => connectors::claude_ai::load_by_id(source_id),
         "chatgpt"      => connectors::chatgpt::load_by_id(source_id),
         "claude-code"  => connectors::claude_code::load_conversation(project_slug, source_id),
         "obsidian"     => connectors::obsidian::load_by_id(source_id),
         "local-folder" => connectors::local_folder::load_by_id(source_id),
+        "apple-notes"  => connectors::apple_notes::load_by_id(source_id),
         // Import local : le markdown converti vit dans node.content, pas de cache connecteur.
         "local-file"   => return Ok(node.content.clone()),
         _ => return Err(format!("Connecteur inconnu : {connector}")),
@@ -788,15 +743,35 @@ fn get_node_snapshot(node_id: String, snapshot_id: String) -> Result<String, Str
 #[tauri::command]
 fn save_node_content(node_id: String, content: String) -> Result<(), String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    save_node_content_in(&dir, &node_id, &content)
+}
+
+/// Variante injectable (dossier explicite) — réutilisée par l'acceptation d'une
+/// proposition MCP `update_node` (dispatch dans `resolve_proposal_in`).
+fn save_node_content_in(dir: &std::path::Path, node_id: &str, content: &str) -> Result<(), String> {
+    let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
+    save_node_content_on(dir, &mut graph, node_id, content)?;
+    backup::write_brain(dir, &mut graph)
+}
+
+/// Mutation en mémoire seule (pas de lecture/écriture de brain.json) — permet
+/// à `resolve_all_pending_in` d'appliquer tout un lot de propositions avec UN
+/// seul cycle lecture+écriture au lieu d'un par proposition (bug remonté par
+/// Liam le 2026-07-21 : une arborescence de 17 pages faisait ~17 cycles de
+/// lecture/écriture complets d'un brain.json de 50 Mo → app très lente).
+fn save_node_content_on(dir: &std::path::Path, graph: &mut BrainGraph, node_id: &str, content: &str) -> Result<(), String> {
+    // Détection de secrets obligatoire (autonome ET validation) — c'est ici que
+    // passe tout contenu tapé/édité dans l'éditeur (insert_note_node_on ne couvre
+    // que la création initiale : import, proposition MCP acceptée).
+    let (content, masked) = secrets::mask_secrets(content);
+    if masked { elog!("secrets: contenu masqué avant écriture (nœud {node_id})"); }
     let node = graph.nodes.iter_mut()
         .find(|n| n.id == node_id)
         .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
     // Sauvegarde l'ancienne version avant d'écraser
-    save_node_content_history(&dir, &node_id, &node.content);
+    save_node_content_history(dir, node_id, &node.content);
     node.content = content;
-    backup::write_brain(&dir, &mut graph)
+    Ok(())
 }
 
 /// Crée un nœud « note » (prise de note utilisateur) rattaché à `parent_id`.
@@ -823,8 +798,18 @@ fn insert_note_node(parent_id: String, label: String, content: String, source: O
 /// utilisée par l'acceptation des propositions MCP (l'id de la proposition
 /// devient l'id du nœud, ce qui garde valides les références parent en chaîne).
 fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, label: String, content: String, source: Option<(&str, String)>) -> Result<BrainNode, String> {
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
+    let node = insert_note_node_on(&mut graph, id, parent_id, label, content, source)?;
+    backup::write_brain(dir, &mut graph)?;
+    Ok(node)
+}
+
+/// Mutation en mémoire seule — cf. `save_node_content_on`.
+fn insert_note_node_on(graph: &mut BrainGraph, id: String, parent_id: String, label: String, content: String, source: Option<(&str, String)>) -> Result<BrainNode, String> {
+    // Détection de secrets obligatoire (autonome ET validation) — point de passage
+    // unique pour toute écriture de contenu note (humaine, import, ou acceptation MCP).
+    let (content, masked) = secrets::mask_secrets(&content);
+    if masked { elog!("secrets: contenu masqué avant écriture (nœud {id})"); }
     if !graph.nodes.iter().any(|n| n.id == parent_id) {
         return Err(format!("Nœud parent {parent_id} introuvable."));
     }
@@ -857,11 +842,10 @@ fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, lab
         source: parent_id, target: id, kind: "contains".into(), relation: "contains".into(),
     });
     graph.nodes.push(node.clone());
-    backup::write_brain(&dir, &mut graph)?;
     Ok(node)
 }
 
-/// Convertit un fichier local en markdown (PDF, DOC/DOCX/RTF, PPTX, TXT/MD, CSV).
+/// Convertit un fichier local en markdown (PDF, DOC/DOCX/RTF, PPTX, XLSX, TXT/MD, CSV).
 /// Partagé entre `import_file` et le connecteur « dossier local ».
 /// Erreur = message honnête et actionnable (ADR-0015), jamais d'échec silencieux.
 pub(crate) fn file_to_markdown(p: &std::path::Path) -> Result<String, String> {
@@ -883,6 +867,7 @@ pub(crate) fn file_to_markdown(p: &std::path::Path) -> Result<String, String> {
         "doc" | "rtf" => textutil_to_text(p)?,
         "txt" | "md" | "markdown" => read_lossy(p)?,
         "csv" => csv_to_markdown(&read_lossy(p)?),
+        "xlsx" => xlsx_to_markdown(p)?,
         other => return Err(format!("Format non supporté : .{other}")),
     };
     if content.trim().is_empty() {
@@ -905,26 +890,87 @@ fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
 
 // ─── Propositions MCP (écriture validée par l'utilisateur) ─────────────────────
 //
-// Le serveur MCP (`lucid_mcp`) ne touche jamais brain.json : il dépose une
-// proposition par fichier dans `mcp_pending/`. L'app les affiche (bulles
-// fantômes + panneau) ; seule l'acceptation écrit dans brain.json — un seul
-// écrivain, pas de course. L'id de la proposition devient l'id du nœud accepté,
-// ce qui permet à l'IA de construire des arbres (parent_id = id d'une
+// Le serveur MCP distant (`supabase/functions/lucid-mcp`, seul serveur MCP —
+// local et distant partagent la même URL depuis la décision du 2026-07-21) ne
+// touche jamais brain.json directement : il dépose une proposition, rapatriée
+// localement dans `mcp_pending/`. L'app les affiche (bulles fantômes/badges +
+// panneau) ; seule l'acceptation écrit dans brain.json — un seul écrivain, pas
+// de course. L'id de la proposition devient l'id du nœud accepté (action
+// "create"), ce qui permet à l'IA de construire des arbres (parent_id = id d'une
 // proposition précédente).
 
+fn default_action() -> String { "create".into() }
+
+/// Généralisée à 5 formes (`action`) plutôt qu'un système de bulles par action :
+/// `create` (parent_id/label/content), `update` (target_id/content), `move`
+/// (target_id/new_parent_id), `merge` (merge_ids/label optionnel du survivant),
+/// `link` (target_id/link_target/relation). Rétrocompatible : les anciens
+/// fichiers sans `action` sur disque se relisent comme `create`.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct McpProposal {
     id: String,
+    #[serde(default = "default_action")]
+    action: String,
+    #[serde(default)]
     parent_id: String,
+    #[serde(default)]
     label: String,
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    target_id: String,
+    #[serde(default)]
+    new_parent_id: String,
+    #[serde(default)]
+    merge_ids: Vec<String>,
+    #[serde(default)]
+    link_target: String,
+    #[serde(default)]
+    relation: String,
     #[serde(default)]
     created_at: String,
 }
 
 fn mcp_pending_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("mcp_pending")
+}
+
+fn remove_pending_file(dir: &std::path::Path, id: &str) -> Result<(), String> {
+    std::fs::remove_file(mcp_pending_dir(dir).join(format!("{id}.json"))).map_err(|e| e.to_string())
+}
+
+// ── Dédoublonnage des propositions résolues ─────────────────────────────────
+// Le poll distant (App.tsx) rapatrie une proposition Supabase pendant 10 min
+// après son dépôt (le temps qu'une IA puisse chaîner des sous-pages). Pour
+// "create", une proposition déjà acceptée est détectable (son id est devenu un
+// id de nœud réel) — mais pour update/move/merge/link, l'id de la proposition
+// n'est JAMAIS un id de nœud, donc rien ne permettait de détecter un réimport.
+// Chaque réimport relançait le cycle complet (snapshot + lecture + écriture
+// des 50 Mo de brain.json), en boucle pendant 10 minutes après une action déjà
+// appliquée — bug remonté par Liam le 2026-07-21 (lenteur persistante, IA à
+// l'arrêt). Un petit registre horodaté, purgé après 24h, ferme ce trou.
+fn resolved_proposals_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("mcp_resolved.json")
+}
+
+fn load_resolved_proposals(dir: &std::path::Path) -> std::collections::HashMap<String, u64> {
+    std::fs::read_to_string(resolved_proposals_path(dir)).ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default()
+}
+
+fn proposal_already_resolved(dir: &std::path::Path, id: &str) -> bool {
+    load_resolved_proposals(dir).contains_key(id)
+}
+
+fn mark_proposal_resolved(dir: &std::path::Path, id: &str) {
+    let mut m = load_resolved_proposals(dir);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    m.insert(id.to_string(), now);
+    m.retain(|_, t| now.saturating_sub(*t) < 24 * 3600); // large marge vs. la fenêtre de 10 min côté serveur
+    if let Ok(json) = serde_json::to_string(&m) {
+        let _ = std::fs::write(resolved_proposals_path(dir), json);
+    }
 }
 
 fn load_proposals_in(dir: &std::path::Path) -> Vec<McpProposal> {
@@ -945,49 +991,20 @@ fn load_proposals_in(dir: &std::path::Path) -> Vec<McpProposal> {
 /// Renvoie les ids réellement résolus (la chaîne d'ancêtres acceptés, ou le
 /// sous-arbre refusé) — le front purge ces lignes côté Supabase (MCP distant).
 fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<Vec<String>, String> {
+    // Même verrou que la régénération complète : sans lui, une régénération en
+    // tâche de fond (watcher Claude Code) et une acceptation MCP peuvent lire
+    // brain.json au même instant puis écrire chacune leur propre version —
+    // l'une écrase le travail de l'autre en mémoire (bug remonté par Liam le
+    // 2026-07-21 : "le canvas s'est vidé, plus rien, ni les nouvelles pages").
+    let _gen = GEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let props = load_proposals_in(dir);
     let target = props.iter().find(|p| p.id == id)
         .ok_or_else(|| format!("Proposition {id} introuvable."))?;
 
-    if accept {
-        // Chaîne d'ancêtres encore pending (accepter un enfant accepte ses parents).
-        let mut chain = vec![target.clone()];
-        let mut cur_parent = target.parent_id.clone();
-        while let Some(p) = props.iter().find(|p| p.id == cur_parent) {
-            chain.push(p.clone());
-            cur_parent = p.parent_id.clone();
-        }
-        chain.reverse();
-        for p in &chain {
-            match insert_note_node_in(dir, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone(), None) {
-                Ok(_) => {}
-                // Réimport zombie (le poll Supabase a recréé une proposition déjà
-                // acceptée) : le nœud vit déjà dans le cerveau — on nettoie juste.
-                Err(e) if e.ends_with("déjà présent.") => {}
-                Err(e) => return Err(e),
-            }
-            std::fs::remove_file(mcp_pending_dir(dir).join(format!("{}.json", p.id)))
-                .map_err(|e| e.to_string())?;
-        }
-        // Le nouveau nœud rejoint les spaces qui contiennent son parent : la vue
-        // d'un space ne montre que node_ids + ancêtres, une proposition acceptée
-        // resterait sinon invisible dans le space qu'elle visait.
-        let mut spaces = load_spaces(dir);
-        let mut touched = false;
-        for p in &chain {
-            for s in spaces.iter_mut() {
-                if let Some(ids) = s.node_ids.as_mut() {
-                    if ids.iter().any(|i| i == &p.parent_id) && !ids.contains(&p.id) {
-                        ids.push(p.id.clone());
-                        touched = true;
-                    }
-                }
-            }
-        }
-        if touched { save_spaces(dir, &spaces); }
-        Ok(chain.iter().map(|p| p.id.clone()).collect())
-    } else {
-        // Refus récursif : les descendants pending tombent avec le parent.
+    if !accept {
+        // Refus récursif : les descendants pending tombent avec le parent — ne
+        // concerne que les chaînes create→create (parent_id) ; sans objet pour
+        // les 4 autres actions (boucle sans effet, juste ce fichier est retiré).
         let mut doomed = vec![id.to_string()];
         let mut i = 0;
         while i < doomed.len() {
@@ -1001,8 +1018,246 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
         for rid in &doomed {
             let _ = std::fs::remove_file(mcp_pending_dir(dir).join(format!("{rid}.json")));
         }
-        Ok(doomed)
+        return Ok(doomed);
     }
+
+    // Acceptation = écriture d'origine IA : filet de sécurité avant toute mutation
+    // (identifiable ensuite dans le panneau Historique comme « Archiviste (MCP) »).
+    save_snapshot_in(dir, "mcp_accept");
+
+    // Zombie tolerance : le poll Supabase peut recréer localement une proposition
+    // déjà appliquée (fenêtre de 10 min côté serveur) — une cible introuvable dans
+    // ce cas n'est pas une vraie erreur, juste un nettoyage (même logique que
+    // "déjà présent" pour `create` plus bas).
+    fn tolerate_already_applied(r: Result<(), String>) -> Result<(), String> {
+        match r {
+            Err(e) if e.ends_with("introuvable.") => Ok(()),
+            other => other,
+        }
+    }
+
+    match target.action.as_str() {
+        "update" => {
+            tolerate_already_applied(save_node_content_in(dir, &target.target_id, &target.content))?;
+            remove_pending_file(dir, id)?;
+            mark_proposal_resolved(dir, id);
+            Ok(vec![target.target_id.clone()])
+        }
+        "move" => {
+            tolerate_already_applied(set_node_parent_in(dir, &target.target_id, &target.new_parent_id))?;
+            remove_pending_file(dir, id)?;
+            mark_proposal_resolved(dir, id);
+            Ok(vec![target.target_id.clone()])
+        }
+        "merge" => {
+            let label = if target.label.trim().is_empty() { None } else { Some(target.label.clone()) };
+            let ids = match merge_nodes_in(dir, &target.merge_ids, label) {
+                Ok(survivor) => vec![survivor.id],
+                Err(e) if e.ends_with("introuvable.") => target.merge_ids.clone(),
+                Err(e) => return Err(e),
+            };
+            remove_pending_file(dir, id)?;
+            mark_proposal_resolved(dir, id);
+            Ok(ids)
+        }
+        "link" => {
+            let relation = if target.relation.trim().is_empty() { None } else { Some(target.relation.clone()) };
+            tolerate_already_applied(link_nodes_in(dir, &target.target_id, &target.link_target, relation))?;
+            remove_pending_file(dir, id)?;
+            mark_proposal_resolved(dir, id);
+            Ok(vec![target.target_id.clone(), target.link_target.clone()])
+        }
+        _ => {
+            // "create" : chaîne d'ancêtres encore pending (accepter un enfant accepte ses parents).
+            let mut chain = vec![target.clone()];
+            let mut cur_parent = target.parent_id.clone();
+            while let Some(p) = props.iter().find(|p| p.id == cur_parent) {
+                chain.push(p.clone());
+                cur_parent = p.parent_id.clone();
+            }
+            chain.reverse();
+            for p in &chain {
+                match insert_note_node_in(dir, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone(), None) {
+                    Ok(_) => {}
+                    // Réimport zombie (le poll Supabase a recréé une proposition déjà
+                    // acceptée) : le nœud vit déjà dans le cerveau — on nettoie juste.
+                    Err(e) if e.ends_with("déjà présent.") => {}
+                    Err(e) => return Err(e),
+                }
+                remove_pending_file(dir, &p.id)?;
+            }
+            // Le nouveau nœud rejoint les spaces qui "voient" son parent : la vue d'un
+            // space (filterGraphBySpace, front) montre node_ids ET leurs ANCÊTRES (pour
+            // le fil d'ariane) — un nœud peut donc être visible dans un space sans être
+            // un membre littéral de node_ids. Le check devait couvrir les deux cas ;
+            // il ne couvrait que le littéral, laissant les propositions acceptées sous
+            // un nœud "ancêtre seulement" invisibles alors même que brain.json les contient
+            // (bug confirmé 2026-07-21 : compteur de nœuds à jour, bulle introuvable).
+            let fresh_graph: BrainGraph = backup::load_brain_cached(dir)?;
+            let parent_of: std::collections::HashMap<&str, Option<&str>> = fresh_graph.nodes.iter()
+                .map(|n| (n.id.as_str(), n.parent_id.as_deref()))
+                .collect();
+            // `parent_id` est-il un membre littéral de `ids`, ou l'ancêtre d'un membre ?
+            let space_can_see = |ids: &[String], parent_id: &str| -> bool {
+                if ids.iter().any(|i| i == parent_id) { return true; }
+                ids.iter().any(|member| {
+                    let mut cur = parent_of.get(member.as_str()).copied().flatten();
+                    while let Some(pid) = cur {
+                        if pid == parent_id { return true; }
+                        cur = parent_of.get(pid).copied().flatten();
+                    }
+                    false
+                })
+            };
+            let mut spaces = load_spaces(dir);
+            let mut touched = false;
+            for p in &chain {
+                for s in spaces.iter_mut() {
+                    if let Some(ids) = s.node_ids.as_mut() {
+                        if space_can_see(ids, &p.parent_id) && !ids.contains(&p.id) {
+                            ids.push(p.id.clone());
+                            touched = true;
+                        }
+                    }
+                }
+            }
+            if touched { save_spaces(dir, &spaces); }
+            for p in &chain { mark_proposal_resolved(dir, &p.id); }
+            Ok(chain.iter().map(|p| p.id.clone()).collect())
+        }
+    }
+}
+
+/// Résout TOUTES les propositions en attente en UN seul cycle lecture+écriture
+/// (au lieu d'un cycle complet par proposition) — une arborescence de N pages
+/// (via brain_add_tree) faisait jusqu'ici N cycles de lecture/écriture d'un
+/// brain.json qui peut peser plusieurs dizaines de Mo, rendant l'app très
+/// lente/saccadée sur un gros lot (bug remonté par Liam le 2026-07-21, 17
+/// pages d'un coup). Traite par vagues : tant qu'une proposition progresse, on
+/// retente les suivantes (gère les chaînes create→create et les dépendances
+/// internes au lot, ex. un `link` visant un `create` du même lot). Une
+/// proposition dont la cible n'existe jamais reste en attente, visible dans
+/// mcp_pending/ — jamais perdue en silence.
+fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
+    // Même verrou que la régénération complète — cf. commentaire dans
+    // `resolve_proposal_in`, même risque de course.
+    let _gen = GEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut props = load_proposals_in(dir);
+    if props.is_empty() { return Ok(vec![]); }
+    // Snapshot différé après la boucle (cf. plus bas) : si rien ne progresse
+    // (cible qui n'arrivera jamais), aucun snapshot ni écriture n'a lieu — sans
+    // ça, un tick répété sur une proposition définitivement bloquée réécrirait
+    // brain.json en boucle pour rien à chaque tentative.
+    let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
+    let mut resolved: Vec<String> = Vec::new();
+    let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut created_parent_of: Vec<(String, String)> = Vec::new();
+
+    loop {
+        let mut progressed = false;
+        let mut remaining = Vec::new();
+        for p in props {
+            let ready = match p.action.as_str() {
+                "update" | "move" | "link" => graph.nodes.iter().any(|n| n.id == p.target_id),
+                "merge" => p.merge_ids.iter().all(|id| graph.nodes.iter().any(|n| &n.id == id)),
+                _ => graph.nodes.iter().any(|n| n.id == p.parent_id), // "create"
+            };
+            if !ready { remaining.push(p); continue; }
+            progressed = true;
+            let outcome: Result<Vec<String>, String> = match p.action.as_str() {
+                "update" => save_node_content_on(dir, &mut graph, &p.target_id, &p.content).map(|_| vec![p.target_id.clone()]),
+                "move" => set_node_parent_on(&mut graph, &p.target_id, &p.new_parent_id).map(|_| vec![p.target_id.clone()]),
+                "link" => {
+                    let relation = if p.relation.trim().is_empty() { None } else { Some(p.relation.clone()) };
+                    link_nodes_on(&mut graph, &p.target_id, &p.link_target, relation)
+                        .map(|_| vec![p.target_id.clone(), p.link_target.clone()])
+                }
+                "merge" => {
+                    let label = if p.label.trim().is_empty() { None } else { Some(p.label.clone()) };
+                    match merge_nodes_on(&mut graph, &p.merge_ids, label) {
+                        Ok(survivor) => {
+                            for m in &p.merge_ids[1..] { tombstoned.insert(m.clone()); }
+                            Ok(vec![survivor.id])
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => insert_note_node_on(&mut graph, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone(), None)
+                    .map(|n| { created_parent_of.push((n.id.clone(), p.parent_id.clone())); vec![n.id] }),
+            };
+            match outcome {
+                Ok(ids) => {
+                    resolved.extend(ids);
+                    let _ = remove_pending_file(dir, &p.id);
+                    mark_proposal_resolved(dir, &p.id);
+                }
+                // Zombie/no-op toléré (réimport distant d'une action déjà appliquée) :
+                // nettoyage sans y voir une vraie erreur (même logique que le chemin
+                // par-proposition dans `resolve_proposal_in`).
+                Err(e) if e.ends_with("introuvable.") || e.ends_with("déjà présent.") => {
+                    let _ = remove_pending_file(dir, &p.id);
+                    mark_proposal_resolved(dir, &p.id);
+                }
+                Err(e) => {
+                    elog!("mcp: proposition {} non appliquée : {e}", p.id);
+                    remaining.push(p); // reste en attente, visible — jamais perdue en silence
+                }
+            }
+        }
+        props = remaining;
+        if !progressed || props.is_empty() { break; }
+    }
+
+    if resolved.is_empty() {
+        return Ok(resolved); // rien n'a progressé (cibles bloquées) : ni snapshot ni écriture
+    }
+    save_snapshot_in(dir, "mcp_accept"); // un seul snapshot pour tout le lot, juste avant l'écriture
+
+    // Les nouveaux nœuds rejoignent les spaces qui "voient" leur parent — même
+    // logique que `resolve_proposal_in` (bug des ancêtres du 2026-07-21).
+    if !created_parent_of.is_empty() {
+        let parent_of: std::collections::HashMap<&str, Option<&str>> = graph.nodes.iter()
+            .map(|n| (n.id.as_str(), n.parent_id.as_deref()))
+            .collect();
+        let space_can_see = |ids: &[String], parent_id: &str| -> bool {
+            if ids.iter().any(|i| i == parent_id) { return true; }
+            ids.iter().any(|member| {
+                let mut cur = parent_of.get(member.as_str()).copied().flatten();
+                while let Some(pid) = cur {
+                    if pid == parent_id { return true; }
+                    cur = parent_of.get(pid).copied().flatten();
+                }
+                false
+            })
+        };
+        let mut spaces = load_spaces(dir);
+        let mut touched = false;
+        for (id, parent_id) in &created_parent_of {
+            for s in spaces.iter_mut() {
+                if let Some(ids) = s.node_ids.as_mut() {
+                    if space_can_see(ids, parent_id) && !ids.contains(id) {
+                        ids.push(id.clone());
+                        touched = true;
+                    }
+                }
+            }
+        }
+        if touched { save_spaces(dir, &spaces); }
+    }
+
+    if !tombstoned.is_empty() { add_tombstones(dir, &tombstoned); }
+    backup::write_brain(dir, &mut graph)?;
+    let existing: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+    purge_dead_space_ids(dir, &existing);
+    Ok(resolved)
+}
+
+/// Version "tout accepter d'un coup" — utilisée par le mode autonome et par le
+/// bouton "Tout accepter" du panneau de propositions.
+#[tauri::command]
+fn resolve_all_mcp_proposals() -> Result<Vec<String>, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    resolve_all_pending_in(&dir)
 }
 
 /// Liste les propositions en attente déposées par le serveur MCP.
@@ -1013,34 +1268,73 @@ fn list_mcp_proposals() -> Result<Vec<McpProposal>, String> {
 }
 
 /// Rapatrie une proposition MCP DISTANTE (table Supabase) dans le circuit local
-/// `mcp_pending/` — même validation par bulles fantômes que le MCP local.
+/// `mcp_pending/` — même validation par bulles fantômes/badges que le MCP local.
+/// `action` généralisé (voir `McpProposal`) : seuls les champs pertinents pour
+/// l'action sont non-vides côté appelant (le reste passe en défaut).
+/// Les 6 nouveaux champs sont `Option` : un appelant qui ne les connaît pas
+/// encore (front pas encore mis à jour) continue de fonctionner en mode create.
 #[tauri::command]
-fn import_mcp_proposal(id: String, parent_id: String, label: String, content: String) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn import_mcp_proposal(
+    id: String,
+    parent_id: String,
+    label: String,
+    content: String,
+    action: Option<String>,
+    target_id: Option<String>,
+    new_parent_id: Option<String>,
+    merge_ids: Option<Vec<String>>,
+    link_target: Option<String>,
+    relation: Option<String>,
+) -> Result<(), String> {
+    let target_id = target_id.unwrap_or_default();
+    let new_parent_id = new_parent_id.unwrap_or_default();
+    let merge_ids = merge_ids.unwrap_or_default();
+    let link_target = link_target.unwrap_or_default();
+    let relation = relation.unwrap_or_default();
     // L'id vient du réseau : charset strict (uuid) contre toute traversée de chemin.
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err("id de proposition invalide".into());
     }
-    if label.trim().is_empty() {
+    let action = action.filter(|a| !a.trim().is_empty()).unwrap_or_else(default_action);
+    if action == "create" && label.trim().is_empty() {
         return Err("label vide".into());
     }
     let data_dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    // Déjà accepté (le nœud vit dans brain.json) → ne pas recréer une bulle
-    // zombie que ✓ ne pourrait plus résoudre (« Nœud déjà présent »).
-    if let Ok(g) = std::fs::read_to_string(data_dir.join("brain.json"))
-        .map_err(|e| e.to_string())
-        .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).map_err(|e| e.to_string()))
-    {
-        if g.nodes.iter().any(|n| n.id == id) {
-            return Ok(());
+    // Déjà résolue (n'importe quelle action) → ne pas recréer le fichier pending.
+    // Le poll distant rapatrie la même ligne Supabase pendant 10 min ; sans ce
+    // garde-fou, chaque réimport relançait tout le cycle (snapshot + lecture +
+    // écriture des 50 Mo de brain.json) même après une action déjà appliquée —
+    // pour "update"/"move"/"merge"/"link" l'id n'est jamais un id de nœud donc
+    // rien ne le détectait avant (bug remonté par Liam le 2026-07-21).
+    if proposal_already_resolved(&data_dir, &id) {
+        return Ok(());
+    }
+    // "create" seul : garde-fou historique redondant mais inoffensif (le nœud
+    // vit déjà dans brain.json si accepté avant que ce registre n'existe).
+    if action == "create" {
+        if let Ok(g) = std::fs::read_to_string(data_dir.join("brain.json"))
+            .map_err(|e| e.to_string())
+            .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).map_err(|e| e.to_string()))
+        {
+            if g.nodes.iter().any(|n| n.id == id) {
+                return Ok(());
+            }
         }
     }
     let dir = data_dir.join("mcp_pending");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let proposal = serde_json::json!({
         "id": id,
+        "action": action,
         "parent_id": parent_id,
         "label": label.trim(),
         "content": content,
+        "target_id": target_id,
+        "new_parent_id": new_parent_id,
+        "merge_ids": merge_ids,
+        "link_target": link_target,
+        "relation": relation,
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
     std::fs::write(dir.join(format!("{id}.json")), proposal.to_string()).map_err(|e| e.to_string())
@@ -1061,9 +1355,8 @@ fn import_shared_space(payload: serde_json::Value, space_id: String) -> Result<B
         return Err("Space trop volumineux (> 10 Mo).".into());
     }
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json"))
+    let mut graph: BrainGraph = backup::load_brain_cached(&dir)
         .map_err(|_| "Ton cerveau n'existe pas encore — termine l'onboarding avant d'importer un space.".to_string())?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone())
         .ok_or("Cerveau sans racine.")?;
 
@@ -1241,24 +1534,6 @@ async fn sync_fingerprint() -> u64 {
     .unwrap_or(0)
 }
 
-/// Statut des clients IA (Claude Desktop/Code, Cursor) : installés ? connectés au MCP Lucid ?
-#[tauri::command]
-fn ai_clients_status() -> Vec<mcp_clients::AiClientStatus> {
-    mcp_clients::status()
-}
-
-/// Connexion one-click : écrit `mcpServers.lucid` dans la config du client (avec backup).
-#[tauri::command]
-fn connect_ai_client(id: String) -> Result<String, String> {
-    mcp_clients::connect(&id)
-}
-
-/// Retire l'entrée MCP Lucid de la config du client.
-#[tauri::command]
-fn disconnect_ai_client(id: String) -> Result<(), String> {
-    mcp_clients::disconnect(&id)
-}
-
 /// Sauvegarde une image collée dans l'éditeur → `assets/img-{ts}.{ext}`.
 /// Le markdown stocke le chemin relatif (`![](assets/…)`), l'affichage passe
 /// par le protocole asset de Tauri.
@@ -1389,8 +1664,12 @@ mod mcp_proposal_tests {
     }
 
     fn propose(dir: &std::path::Path, id: &str, parent: &str, label: &str) {
-        let p = McpProposal { id: id.into(), parent_id: parent.into(), label: label.into(),
-                              content: String::new(), created_at: String::new() };
+        let p = McpProposal {
+            id: id.into(), action: default_action(), parent_id: parent.into(), label: label.into(),
+            content: String::new(), target_id: String::new(), new_parent_id: String::new(),
+            merge_ids: vec![], link_target: String::new(), relation: String::new(),
+            created_at: String::new(),
+        };
         std::fs::write(mcp_pending_dir(dir).join(format!("{id}.json")),
                        serde_json::to_string(&p).unwrap()).unwrap();
     }
@@ -1398,6 +1677,38 @@ mod mcp_proposal_tests {
     fn graph_ids(dir: &std::path::Path) -> Vec<String> {
         let g: BrainGraph = serde_json::from_str(&std::fs::read_to_string(dir.join("brain.json")).unwrap()).unwrap();
         g.nodes.iter().map(|n| n.id.clone()).collect()
+    }
+
+    fn load_graph(dir: &std::path::Path) -> BrainGraph {
+        serde_json::from_str(&std::fs::read_to_string(dir.join("brain.json")).unwrap()).unwrap()
+    }
+
+    /// Ajoute un nœud directement dans brain.json (hors circuit MCP), pour les
+    /// tests qui ont besoin de nœuds déjà existants (update/move/merge/link).
+    fn add_node(dir: &std::path::Path, id: &str, parent: &str, label: &str, content: &str) {
+        let mut graph: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("brain.json")).unwrap()).unwrap();
+        graph["nodes"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": id, "label": label, "kind": "page", "weight": 0,
+            "summary": "", "keywords": [], "decisions": [], "patterns": [],
+            "community": 0, "parent_id": parent, "synthesized_at": null,
+            "content": content, "connector": null, "source_id": null, "source_project": null
+        }));
+        std::fs::write(dir.join("brain.json"), graph.to_string()).unwrap();
+    }
+
+    fn propose_action(dir: &std::path::Path, p: McpProposal) {
+        std::fs::write(mcp_pending_dir(dir).join(format!("{}.json", p.id)),
+                       serde_json::to_string(&p).unwrap()).unwrap();
+    }
+
+    fn blank_proposal(id: &str, action: &str) -> McpProposal {
+        McpProposal {
+            id: id.into(), action: action.into(), parent_id: String::new(), label: String::new(),
+            content: String::new(), target_id: String::new(), new_parent_id: String::new(),
+            merge_ids: vec![], link_target: String::new(), relation: String::new(),
+            created_at: String::new(),
+        }
     }
 
     #[test]
@@ -1438,6 +1749,222 @@ mod mcp_proposal_tests {
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].id, "mcp-9");
         assert_eq!(graph_ids(&dir).len(), 1); // rien inséré
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepter_sous_un_noeud_visible_seulement_comme_ancetre_dans_un_space() {
+        // Bug réel du 2026-07-21 : une proposition acceptée sous un nœud qui n'est
+        // "vu" dans un space que comme ancêtre (fil d'ariane, filterGraphBySpace
+        // remonte les parents) — pas comme membre littéral de node_ids — restait
+        // invisible dans ce space alors même que brain.json la contenait.
+        let dir = setup("space_ancestor");
+        let mut graph: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("brain.json")).unwrap()).unwrap();
+        let mk = |id: &str, parent: &str| serde_json::json!({
+            "id": id, "label": id, "kind": "page", "weight": 0,
+            "summary": "", "keywords": [], "decisions": [], "patterns": [],
+            "community": 0, "parent_id": parent, "synthesized_at": null,
+            "content": "", "connector": null, "source_id": null, "source_project": null
+        });
+        graph["nodes"].as_array_mut().unwrap().push(mk("project", "root"));
+        graph["nodes"].as_array_mut().unwrap().push(mk("leaf-x", "project"));
+        std::fs::write(dir.join("brain.json"), graph.to_string()).unwrap();
+
+        // Space scopé à "leaf-x" seul : "project" n'est PAS un membre littéral,
+        // seulement un ancêtre affiché pour le contexte.
+        let space = Space { id: "s1".into(), name: "Test".into(), node_ids: Some(vec!["leaf-x".into()]), updated_at: None };
+        save_spaces(&dir, &[space]);
+
+        // Propose et accepte une note sous "project" (l'ancêtre visible, pas membre).
+        propose(&dir, "mcp-1", "project", "Nouvelle note");
+        assert_eq!(resolve_proposal_in(&dir, "mcp-1", true).unwrap().len(), 1);
+
+        let spaces = load_spaces(&dir);
+        let s1 = spaces.iter().find(|s| s.id == "s1").unwrap();
+        assert!(
+            s1.node_ids.as_ref().unwrap().contains(&"mcp-1".to_string()),
+            "le nouveau nœud doit rejoindre le space dont le parent n'était visible que comme ancêtre : {:?}",
+            s1.node_ids
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_reparente_tombstone_et_redirige_le_wikilink() {
+        let dir = setup("merge");
+        add_node(&dir, "a", "root", "A", "");
+        add_node(&dir, "b", "root", "B", "");
+        add_node(&dir, "c", "b", "Enfant de B", ""); // doit être reparenté vers "a"
+        add_node(&dir, "d", "root", "D", "voir [[B]] pour plus");
+
+        let survivor = merge_nodes_in(&dir, &["a".to_string(), "b".to_string()], None).unwrap();
+        assert_eq!(survivor.id, "a");
+
+        let graph = load_graph(&dir);
+        assert!(!graph.nodes.iter().any(|n| n.id == "b"), "b doit disparaître du graphe");
+        let c = graph.nodes.iter().find(|n| n.id == "c").unwrap();
+        assert_eq!(c.parent_id.as_deref(), Some("a"), "l'enfant de b doit être reparenté vers a");
+        let d = graph.nodes.iter().find(|n| n.id == "d").unwrap();
+        assert!(d.content.contains("[[A]]"), "le wikilink [[B]] doit être redirigé vers [[A]] : {}", d.content);
+        assert!(!d.content.contains("[[B]]"));
+        assert!(load_tombstones(&dir).contains("b"), "b doit être tombstoné");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn link_est_idempotent_et_refuse_lauto_lien() {
+        let dir = setup("link");
+        add_node(&dir, "x", "root", "X", "");
+        add_node(&dir, "y", "root", "Y", "");
+        link_nodes_in(&dir, "x", "y", None).unwrap();
+        link_nodes_in(&dir, "y", "x", None).unwrap(); // même paire, sens inverse → no-op
+        let graph = load_graph(&dir);
+        assert_eq!(graph.edges.iter().filter(|e| e.kind == "link").count(), 1, "pas de doublon");
+        assert!(link_nodes_in(&dir, "x", "x", None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_accepte_update_move_merge_link() {
+        let dir = setup("dispatch_accept");
+        add_node(&dir, "n1", "root", "Note 1", "vieux contenu");
+        add_node(&dir, "n2", "root", "Note 2", "");
+        add_node(&dir, "n3", "root", "Note 3", "");
+
+        let mut p = blank_proposal("p-update", "update");
+        p.target_id = "n1".into(); p.content = "nouveau contenu".into();
+        propose_action(&dir, p);
+        resolve_proposal_in(&dir, "p-update", true).unwrap();
+        assert_eq!(load_graph(&dir).nodes.iter().find(|n| n.id == "n1").unwrap().content, "nouveau contenu");
+
+        let mut p = blank_proposal("p-move", "move");
+        p.target_id = "n2".into(); p.new_parent_id = "n1".into();
+        propose_action(&dir, p);
+        resolve_proposal_in(&dir, "p-move", true).unwrap();
+        assert_eq!(load_graph(&dir).nodes.iter().find(|n| n.id == "n2").unwrap().parent_id.as_deref(), Some("n1"));
+
+        let mut p = blank_proposal("p-link", "link");
+        p.target_id = "n1".into(); p.link_target = "n3".into();
+        propose_action(&dir, p);
+        resolve_proposal_in(&dir, "p-link", true).unwrap();
+        assert!(load_graph(&dir).edges.iter().any(|e| e.kind == "link" && (e.source == "n1" || e.target == "n1")));
+
+        let mut p = blank_proposal("p-merge", "merge");
+        p.merge_ids = vec!["n1".into(), "n3".into()];
+        propose_action(&dir, p);
+        resolve_proposal_in(&dir, "p-merge", true).unwrap();
+        assert!(!load_graph(&dir).nodes.iter().any(|n| n.id == "n3"));
+
+        assert!(load_proposals_in(&dir).is_empty(), "toutes les propositions doivent être consommées");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_refuse_est_un_simple_retrait_sans_mutation() {
+        let dir = setup("dispatch_reject");
+        add_node(&dir, "n1", "root", "Note 1", "contenu original");
+        let mut p = blank_proposal("p-update", "update");
+        p.target_id = "n1".into(); p.content = "ne doit jamais s'appliquer".into();
+        propose_action(&dir, p);
+        resolve_proposal_in(&dir, "p-update", false).unwrap();
+        assert_eq!(load_graph(&dir).nodes.iter().find(|n| n.id == "n1").unwrap().content, "contenu original");
+        assert!(load_proposals_in(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_all_traite_un_arbre_complet_en_un_seul_cycle() {
+        // Reproduit le cas remonté par Liam le 2026-07-21 : une arborescence
+        // (brain_add_tree) dépose plusieurs propositions "create" chaînées
+        // d'un coup — resolve_all_pending_in doit toutes les appliquer avec
+        // UNE seule lecture/écriture de brain.json (pas une par proposition).
+        let dir = setup("resolve_all_tree");
+        propose(&dir, "racine", "root", "Racine");
+        propose(&dir, "enfant-a", "racine", "Enfant A");
+        propose(&dir, "enfant-b", "racine", "Enfant B");
+        propose(&dir, "petit-enfant", "enfant-a", "Petit-enfant");
+
+        let snapshots_avant = std::fs::read_dir(dir.join("snapshots")).map(|d| d.count()).unwrap_or(0);
+        let resolved = resolve_all_pending_in(&dir).unwrap();
+        assert_eq!(resolved.len(), 4, "les 4 propositions doivent être résolues en un seul appel");
+
+        let ids = graph_ids(&dir);
+        for id in ["racine", "enfant-a", "enfant-b", "petit-enfant"] {
+            assert!(ids.contains(&id.to_string()), "{id} doit exister : {ids:?}");
+        }
+        assert!(load_proposals_in(&dir).is_empty());
+
+        let snapshots_apres = std::fs::read_dir(dir.join("snapshots")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(snapshots_apres, snapshots_avant + 1, "un seul snapshot pour tout le lot, pas un par proposition");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_all_laisse_en_attente_une_proposition_dont_la_cible_narrive_jamais() {
+        let dir = setup("resolve_all_stuck");
+        let mut p = blank_proposal("p-orphan", "update");
+        p.target_id = "n-inexistant".into(); p.content = "peu importe".into();
+        propose_action(&dir, p);
+        let resolved = resolve_all_pending_in(&dir).unwrap();
+        assert!(resolved.is_empty());
+        assert_eq!(load_proposals_in(&dir).len(), 1, "reste visible, pas supprimée en silence");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod space_anchor_tests {
+    use super::*;
+
+    fn setup(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("brainlink_test_anchor_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let graph = serde_json::json!({
+            "nodes": [{ "id": "root", "label": "Lucid", "kind": "root", "weight": 0,
+                        "summary": "", "keywords": [], "decisions": [], "patterns": [],
+                        "community": 0, "parent_id": null, "synthesized_at": null,
+                        "content": "", "connector": null, "source_id": null, "source_project": null }],
+            "edges": [], "markdown": "", "report": "", "generated_at": ""
+        });
+        std::fs::write(dir.join("brain.json"), graph.to_string()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn cree_une_ancre_et_lajoute_au_space() {
+        let dir = setup("create");
+        let mut space = Space { id: "s1".into(), name: "Perso".into(), node_ids: Some(vec![]), updated_at: None };
+        ensure_space_anchor(&dir, &mut space);
+        assert_eq!(space.node_ids.as_ref().unwrap(), &vec!["s1-vide".to_string()]);
+        let graph: BrainGraph = serde_json::from_str(&std::fs::read_to_string(dir.join("brain.json")).unwrap()).unwrap();
+        let anchor = graph.nodes.iter().find(|n| n.id == "s1-vide").expect("ancre absente de brain.json");
+        assert_eq!(anchor.label, "Perso vide");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idempotent_ne_duplique_pas_lancre() {
+        let dir = setup("idempotent");
+        let mut space = Space { id: "s1".into(), name: "Perso".into(), node_ids: Some(vec![]), updated_at: None };
+        ensure_space_anchor(&dir, &mut space);
+        ensure_space_anchor(&dir, &mut space);
+        assert_eq!(space.node_ids.as_ref().unwrap().len(), 1);
+        let graph: BrainGraph = serde_json::from_str(&std::fs::read_to_string(dir.join("brain.json")).unwrap()).unwrap();
+        assert_eq!(graph.nodes.iter().filter(|n| n.id == "s1-vide").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_backfille_un_space_existant_sans_ancre() {
+        let dir = setup("migration");
+        let space = Space { id: "old".into(), name: "Ancien space".into(), node_ids: Some(vec![]), updated_at: None };
+        save_spaces(&dir, &[space]);
+        ensure_all_space_anchors(&dir);
+        let spaces = load_spaces(&dir);
+        let s = spaces.iter().find(|s| s.id == "old").unwrap();
+        assert!(s.node_ids.as_ref().unwrap().contains(&"old-vide".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -1489,6 +2016,20 @@ mod import_tests {
         assert!(md.contains("tronqué"));
         assert!(!md.contains("| 250 |"));
     }
+
+    #[test]
+    fn xlsx_route_bien_vers_le_parseur_calamine() {
+        // Pas un vrai classeur : vérifie juste que .xlsx est routé vers
+        // xlsx_to_markdown (et pas "Format non supporté"), et que l'échec
+        // sur un fichier invalide reste un message honnête (ADR-0015).
+        let dir = std::env::temp_dir().join("lucid_test_xlsx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("faux.xlsx");
+        std::fs::write(&path, b"pas un classeur excel").unwrap();
+        let err = super::file_to_markdown(&path).unwrap_err();
+        assert!(err.contains("Excel"), "message d'erreur attendu, reçu : {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// CSV → tableau markdown. Délimiteur `,` ou `;` auto-détecté, 200 lignes max.
@@ -1512,6 +2053,33 @@ fn csv_to_markdown(raw: &str) -> String {
     md
 }
 
+/// Extraction .xlsx pure Rust (calamine) — même logique de parité que docx/pptx :
+/// pas de binaire externe, donc gratuit sur Windows. Une table markdown par feuille,
+/// 200 lignes max chacune.
+fn xlsx_to_markdown(p: &std::path::Path) -> Result<String, String> {
+    use calamine::{open_workbook_auto, Data, Reader};
+    let mut wb = open_workbook_auto(p).map_err(|e| format!("Classeur Excel illisible : {e}"))?;
+    let sheet_names = wb.sheet_names().to_owned();
+    let mut out = String::new();
+    for name in &sheet_names {
+        let Ok(range) = wb.worksheet_range(name) else { continue };
+        let mut rows = range.rows();
+        let Some(header) = rows.next() else { continue };
+        let cell = |c: &Data| c.to_string().trim().replace('|', "\\|");
+        let cells = |r: &[Data]| r.iter().map(cell).collect::<Vec<_>>().join(" | ");
+        out.push_str(&format!("## {name}\n\n"));
+        out.push_str(&format!("| {} |\n|{}\n", cells(header), " --- |".repeat(header.len())));
+        let mut truncated = false;
+        for (i, r) in rows.enumerate() {
+            if i >= 200 { truncated = true; break; }
+            out.push_str(&format!("| {} |\n", cells(r)));
+        }
+        if truncated { out.push_str("\n*… tronqué à 200 lignes.*\n"); }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Crée une arborescence de pages à partir d'une consigne en langage naturel
 /// (ex. « une structure pour gérer un projet web »). Gemma propose l'arbre en JSON,
 /// les nœuds sont créés en `kind: "note"` → préservés lors des régénérations.
@@ -1522,9 +2090,8 @@ async fn create_structure(instruction: String, parent_id: Option<String>, space_
     tauri::async_runtime::spawn_blocking(move || {
         let engine = LlamaEngine::detect()?;
         let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-        let raw = std::fs::read_to_string(dir.join("brain.json"))
+        let mut graph: BrainGraph = backup::load_brain_cached(&dir)
             .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
-        let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
 
         let parent = match parent_id {
             Some(p) if graph.nodes.iter().any(|n| n.id == p) => p,
@@ -1616,8 +2183,19 @@ concis) et \"children\" (liste de sous-pages, même format, 2 niveaux maximum, \
 #[tauri::command]
 fn set_node_parent(node_id: String, parent_id: String) -> Result<(), String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    set_node_parent_in(&dir, &node_id, &parent_id)
+}
+
+/// Variante injectable (dossier explicite) — réutilisée par l'acceptation d'une
+/// proposition MCP `move_node` (dispatch dans `resolve_proposal_in`).
+fn set_node_parent_in(dir: &std::path::Path, node_id: &str, parent_id: &str) -> Result<(), String> {
+    let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
+    set_node_parent_on(&mut graph, node_id, parent_id)?;
+    backup::write_brain(dir, &mut graph)
+}
+
+/// Mutation en mémoire seule — cf. `save_node_content_on`.
+fn set_node_parent_on(graph: &mut BrainGraph, node_id: &str, parent_id: &str) -> Result<(), String> {
     if node_id == parent_id {
         return Err("Un nœud ne peut pas être son propre parent.".into());
     }
@@ -1629,7 +2207,7 @@ fn set_node_parent(node_id: String, parent_id: String) -> Result<(), String> {
         let parent_of: std::collections::HashMap<&str, &str> = graph.nodes.iter()
             .filter_map(|n| n.parent_id.as_deref().map(|p| (n.id.as_str(), p)))
             .collect();
-        let mut cur = Some(parent_id.as_str());
+        let mut cur = Some(parent_id);
         while let Some(c) = cur {
             if c == node_id {
                 return Err("Déplacement impossible : créerait une boucle.".into());
@@ -1640,21 +2218,130 @@ fn set_node_parent(node_id: String, parent_id: String) -> Result<(), String> {
     let node = graph.nodes.iter_mut()
         .find(|n| n.id == node_id)
         .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
-    node.parent_id = Some(parent_id.clone());
+    node.parent_id = Some(parent_id.to_string());
     // Maintient les arêtes de contenance cohérentes (utilisées par le filtrage par space).
     graph.edges.retain(|e| !(e.target == node_id && e.kind == "contains"));
     graph.edges.push(BrainEdge {
-        source: parent_id, target: node_id, kind: "contains".into(), relation: "contains".into(),
+        source: parent_id.to_string(), target: node_id.to_string(), kind: "contains".into(), relation: "contains".into(),
     });
-    backup::write_brain(&dir, &mut graph)
+    Ok(())
+}
+
+/// Ajoute un pont conceptuel entre deux nœuds existants (arête `link`, distincte
+/// de l'arbre `contains`). Idempotent : pas de doublon si le lien existe déjà
+/// dans un sens ou l'autre. Réutilisée par l'acceptation d'une proposition MCP
+/// `link_nodes`.
+fn link_nodes_in(dir: &std::path::Path, a: &str, b: &str, relation: Option<String>) -> Result<(), String> {
+    let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
+    link_nodes_on(&mut graph, a, b, relation)?;
+    backup::write_brain(dir, &mut graph)
+}
+
+/// Mutation en mémoire seule — cf. `save_node_content_on`.
+fn link_nodes_on(graph: &mut BrainGraph, a: &str, b: &str, relation: Option<String>) -> Result<(), String> {
+    if a == b {
+        return Err("Un nœud ne peut pas être lié à lui-même.".into());
+    }
+    if !graph.nodes.iter().any(|n| n.id == a) { return Err(format!("Nœud {a} introuvable.")); }
+    if !graph.nodes.iter().any(|n| n.id == b) { return Err(format!("Nœud {b} introuvable.")); }
+    let already = graph.edges.iter().any(|e| e.kind == "link"
+        && ((e.source == a && e.target == b) || (e.source == b && e.target == a)));
+    if already { return Ok(()); }
+    graph.edges.push(BrainEdge {
+        source: a.to_string(), target: b.to_string(), kind: "link".into(),
+        relation: relation.unwrap_or_else(|| "bridge".into()),
+    });
+    Ok(())
+}
+
+/// Fusionne 2+ nœuds en un seul (le premier id de `ids` survit) : reparente les
+/// enfants des autres vers le survivant, redirige les arêtes (contains/link) et
+/// les `[[wikilinks]]` textuels (résolus par label, cf. `src/App.tsx`), concatène
+/// le contenu, tombstone les fusionnés (comme `delete_node`). Réutilisée par
+/// l'acceptation d'une proposition MCP `merge_nodes`.
+fn merge_nodes_in(dir: &std::path::Path, ids: &[String], label: Option<String>) -> Result<BrainNode, String> {
+    save_snapshot_in(dir, "mcp_merge");
+    let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
+    let result = merge_nodes_on(&mut graph, ids, label)?;
+    add_tombstones(dir, &ids[1..].iter().cloned().collect());
+    backup::write_brain(dir, &mut graph)?;
+    let existing: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+    purge_dead_space_ids(dir, &existing);
+    Ok(result)
+}
+
+/// Mutation en mémoire seule — cf. `save_node_content_on`. Ne gère PAS le
+/// snapshot/tombstone/purge des spaces (dépendants du disque) : à charge de
+/// l'appelant (`merge_nodes_in` pour un accept isolé, `resolve_all_pending_in`
+/// pour un accept par lot).
+fn merge_nodes_on(graph: &mut BrainGraph, ids: &[String], label: Option<String>) -> Result<BrainNode, String> {
+    if ids.len() < 2 {
+        return Err("merge_nodes demande au moins 2 ids.".into());
+    }
+    for id in ids {
+        let node = graph.nodes.iter().find(|n| &n.id == id)
+            .ok_or_else(|| format!("Nœud {id} introuvable."))?;
+        if node.kind == "root" { return Err("La racine ne peut pas être fusionnée.".into()); }
+    }
+    let survivor_id = ids[0].clone();
+    let merged_ids: std::collections::HashSet<String> = ids[1..].iter().cloned().collect();
+
+    let bodies: Vec<String> = ids.iter()
+        .filter_map(|id| graph.nodes.iter().find(|n| &n.id == id))
+        .map(|n| if n.content.is_empty() { n.source_text.clone() } else { n.content.clone() })
+        .filter(|c| !c.is_empty())
+        .collect();
+    let merged_content = bodies.join("\n\n---\n\n");
+    let old_labels: Vec<String> = ids[1..].iter()
+        .filter_map(|id| graph.nodes.iter().find(|n| &n.id == id))
+        .map(|n| n.label.clone())
+        .collect();
+    let final_label = label.clone().unwrap_or_else(|| {
+        graph.nodes.iter().find(|n| n.id == survivor_id).map(|n| n.label.clone()).unwrap_or_default()
+    });
+
+    // Reparente les enfants des fusionnés vers le survivant.
+    for n in graph.nodes.iter_mut() {
+        if let Some(p) = &n.parent_id {
+            if merged_ids.contains(p) { n.parent_id = Some(survivor_id.clone()); }
+        }
+    }
+    // Redirige toute arête (contains ou link) qui référence un nœud fusionné.
+    for e in graph.edges.iter_mut() {
+        if merged_ids.contains(&e.source) { e.source = survivor_id.clone(); }
+        if merged_ids.contains(&e.target) { e.target = survivor_id.clone(); }
+    }
+    graph.edges.retain(|e| e.source != e.target); // pas d'auto-boucle après redirection
+    // Dédoublonne (deux fusionnés pouvaient pointer vers la même cible).
+    let mut seen = std::collections::HashSet::new();
+    graph.edges.retain(|e| seen.insert((e.source.clone(), e.target.clone(), e.kind.clone())));
+
+    // Redirige les [[wikilinks]] textuels (résolution par LABEL, jamais par id,
+    // cf. src/App.tsx:graphWithGhosts) dans le contenu des nœuds restants.
+    for old_label in &old_labels {
+        if old_label == &final_label { continue; }
+        let needle = format!("[[{old_label}]]");
+        let replacement = format!("[[{final_label}]]");
+        for n in graph.nodes.iter_mut() {
+            if !merged_ids.contains(&n.id) && n.content.contains(&needle) {
+                n.content = n.content.replace(&needle, &replacement);
+            }
+        }
+    }
+
+    graph.nodes.retain(|n| !merged_ids.contains(&n.id));
+    let survivor = graph.nodes.iter_mut().find(|n| n.id == survivor_id)
+        .ok_or("Nœud survivant introuvable après fusion.")?;
+    survivor.content = merged_content;
+    survivor.label = final_label;
+    Ok(survivor.clone())
 }
 
 /// Renomme un nœud (change son `label`). Persisté dans brain.json.
 #[tauri::command]
 fn rename_node(node_id: String, label: String) -> Result<(), String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = backup::load_brain_cached(&dir)?;
     let node = graph.nodes.iter_mut()
         .find(|n| n.id == node_id)
         .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
@@ -1708,31 +2395,22 @@ mod tombstone_tests {
 #[tauri::command]
 fn delete_node(node_id: String) -> Result<usize, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut graph: BrainGraph = backup::load_brain_cached(&dir)?;
     let node = graph.nodes.iter().find(|n| n.id == node_id)
         .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
     if node.kind == "root" { return Err("La racine ne peut pas être supprimée.".into()); }
 
     let doomed: std::collections::HashSet<String> =
         subtree_ids(&dir, &node_id).into_iter().collect();
-    save_snapshot_in(&dir); // destructif → filet (restaurable via les snapshots)
+    save_snapshot_in(&dir, "delete_node"); // destructif → filet (restaurable via les snapshots)
     add_tombstones(&dir, &doomed); // la suppression survivra aux régénérations
     graph.nodes.retain(|n| !doomed.contains(&n.id));
     graph.edges.retain(|e| !doomed.contains(&e.source) && !doomed.contains(&e.target));
     backup::write_brain(&dir, &mut graph)?;
 
     // Les spaces ne doivent pas garder d'ids morts.
-    let mut spaces = load_spaces(&dir);
-    let mut touched = false;
-    for s in spaces.iter_mut() {
-        if let Some(ids) = s.node_ids.as_mut() {
-            let before = ids.len();
-            ids.retain(|id| !doomed.contains(id));
-            touched |= ids.len() != before;
-        }
-    }
-    if touched { save_spaces(&dir, &spaces); }
+    let existing: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+    purge_dead_space_ids(&dir, &existing);
     Ok(doomed.len())
 }
 
@@ -1744,8 +2422,7 @@ async fn synthesize_node(node_id: String) -> Result<BrainNode, String> {
         let engine = LlamaEngine::detect()?;
         let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
 
-        let raw_graph = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-        let mut graph: BrainGraph = serde_json::from_str(&raw_graph).map_err(|e| e.to_string())?;
+        let mut graph: BrainGraph = backup::load_brain_cached(&dir)?;
 
         let node_idx = graph.nodes.iter().position(|n| n.id == node_id)
             .ok_or_else(|| format!("Nœud {node_id} introuvable."))?;
@@ -1844,9 +2521,14 @@ struct SnapshotInfo {
     id: String,
     created_at: u64,
     node_count: usize,
+    /// Origine du snapshot ("mcp_accept", "delete_node", "pre_restore",
+    /// "regenerate", "manual" pour les anciens fichiers sans suffixe).
+    reason: String,
 }
 
-fn save_snapshot_in(dir: &std::path::Path) {
+/// `reason` identifie l'origine (ex. "mcp_accept") — sert au panneau Historique
+/// à retrouver « la dernière action de l'Archiviste » sans mécanisme dédié.
+fn save_snapshot_in(dir: &std::path::Path, reason: &str) {
     let brain_path = dir.join("brain.json");
     if !brain_path.exists() { return; }
     let snap_dir = dir.join("snapshots");
@@ -1855,7 +2537,7 @@ fn save_snapshot_in(dir: &std::path::Path) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let _ = std::fs::copy(&brain_path, snap_dir.join(format!("brain_{ts}.json")));
+    let _ = std::fs::copy(&brain_path, snap_dir.join(format!("brain_{ts}_{reason}.json")));
     // Garder les 10 derniers
     if let Ok(entries) = std::fs::read_dir(&snap_dir) {
         let mut files: Vec<_> = entries.flatten()
@@ -1877,12 +2559,17 @@ fn list_snapshots() -> Vec<SnapshotInfo> {
             let name = e.file_name();
             let s = name.to_string_lossy();
             if !s.starts_with("brain_") || !s.ends_with(".json") { return None; }
-            let ts_str = s.strip_prefix("brain_")?.strip_suffix(".json")?;
+            let stem = s.strip_prefix("brain_")?.strip_suffix(".json")?;
+            // Anciens snapshots : "brain_<ts>.json" (pas de raison) → "manual".
+            let (ts_str, reason) = match stem.split_once('_') {
+                Some((ts, reason)) => (ts, reason.to_string()),
+                None => (stem, "manual".to_string()),
+            };
             let created_at: u64 = ts_str.parse().ok()?;
             let node_count = std::fs::read_to_string(e.path()).ok()
                 .and_then(|r| serde_json::from_str::<BrainGraph>(&r).ok())
                 .map(|g| g.nodes.len()).unwrap_or(0);
-            Some(SnapshotInfo { id: format!("brain_{ts_str}"), created_at, node_count })
+            Some(SnapshotInfo { id: format!("brain_{stem}"), created_at, node_count, reason })
         })
         .collect();
     infos.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1893,13 +2580,18 @@ fn list_snapshots() -> Vec<SnapshotInfo> {
 fn restore_snapshot(snapshot_id: String) -> Result<BrainGraph, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
     let src = dir.join("snapshots").join(format!("{snapshot_id}.json"));
-    save_snapshot_in(&dir); // snapshot de l'état actuel avant restauration
+    save_snapshot_in(&dir, "pre_restore"); // snapshot de l'état actuel avant restauration
     let raw = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
     let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     // write_brain (et pas une copie brute) : les nœuds qui changent par rapport à
     // l'état courant sont ré-estampillés, sinon la sync « annulerait » la restauration
     // en re-fusionnant l'état cloud plus récent par-dessus.
     backup::write_brain(&dir, &mut graph)?;
+    // Un nœud créé après ce snapshot (ex. une note acceptée via MCP) peut encore
+    // vivre dans un space : sans purge, le space affiche un nombre de nœuds sans
+    // rien de visible sur le canvas (ids fantômes — bug remonté par Liam le 2026-07-21).
+    let existing: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+    purge_dead_space_ids(&dir, &existing);
     Ok(graph)
 }
 
@@ -1914,6 +2606,22 @@ struct Space {
     /// sert à la fusion de la sync cloud (le plus récent gagne).
     #[serde(default)]
     updated_at: Option<u64>,
+}
+
+/// Retire des spaces tout id absent de `existing_ids` — sinon un space affiche un
+/// nombre de nœuds sans rien de visible (ids fantômes après suppression/restauration/
+/// régénération). Utilisé par `delete_node`, `restore_snapshot` et la régénération.
+fn purge_dead_space_ids(dir: &std::path::Path, existing_ids: &std::collections::HashSet<String>) {
+    let mut spaces = load_spaces(dir);
+    let mut touched = false;
+    for s in spaces.iter_mut() {
+        if let Some(ids) = s.node_ids.as_mut() {
+            let before = ids.len();
+            ids.retain(|id| existing_ids.contains(id));
+            touched |= ids.len() != before;
+        }
+    }
+    if touched { save_spaces(dir, &spaces); }
 }
 
 fn load_spaces(dir: &std::path::Path) -> Vec<Space> {
@@ -1955,6 +2663,43 @@ fn list_spaces() -> Vec<Space> {
     spaces
 }
 
+/// Nœud d'ancrage d'un space : point d'attache stable, jamais vide, jamais
+/// dépendant du contenu réel du space. Sert de `parent_id` toujours valide pour
+/// une proposition MCP — y compris quand un space PUBLIÉ est un instantané figé
+/// (voir `supabase/functions/lucid-mcp`) qui référence des ids depuis disparus
+/// du cerveau local (bug remonté par Liam le 2026-07-21 : proposition MCP visant
+/// un id du space publié introuvable en local → acceptation impossible).
+/// Idempotent : ne recrée rien si l'ancre existe déjà.
+fn ensure_space_anchor(dir: &std::path::Path, space: &mut Space) {
+    let anchor_id = format!("{}-vide", space.id);
+    let already_member = space.node_ids.as_ref().is_some_and(|ids| ids.contains(&anchor_id));
+    let Ok(graph) = backup::load_brain_cached(dir) else { return };
+    let node_exists = graph.nodes.iter().any(|n| n.id == anchor_id);
+    if already_member && node_exists { return; }
+    if !node_exists {
+        let Some(root_id) = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone()) else { return };
+        let label = format!("{} vide", space.name);
+        let content = format!(
+            "Page d'ancrage de l'espace « {} » — sert de parent stable pour les propositions \
+             MCP même si l'espace ne contient encore aucune autre page, ou si un space publié \
+             pointe vers un instantané périmé. Ne la supprime pas.",
+            space.name
+        );
+        let _ = insert_note_node_in(dir, anchor_id.clone(), root_id, label, content, None);
+    }
+    let ids = space.node_ids.get_or_insert_with(Vec::new);
+    if !ids.contains(&anchor_id) { ids.push(anchor_id); }
+}
+
+/// Migration au démarrage : les spaces créés avant l'ajout du nœud d'ancrage
+/// (ci-dessus) n'en ont pas encore — on la backfille une fois, silencieusement.
+fn ensure_all_space_anchors(dir: &std::path::Path) {
+    let mut spaces = load_spaces(dir);
+    let before = spaces.clone();
+    for s in spaces.iter_mut() { ensure_space_anchor(dir, s); }
+    if spaces != before { save_spaces(dir, &spaces); }
+}
+
 #[tauri::command]
 fn create_space(name: String) -> Result<Space, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
@@ -1962,7 +2707,8 @@ fn create_space(name: String) -> Result<Space, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let space = Space { id: format!("space_{ts}"), name, node_ids: Some(vec![]), updated_at: None };
+    let mut space = Space { id: format!("space_{ts}"), name, node_ids: Some(vec![]), updated_at: None };
+    ensure_space_anchor(&dir, &mut space);
     let mut spaces = load_spaces(&dir);
     spaces.push(space.clone());
     save_spaces(&dir, &spaces);
@@ -2032,8 +2778,7 @@ fn remove_node_from_space(space_id: String, node_id: String) -> Result<(), Strin
 /// Ids du sous-arbre de `node_id` (lui inclus) d'après brain.json.
 /// brain.json illisible → juste le nœud (dégradé, pas d'échec).
 fn subtree_ids(dir: &std::path::Path, node_id: &str) -> Vec<String> {
-    let graph: Option<BrainGraph> = std::fs::read_to_string(dir.join("brain.json")).ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let graph: Option<BrainGraph> = backup::load_brain_cached(dir).ok();
     let Some(graph) = graph else { return vec![node_id.to_string()]; };
     let mut kids: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for n in &graph.nodes {
@@ -2055,8 +2800,7 @@ fn subtree_ids(dir: &std::path::Path, node_id: &str) -> Vec<String> {
 #[tauri::command]
 fn export_space_md(space_id: String) -> Result<String, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let graph: BrainGraph = backup::load_brain_cached(&dir)?;
 
     let (space_name, node_ids): (String, Option<Vec<String>>) = if space_id == "lucid" {
         ("Lucid".into(), None)
@@ -2144,7 +2888,7 @@ Connecte une vraie source (voir [[Connecter tes sources]]) — ce contenu d'exem
         demo_leaf("demo-sources", "demo-guide", "Connecter tes sources",
 "# Connecter tes sources
 
-Lucid agrège tes outils en un seul cerveau : **Claude Code**, **Notion**, **Google Drive**, **Obsidian**…
+Lucid agrège tes outils en un seul cerveau : **Claude Code**, **Google Drive**, **Obsidian**…
 
 1. Ouvre les Paramètres → Sources.
 2. Connecte une source et lance un Sync.
@@ -2409,6 +3153,36 @@ mod active_user_tests {
     }
 }
 
+// ── Archiviste : autonome par défaut, validation manuelle en option ──────────
+// Fichier-drapeau (comme la télémétrie) mais sémantique inversée : absent =
+// autonome (aucun fichier à créer à l'installation, autonomie gratuite par
+// défaut) ; présent = chaque écriture repasse par les bulles fantômes.
+
+fn mcp_manual_validation_flag() -> Option<std::path::PathBuf> {
+    ai::llama::app_data_dir().map(|d| d.join("mcp_manual_validation"))
+}
+
+#[tauri::command]
+fn mcp_manual_validation_enabled() -> bool {
+    mcp_manual_validation_flag().map(|p| p.exists()).unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_mcp_manual_validation(enabled: bool) -> Result<(), String> {
+    let p = mcp_manual_validation_flag().ok_or("Dossier de données introuvable.")?;
+    if enabled {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&p, "").map_err(|e| e.to_string())
+    } else {
+        match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
+}
+
 // ── Crash reporting (Sentry) — opt-in strict ─────────────────────────────────
 // Promesse produit « 100 % local » : sans le flag de consentement ET un DSN,
 // Sentry n'est jamais initialisé → zéro connexion sortante.
@@ -2654,11 +3428,13 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
 
         if let Some(dir) = ai::llama::app_data_dir() {
             let _ = std::fs::create_dir_all(&dir);
-            save_snapshot_in(&dir); // snapshot avant écrasement
+            save_snapshot_in(&dir, "regenerate"); // snapshot avant écrasement
             let _ = std::fs::write(dir.join("brain.md"), &graph.markdown);
             let _ = std::fs::write(dir.join("brain_report.md"), &graph.report);
             let mut stamped = graph.clone();
             let _ = backup::write_brain(&dir, &mut stamped);
+            let existing: std::collections::HashSet<String> = stamped.nodes.iter().map(|n| n.id.clone()).collect();
+            purge_dead_space_ids(&dir, &existing);
         }
         Ok(graph)
     }
@@ -2682,31 +3458,84 @@ fn obsidian_disconnect() {
     connectors::obsidian::disconnect();
 }
 
-/// Configure le dossier local à indexer.
+/// Détecte le vault Obsidian le plus récent (lit la config d'Obsidian
+/// lui-même) et le connecte automatiquement. Renvoie le chemin connecté,
+/// `None` si Obsidian n'a jamais tourné sur cette machine.
 #[tauri::command]
-fn local_folder_set(path: String) -> Result<(), String> {
-    connectors::local_folder::set_folder(&path)
+fn obsidian_auto_connect() -> Option<String> {
+    connectors::obsidian::auto_connect()
 }
 
-/// Renvoie le chemin du dossier local configuré (None si pas encore configuré).
+/// Première connexion : synchronise les notes Apple (déclenche le prompt
+/// d'autorisation macOS au premier appel) et marque comme connecté. Renvoie
+/// le nombre de notes importées. Mac uniquement.
 #[tauri::command]
-fn local_folder_path() -> Option<String> {
-    connectors::local_folder::folder_path()
+async fn apple_notes_connect() -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(connectors::apple_notes::connect)
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
-/// Déconnecte le dossier local (supprime config + cache).
+/// Resynchronise les notes Apple (réécrit le cache en entier).
+#[tauri::command]
+async fn apple_notes_sync() -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(connectors::apple_notes::sync)
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Déconnecte les notes Apple (supprime config + cache).
+#[tauri::command]
+fn apple_notes_disconnect() {
+    connectors::apple_notes::disconnect();
+}
+
+/// Première connexion : ajoute automatiquement Bureau/Documents/Téléchargements
+/// (ceux qui existent). Idempotent si déjà connecté. Renvoie la liste des dossiers.
+#[tauri::command]
+fn local_folder_connect() -> Result<Vec<String>, String> {
+    connectors::local_folder::connect()
+}
+
+/// Renvoie les dossiers actuellement configurés (vide si pas encore connecté).
+#[tauri::command]
+fn local_folder_list() -> Vec<String> {
+    connectors::local_folder::folders()
+}
+
+/// Ajoute un dossier supplémentaire à indexer. Renvoie la liste à jour.
+#[tauri::command]
+fn local_folder_add(path: String) -> Result<Vec<String>, String> {
+    connectors::local_folder::add_folder(&path)
+}
+
+/// Retire un dossier de la liste (le disque n'est pas touché). Renvoie la liste à jour.
+#[tauri::command]
+fn local_folder_remove(path: String) -> Result<Vec<String>, String> {
+    connectors::local_folder::remove_folder(&path)
+}
+
+/// Déconnecte tous les dossiers locaux (supprime config + cache).
 #[tauri::command]
 fn local_folder_disconnect() {
     connectors::local_folder::disconnect();
 }
 
-/// Synchronise le dossier local (extraction incrémentale). L'extraction PDF/OCR
-/// peut être longue → thread bloquant, pas le thread UI.
+/// Synchronise tous les dossiers locaux configurés (extraction incrémentale).
+/// Émet `local-folder-progress` (current/total/label) fichier par fichier —
+/// affiché en direct à l'onboarding pendant le scan. L'extraction PDF/OCR peut
+/// être longue → thread bloquant, pas le thread UI.
 #[tauri::command]
-async fn local_folder_sync() -> Result<connectors::local_folder::SyncReport, String> {
-    tauri::async_runtime::spawn_blocking(connectors::local_folder::sync)
-        .await
-        .map_err(|e| format!("Tâche de sync interrompue : {e}"))?
+async fn local_folder_sync(app: tauri::AppHandle) -> Result<connectors::local_folder::SyncReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        connectors::local_folder::sync(|current, total, label| {
+            let _ = app.emit("local-folder-progress", serde_json::json!({
+                "current": current, "total": total, "label": label,
+            }));
+        })
+    })
+    .await
+    .map_err(|e| format!("Tâche de sync interrompue : {e}"))?
 }
 
 /// Charge les variables depuis `.env.local` / `.env` (CWD et dossiers parents).
@@ -2782,6 +3611,10 @@ fn start_data_watcher(app: tauri::AppHandle) {
     });
 }
 
+/// Epoch (secondes) de la dernière régénération auto — borne la fréquence
+/// ci-dessous, indépendamment du nombre de rafales détectées par le watcher.
+static LAST_AUTO_REGEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn start_watcher(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         use notify::Watcher;
@@ -2813,12 +3646,53 @@ fn start_watcher(app: tauri::AppHandle) {
             if connectors::claude_code::projects_dir().is_none() { continue; }
             let Some(data) = ai::llama::app_data_dir() else { continue; };
             if !data.join("brain.json").exists() || data.join("demo.flag").exists() { continue; }
+            // Garde-fou : une session Claude Code active (y compris CETTE conversation,
+            // qui écrit dans ~/.claude/projects/) peut redéclencher le watcher toutes les
+            // quelques secondes — sans ce plafond, chaque accalmie de 3s relance une
+            // régénération complète (~50 Mo réécrits à chaque fois). Bug remonté par
+            // Liam le 2026-07-21 (app ralentie, 7 régénérations en 4 min).
+            const AUTO_REGEN_COOLDOWN_SECS: u64 = 300;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let last = LAST_AUTO_REGEN.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) < AUTO_REGEN_COOLDOWN_SECS { continue; }
             // Une génération manuelle tourne → skip, le prochain event relancera.
             let Ok(_gen) = GEN_LOCK.try_lock() else { continue; };
+            LAST_AUTO_REGEN.store(now, std::sync::atomic::Ordering::Relaxed);
             match run_generation(&app) {
                 Ok(_) => { let _ = app.emit("brain-updated", ()); }
                 Err(e) => crate::elog!("⚠️ watch auto : régénération échouée : {e}"),
             }
+        }
+    });
+}
+
+/// Watch `mcp_pending/` : prévient le front dès qu'une proposition MCP locale
+/// apparaît/disparaît, via un évènement Tauri — au lieu de sonder à l'aveugle
+/// toutes les 2s (coût continu pour rien, remonté par Liam le 2026-07-21).
+fn start_mcp_pending_watcher(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use notify::Watcher;
+        let dir = loop {
+            if let Some(d) = ai::llama::app_data_dir() { break d; }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        };
+        let pending_dir = mcp_pending_dir(&dir);
+        if std::fs::create_dir_all(&pending_dir).is_err() { return; }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if res.is_ok() { let _ = tx.send(()); }
+        }) {
+            Ok(w) => w,
+            Err(e) => { crate::elog!("⚠️ watch mcp_pending indisponible : {e}"); return; }
+        };
+        if let Err(e) = watcher.watch(&pending_dir, notify::RecursiveMode::NonRecursive) {
+            crate::elog!("⚠️ watch mcp_pending indisponible : {e}");
+            return;
+        }
+        while rx.recv().is_ok() {
+            // Léger débounce : une acceptation écrit/supprime plusieurs fichiers d'affilée.
+            while rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok() {}
+            let _ = app.emit("mcp-proposal-changed", ());
         }
     });
 }
@@ -2858,9 +3732,14 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            if let Some(dir) = ai::llama::app_data_dir() {
+                ensure_all_space_anchors(&dir);
+            }
             start_watcher(app.handle().clone());
             start_data_watcher(app.handle().clone());
+            start_mcp_pending_watcher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2877,10 +3756,6 @@ pub fn run() {
             google_drive_connect,
             google_drive_sync,
             google_drive_disconnect,
-            notion_connect,
-            notion_sync,
-            notion_disconnect,
-            notion_load_page,
             ask_brain,
             ask_node,
             generate_content,
@@ -2900,12 +3775,10 @@ pub fn run() {
             import_file,
             list_mcp_proposals,
             resolve_mcp_proposal,
+            resolve_all_mcp_proposals,
             import_mcp_proposal,
             import_shared_space,
             save_pasted_image,
-            ai_clients_status,
-            connect_ai_client,
-            disconnect_ai_client,
             export_backup,
             import_backup,
             merge_backup,
@@ -2916,9 +3789,15 @@ pub fn run() {
             obsidian_set_vault,
             obsidian_vault_path,
             obsidian_disconnect,
+            obsidian_auto_connect,
+            apple_notes_connect,
+            apple_notes_sync,
+            apple_notes_disconnect,
             import_chatgpt,
-            local_folder_set,
-            local_folder_path,
+            local_folder_connect,
+            local_folder_list,
+            local_folder_add,
+            local_folder_remove,
             local_folder_disconnect,
             local_folder_sync,
             list_snapshots,
@@ -2936,6 +3815,8 @@ pub fn run() {
             reset_demo,
             reset_environment,
             set_active_user,
+            mcp_manual_validation_enabled,
+            set_mcp_manual_validation,
             telemetry_enabled,
             set_telemetry,
             sentry_active,

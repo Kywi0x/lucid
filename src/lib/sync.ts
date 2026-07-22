@@ -15,6 +15,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { supabase, BACKUP_BUCKET } from "./supabase";
 import { exportBackup, mergeBackup, syncFingerprint } from "./api";
+import { ensurePersonalMcpSpace } from "./share";
 
 export const SYNC_FILE = "sync.zip";
 
@@ -76,6 +77,11 @@ async function push(id: string): Promise<void> {
   // Préviens les autres machines connectées : elles tirent tout de suite au
   // lieu d'attendre leur tick (simple ping, aucune donnée ne transite ici).
   void channel?.send({ type: "broadcast", event: "pushed", payload: {} });
+  // Le space "MCP personnel" (tout le cerveau, pour Claude Desktop/Code locaux
+  // ET claude.ai distant — même serveur, mêmes fonctionnalités) suit la même
+  // cadence que le reste de la sync cloud. Best-effort : ne doit jamais faire
+  // échouer la sync elle-même (ex. migration SQL pas encore appliquée).
+  void ensurePersonalMcpSpace().catch((e) => console.warn("mcp personnel:", e));
 }
 
 /** Tire le cloud et le FUSIONNE dans le local (nœud le plus récent gagne, rien

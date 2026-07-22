@@ -16,7 +16,6 @@ import { Properties } from "./Properties";
 import { parseFrontmatter, serializeFrontmatter, type Prop } from "@/lib/frontmatter";
 import claudeLogo from "@/assets/claude-logo.png";
 import driveLogo  from "@/assets/google_drive.svg.png";
-import notionLogo from "@/assets/Notion_app_logo.png";
 
 interface Props {
   node: BrainNode;
@@ -43,12 +42,10 @@ export const KIND_LABEL = {
 const CONNECTOR_LOGO: Record<string, string> = {
   "claude-code":  claudeLogo,
   "google-drive": driveLogo,
-  "notion":       notionLogo,
 };
 const CONNECTOR_LABEL: Record<string, string> = {
   "claude-code":  "Claude Code",
   "google-drive": "Google Drive",
-  "notion":       "Notion",
 };
 
 function ConnectorLogo({ connector }: { connector: string }) {
@@ -275,13 +272,12 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
   const aiOk = useAiReady();
 
   // « Ouvrir l'original » : le markdown est la version cerveau, l'original
-  // (Slides, PowerPoint, PDF, page Notion…) reste à un clic pour la mise en forme.
+  // (Slides, PowerPoint, PDF…) reste à un clic pour la mise en forme.
   const openOriginal = useMemo(() => {
     const sid = node.source_id;
     if (!sid) return null;
     switch (node.connector) {
       case "google-drive": return () => openUrl(`https://drive.google.com/open?id=${sid}`);
-      case "notion":       return () => openUrl(`https://www.notion.so/${sid.replace(/-/g, "")}`);
       case "local-file":   return () => openPath(sid).catch(() => openUrl(`file://${sid}`));
       default: return null;
     }
@@ -376,7 +372,7 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
   const [body, setBody] = useState(() => parseFrontmatter(node.content ?? "").body);
   useEffect(() => {
     // `node.content` vaut "" (jamais null) côté Rust : `||` pour que le texte
-    // source (PDF/Notion chargé via loadNodeContent) s'affiche quand rien n'est édité.
+    // source (PDF chargé via loadNodeContent) s'affiche quand rien n'est édité.
     const { props: p, body: b } = parseFrontmatter(localContent ?? (node.content || sourceText || ""));
     setProps(p);
     setBody(b);

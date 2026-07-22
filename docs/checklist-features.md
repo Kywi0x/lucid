@@ -32,9 +32,8 @@
 - [ ] **ChatGPT** : import de l'export
 - [ ] **Google Drive** : saisie credentials OAuth, connexion, sync, déconnexion
 - [ ] Google Drive Windows : les PDF sont bien synchronisés (régression connue à surveiller)
-- [ ] **Notion** : connexion, sync, chargement de pages, déconnexion
 - [ ] **Obsidian** : choix du vault, déconnexion
-- [ ] **Dossier local** : choix du dossier, sync, déconnexion
+- [ ] **Dossiers locaux** : connexion auto-détecte Bureau/Documents/Téléchargements, ajout/retrait de dossiers, sync, déconnexion, extraction .xlsx
 - [ ] Statut des connecteurs correct dans Réglages → Connecteurs
 - [ ] **Clients IA externes** : statut / connexion / déconnexion
 
