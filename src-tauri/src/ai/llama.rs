@@ -4,8 +4,10 @@
 //! premier lancement, puis mis en cache localement. Les URLs viennent du catalogue
 //! officiel → jamais de 404/401 par URL hardcodée.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const APP_DIR: &str = "com.lucidflow.lucid";
 /// Ancien identifiant (avant le 2026-07-20) — un `rename` best-effort au premier
@@ -263,6 +265,38 @@ pub fn quiet_command(bin: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
+/// Comme `quiet_command`, mais en plus à priorité CPU réduite pour LE PROCESS
+/// D'INFÉRENCE spécifiquement — un passage de l'Archiviste peut enchaîner des
+/// dizaines d'appels Gemma d'affilée (arbitrage de doublons + clustering
+/// sémantique), plusieurs minutes en tout ; sans ça, ce calcul intensif affame
+/// les autres threads de l'app — dont le rendu du canvas, qui se met à ramer/
+/// geler pendant que "L'archiviste travaille…" (retour de Liam le 2026-07-23).
+/// `nice` (POSIX, toujours présent) sur Mac/Linux. Pas d'équivalent simple sans
+/// dépendance sur Windows — dégradé gracieusement là-bas (parité : jamais un
+/// échec silencieux, juste un peu plus de contention, jamais pire qu'avant).
+fn low_priority_command(bin: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        quiet_command(bin)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = Command::new("nice");
+        cmd.arg("-n").arg("15").arg(bin);
+        cmd
+    }
+}
+
+/// Nombre de threads passés à `llama-completion` (`-t`) : tous les cœurs sauf 2,
+/// jamais moins de 1 — sans ça le binaire prend par défaut TOUS les cœurs et
+/// n'en laisse aucun de libre pour le rendu du canvas (BrainMap) pendant qu'une
+/// passe de l'Archiviste enchaîne des dizaines d'appels Gemma d'affilée. Vient
+/// compléter `low_priority_command` (nice) : nice abaisse la priorité, ça ne
+/// réduit pas le nombre de cœurs occupés.
+fn worker_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(1)
+}
+
 fn total_ram_gb() -> f32 {
     // La RAM ne change pas en cours de route : une seule lecture (le spawn
     // powershell sous Windows coûte ~1-2 s, inacceptable à chaque list_models).
@@ -435,6 +469,127 @@ pub fn install_from_path(app: &tauri::AppHandle, src: &std::path::Path) -> Resul
     std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())
 }
 
+// ── Serveur d'inférence persistant ────────────────────────────────────────────
+//
+// Chaque appel `complete()` lançait jusqu'ici un process `llama-completion`
+// neuf, qui recharge le modèle entier (~2-4 Go, upload GPU Metal compris) à
+// chaque fois. Sans conséquence pour un appel isolé (chat), mais l'Archiviste
+// enchaîne des dizaines/centaines d'appels d'affilée : autant de rechargements
+// complets redondants, à l'origine du rythme "pause/freeze" observé côté
+// canvas ET de la surchauffe remontée par Liam le 2026-07-24 (M4 Pro : `-ngl
+// 99` décharge sur le GPU Metal, partagé avec le rendu du canvas — `nice`/`-t`
+// ne changent rien à CETTE contention-là). `llama-server` (mode HTTP du même
+// llama.cpp) charge le modèle UNE fois et le garde en mémoire : on le démarre
+// paresseusement au premier appel, on le réutilise pour tous les suivants.
+//
+// Dégradation : si `llama-server` n'est pas présent à côté de
+// `llama-completion` (pas encore bundlé/buildé) ou s'il échoue à démarrer,
+// `complete()` retombe silencieusement sur l'ancien mode one-shot — jamais un
+// échec dur, cf. [[feedback_parite_windows]] (jamais d'échec silencieux total,
+// juste moins performant qu'avec le serveur).
+const SERVER_PORT: u16 = 8721; // ponytail: port fixe, un seul serveur pour toute l'app — pas de découverte dynamique tant qu'un seul modèle actif à la fois suffit.
+const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ServerProc {
+    child: std::process::Child,
+    model: PathBuf,
+}
+
+impl Drop for ServerProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+static SERVER: OnceLock<Mutex<Option<ServerProc>>> = OnceLock::new();
+
+fn server_slot() -> &'static Mutex<Option<ServerProc>> {
+    SERVER.get_or_init(|| Mutex::new(None))
+}
+
+/// `llama-server` à côté du binaire `llama-completion` déjà résolu (mêmes 3
+/// emplacements possibles : override env, sidecar packagé, build dev) — pas
+/// besoin de dupliquer `resolve_binary`, juste chercher son voisin.
+fn resolve_server_binary() -> Option<PathBuf> {
+    let completion = resolve_binary()?;
+    let candidate = completion.with_file_name(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
+}
+
+fn server_health(port: u16) -> bool {
+    reqwest::blocking::Client::new()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Démarre (ou réutilise) le serveur pour CE modèle précis. `None` si le
+/// binaire est absent ou si le démarrage échoue — l'appelant retombe alors sur
+/// le mode one-shot.
+fn ensure_server(binary: &Path, model: &Path) -> Option<u16> {
+    let mut slot = server_slot().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = slot.as_ref() {
+        if s.model == model && server_health(SERVER_PORT) {
+            return Some(SERVER_PORT);
+        }
+        // Modèle changé (bascule utilisateur) ou process mort : on repart propre.
+        *slot = None;
+    }
+    let mut cmd = low_priority_command(binary);
+    cmd.arg("-m").arg(model)
+        .args(["-ngl", "99"])
+        .args(["-t", &worker_threads().to_string()])
+        .args(["-c", &CONTEXT_TOKENS.to_string()])
+        .args(["--port", &SERVER_PORT.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn().ok()?;
+    let mut proc = ServerProc { child, model: model.to_path_buf() };
+    let started = Instant::now();
+    while started.elapsed() < SERVER_STARTUP_TIMEOUT {
+        if server_health(SERVER_PORT) {
+            *slot = Some(proc);
+            return Some(SERVER_PORT);
+        }
+        if let Ok(Some(_)) = proc.child.try_wait() {
+            return None; // mort avant même de répondre (modèle/flags invalides)
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None // `proc` droppé ici → Drop tue le process qui n'a jamais répondu
+}
+
+/// Arrête le serveur persistant s'il tourne — appelé à la fermeture de l'app
+/// (sinon un process GPU-actif traînerait après avoir quitté Lucid).
+pub fn shutdown_server() {
+    *server_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+fn complete_via_server(port: u16, prompt: &str, max_tokens: u32) -> Result<String, String> {
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "n_predict": max_tokens,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "cache_prompt": true,
+    });
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("http://127.0.0.1:{port}/completion"))
+        .json(&body)
+        .timeout(Duration::from_secs(180))
+        .send()
+        .map_err(|e| format!("llama-server injoignable : {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("llama-server a répondu {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(clean_output(content))
+}
+
 // ── Moteur d'inférence ────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -463,9 +618,19 @@ impl LlamaEngine {
         let filename = self.model.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
         let formatted = format_prompt(&filename, system, user);
 
-        let mut cmd = quiet_command(&self.binary);
+        if let Some(server_bin) = resolve_server_binary() {
+            if let Some(port) = ensure_server(&server_bin, &self.model) {
+                match complete_via_server(port, &formatted, max_tokens) {
+                    Ok(out) => return Ok(out),
+                    Err(e) => crate::elog!("⚠️ llama-server en échec ({e}), retour au mode one-shot."),
+                }
+            }
+        }
+
+        let mut cmd = low_priority_command(&self.binary);
         cmd.arg("-m").arg(&self.model)
             .args(["-ngl", "99"])
+            .args(["-t", &worker_threads().to_string()])
             .args(["-c", &CONTEXT_TOKENS.to_string()])
             .args(["-n", &max_tokens.to_string()])
             .args(["--temp", "0.2"])

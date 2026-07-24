@@ -11,6 +11,8 @@ import {
   History,
   RotateCcw,
   Plus,
+  Sparkles,
+  Loader2,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
@@ -24,8 +26,6 @@ import { UpdateBanner } from "@/components/UpdateBanner";
 import { BetaBadge } from "@/components/BetaBadge";
 import {
   GenerateEmpty,
-  GenerateProgress,
-  ScanSteps,
   MarkdownView,
 } from "@/components/BrainView";
 import { NodeDetail } from "@/components/NodeDetail";
@@ -59,8 +59,9 @@ import {
   localFolderSync,
   obsidianAutoConnect,
   appleNotesConnect,
-  claudeCodeAvailable,
   claudeCodeReconnect,
+  runArchivist,
+  archivistWasInterrupted,
   type BrainProgress,
   type LocalFolderProgress,
 } from "@/lib/api";
@@ -166,14 +167,33 @@ function App() {
   // "Lucid" (mêmes composants/animation de pop que le vrai graphe — pas un
   // effet séparé) : voir `scanGraph` plus bas.
   const [scanFiles, setScanFiles] = useState<string[]>([]);
-  // Auto-détections annexes affichées en direct (Obsidian, Notes Apple, Claude Desktop).
-  const [scanSteps, setScanSteps] = useState<string[]>([]);
-  // Genesis = la carte se construit à l'écran (1er cerveau). En régénération
-  // (re-sync), on garde la carte affichée et on ajoute les nouveaux nœuds.
-  const [genesisRun, setGenesisRun] = useState(false);
   const [progress, setProgress]   = useState<BrainProgress | null>(null);
   // Graphe vivant : état provisoire réel émis par le pipeline pendant la génération.
   const [partialGraph, setPartialGraph] = useState<BrainGraph | null>(null);
+  // L'Archiviste tourne en fond (fin de scan, après une écriture MCP, ou bouton
+  // manuel) : ne touche ni au graphe affiché ni à la sélection, juste le
+  // message sous l'orbe — contrairement à `generating`, qui lui les bloque.
+  const [archiving, setArchiving] = useState(false);
+  // Progression réelle (groupe de doublons en cours / total) — sans ça le
+  // spinner reste muet pendant potentiellement plusieurs dizaines de minutes,
+  // aucun moyen de savoir si l'Archiviste avance ou est planté (retour de Liam
+  // le 2026-07-24).
+  const [archiveProgress, setArchiveProgress] = useState<{ current: number; total: number } | null>(null);
+  // Miroir en ref (pas juste le state) : le poll autonome plus bas lit cette
+  // valeur depuis une closure figée au montage de son effet — un state y
+  // serait toujours celui du premier rendu, jamais mis à jour. Sert à mettre
+  // en pause l'application des propositions PENDANT que l'Archiviste écrit les
+  // siennes une par une (chaque décision Gemma peut prendre plusieurs
+  // secondes) : sans ça, le canvas se ré-applique/reflow à chaque nouvelle
+  // proposition qui arrive → saccades, pages qui sautent d'un coup, plusieurs
+  // fois de suite (retour de Liam le 2026-07-23). Un seul rafraîchissement,
+  // groupé, une fois le passage terminé.
+  const archivingRef = useRef(false);
+  // Permet de redéclencher le cycle d'application des propositions (le même
+  // que celui écouté via l'event `mcp-proposal-changed`, cf. plus bas) depuis
+  // `runArchivistNow`, sans dupliquer sa logique (manuel/autonome, notify,
+  // suivi des propositions bloquées).
+  const scheduleMcpTickRef = useRef<() => void>(() => {});
   // Timeline : curseur temporel (epoch ms) ; null = timeline fermée.
   const [timeCutoff, setTimeCutoff] = useState<number | null>(null);
   const [error, setError]         = useState<string | null>(null);
@@ -233,8 +253,6 @@ function App() {
   async function handleStartScan() {
     setScanning(true);
     setError(null);
-    setScanSteps([]);
-    setGenesisRun(!graph); // même mise en scène "genesis" que la 1ère génération, dès le scan
     setScanFiles([]);
     const unlisten = await listen<LocalFolderProgress>("local-folder-progress", (e) => {
       setScanProgress(e.payload);
@@ -249,28 +267,22 @@ function App() {
       // absent) — puis on vérifie que ~/.claude/projects existe vraiment.
       try {
         await claudeCodeReconnect();
-        if (await claudeCodeAvailable()) {
-          setScanSteps((s) => [...s, "Claude Code connecté"]);
-        }
       } catch { /* absent sur cette machine */ }
 
       // Obsidian : détecte le vault le plus récent si Obsidian a déjà tourné
       // sur cette machine (lit sa propre config, pas de dialogue à l'user).
       try {
-        const vault = await obsidianAutoConnect();
-        if (vault) setScanSteps((s) => [...s, `Obsidian connecté (${vault.split(/[/\\]/).pop()})`]);
+        await obsidianAutoConnect();
       } catch { /* absent ou déjà configuré autrement : silencieux, pas une erreur */ }
 
       await localFolderConnect();
       await localFolderSync();
-      setScanSteps((s) => [...s, "Bureau, Documents et Téléchargements scannés"]);
 
       // Notes Apple : Mac uniquement. Sur Windows ou si l'autorisation est
       // refusée, l'échec est attendu — on ne bloque pas le scan pour ça
       // (gérable ensuite depuis les Réglages, qui affiche le vrai message).
       try {
-        const n = await appleNotesConnect();
-        setScanSteps((s) => [...s, `${n} note${n > 1 ? "s" : ""} Apple importée${n > 1 ? "s" : ""}`]);
+        await appleNotesConnect();
       } catch { /* non-Mac ou autorisation refusée */ }
 
       connectorsStatus().then(setConnectors);
@@ -282,8 +294,76 @@ function App() {
       setScanning(false);
       setScanProgress(null);
     }
-    if (ok) await handleGenerate();
+    if (ok) {
+      await handleGenerate();
+      // Fin du scan machine : l'Archiviste range/fusionne ce que le pipeline
+      // vient de générer (bac "Non triable", doublons de titres proches…).
+      void runArchivistNow();
+    }
   }
+
+  /** Une passe de l'Archiviste. Ses propositions se résolvent via le même
+   *  circuit que le MCP (poll `mcp-proposal-changed` plus bas) — pas besoin
+   *  d'attendre ça ici. En revanche la commande elle-même (script + Gemma sur
+   *  les cas ambigus) peut être quasi instantanée sur un petit cerveau : sans
+   *  durée plancher, le message sous l'orbe clignote trop vite pour être vu
+   *  (retour de Liam le 2026-07-23). `silent` : pas de toast (déclenchement de
+   *  fond après une écriture MCP — déjà signalé par la notification "Archiviste"
+   *  de l'écriture elle-même, un second message ferait doublon). */
+  async function runArchivistNow(opts?: { silent?: boolean }) {
+    setArchiving(true);
+    setArchiveProgress(null);
+    // Fermé AVANT le premier appel Rust : les propositions qu'il dépose au fil
+    // de l'eau (déplacements immédiats, puis une par une après chaque décision
+    // Gemma, potentiellement étalées sur plusieurs dizaines de secondes) ne
+    // doivent déclencher AUCUNE application/rafraîchissement du canvas tant
+    // que ce passage n'est pas terminé — un seul coup, groupé, à la fin.
+    archivingRef.current = true;
+    const MIN_VISIBLE_MS = 1200;
+    const started = Date.now();
+    const unlisten = await listen<{ current: number; total: number }>(
+      "archivist-progress",
+      (e) => setArchiveProgress(e.payload),
+    );
+    try {
+      const report = await runArchivist();
+      const rest = MIN_VISIBLE_MS - (Date.now() - started);
+      if (rest > 0) await new Promise((r) => setTimeout(r, rest));
+      if (!opts?.silent) showToast(report.trim(), 6000);
+    } catch (e) {
+      const msg = String(e instanceof Error ? e.message : e);
+      if (opts?.silent) console.warn("archiviste:", msg);
+      else showToast(`Archiviste — ${msg}`, 6000);
+    } finally {
+      unlisten();
+      setArchiving(false);
+      setArchiveProgress(null);
+      archivingRef.current = false;
+      // Toutes ses propositions sont déposées : on les applique maintenant,
+      // en un seul cycle (même circuit que le poll MCP normal — manuel ou
+      // autonome selon le réglage, notify compris).
+      scheduleMcpTickRef.current();
+    }
+  }
+
+  /** Reprise après coupure : si la dernière passe de l'Archiviste n'est jamais
+   *  allée au bout (app fermée/crashée en cours de route), le marqueur
+   *  `archivist_running.marker` traîne encore côté Rust — on relance une passe
+   *  silencieuse. Délai avant de vérifier : laisse le poll MCP habituel
+   *  (`tick()`, plus bas) appliquer d'abord les propositions déjà déposées par
+   *  la passe interrompue, sinon le nouveau scan referait les mêmes décisions
+   *  Gemma pour rien. Si la passe précédente était bien allée au bout, le
+   *  marqueur est absent et rien ne se relance. */
+  useEffect(() => {
+    if (needsSetup) return;
+    const t = setTimeout(() => {
+      void archivistWasInterrupted()
+        .then((yes) => { if (yes) void runArchivistNow({ silent: true }); })
+        .catch(() => {});
+    }, 3000);
+    return () => clearTimeout(t);
+  }, [needsSetup]);
+
   // Premier lancement (modèle prêt, pas de cerveau, jamais onboardé) : plus de
   // seed automatique (décision Liam, 2026-07-21) — l'utilisateur atterrit sur
   // l'écran GenerateEmpty et choisit explicitement : scanner sa machine ou
@@ -327,11 +407,18 @@ function App() {
     if (scanning) {
       return scanProgress ? `Lucid scanne tes fichiers (${scanProgress.current}/${scanProgress.total})` : "Lucid se prépare";
     }
-    if (!generating) return null;
-    if (!progress) return "Lucid se prépare";
-    if (progress.label.startsWith("Synthèse")) return "Lucid tisse l'arborescence";
-    return `Lucid analyse tes contenus (${progress.current}/${progress.total})`;
-  }, [scanning, scanProgress, generating, progress]);
+    if (generating) {
+      if (!progress) return "Lucid se prépare";
+      if (progress.label.startsWith("Synthèse")) return "Lucid tisse l'arborescence";
+      return `Lucid analyse tes contenus (${progress.current}/${progress.total})`;
+    }
+    if (archiving) {
+      return archiveProgress
+        ? `L'archiviste trie et range tes pages (${archiveProgress.current}/${archiveProgress.total})`
+        : "L'archiviste trie et range tes pages…";
+    }
+    return null;
+  }, [scanning, scanProgress, generating, progress, archiving, archiveProgress]);
 
   useEffect(() => {
     // L'IA locale est optionnelle : si l'user a passé le setup, on n'affiche
@@ -404,7 +491,6 @@ function App() {
   // `skipSync` : la sync a déjà été faite par le connecteur (bouton Synchroniser)
   // → on régénère seulement, sans re-synchroniser tous les connecteurs.
   async function handleGenerate(opts?: { skipSync?: boolean }) {
-    setGenesisRun(!graph); // genesis uniquement s'il n'y a pas encore de carte
     setGenerating(true);
     setError(null);
     setProgress(null);
@@ -605,6 +691,12 @@ function App() {
     const STUCK_THRESHOLD_MS = 90_000;
     const tick = async () => {
       if (running) return;
+      // L'Archiviste écrit encore (cf. `runArchivistNow`) : ne rien appliquer/
+      // rafraîchir tant qu'il n'a pas fini, sinon chacune de ses propositions
+      // déclenche son propre reflow du canvas au fil de l'eau — saccadé, pages
+      // qui sautent d'un coup, plusieurs fois de suite. Il redéclenche lui-même
+      // un cycle une fois terminé (`scheduleMcpTickRef`).
+      if (archivingRef.current) return;
       running = true;
       try {
         const manual = await mcpManualValidationEnabled();
@@ -630,6 +722,14 @@ function App() {
             supabase?.from("mcp_proposals").delete().in("id", resolvedIds).then(() => {}, () => {});
             const n = resolvedIds.length;
             void notify("Archiviste", `${n} page${n > 1 ? "s" : ""} mise${n > 1 ? "s" : ""} à jour dans ton cerveau.`);
+            // Une IA (MCP) vient d'écrire — l'Archiviste repasse derrière pour
+            // ranger/fusionner (ex. si elle a mal placé une page). Jamais après
+            // une résolution qui ne contient QUE ses propres propositions
+            // (préfixe "arch-"), sinon il se redéclenche indéfiniment sur ses
+            // propres écritures.
+            if (resolvedIds.some((id) => !id.startsWith("arch-"))) {
+              void runArchivistNow({ silent: true });
+            }
           }
           // Suivi des propositions encore en attente malgré cette tentative.
           const resolvedSet = new Set(resolvedIds);
@@ -663,6 +763,7 @@ function App() {
       if (debounce) clearTimeout(debounce);
       debounce = setTimeout(() => { debounce = null; void tick(); }, 1500);
     };
+    scheduleMcpTickRef.current = scheduleTick;
     tick();
     const unlisten = listen("mcp-proposal-changed", scheduleTick);
     const iv = setInterval(tick, 30_000); // filet, pas le mécanisme principal
@@ -1035,8 +1136,19 @@ function App() {
               selectedId={selectedNode?.id ?? null}
               query={query}
               revealKey={revealKey}
-              busy={generating || scanning}
-              busyMessage={busyMessage}
+              // L'Archiviste ne régénère rien : contrairement à `generating`
+              // (pipeline IA, graphe reconstruit), ses propositions ne
+              // s'appliquent qu'à la toute fin (cf. `archivingRef`) — lui
+              // donner la phase "generating" forçait pourtant l'effet de
+              // "construction feuille par feuille" du scan (toutes les
+              // feuilles à pleine opacité, fondu de zoom désactivé), un
+              // graphe réel déjà dense rendu entièrement en plus de l'IA
+              // locale qui tourne = surcharge CPU/rendu (retour de Liam le
+              // 2026-07-24 : "mon graph bouge comme ça"). Reste en "idle"
+              // pendant l'archivage — le message de statut vient du `caption`
+              // ci-dessous, pas de la phase.
+              phase={scanning ? "scanning" : generating ? "generating" : "idle"}
+              caption={busyMessage}
               spaces={spaces}
               onAddNodeToSpace={handleAddNodeToSpace}
               onMoveNode={handleMoveNode}
@@ -1057,21 +1169,6 @@ function App() {
           )}
           {view === "brain" && graph && (
             <MarkdownView markdown={graph.markdown} onRegenerate={handleGenerate} />
-          )}
-
-          {/* ── Overlay progression : scan machine puis 1er cerveau (genesis) —
-                 même carte flottante pour les deux, jamais bloquante. En
-                 régénération, c'est le root « Lucid » qui pulse et parle. ── */}
-          {(scanning || (generating && genesisRun)) && (
-            <div className="absolute inset-0 z-20 flex items-end justify-center pb-24 pointer-events-none">
-              <div className="pointer-events-auto rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] px-6 py-4 shadow-[var(--shadow-float)] min-w-[320px]">
-                <GenerateProgress
-                  progress={scanning ? scanProgress : progress}
-                  label={scanning ? "Lucid scanne ton ordinateur…" : undefined}
-                />
-                {scanning && <ScanSteps steps={scanSteps} />}
-              </div>
-            </div>
           )}
 
           {/* ── Dock de widgets (bord gauche) ── */}
@@ -1364,6 +1461,21 @@ function App() {
                   className="rounded-full p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
                 >
                   <RefreshCw className="size-4" />
+                </button>
+              )}
+              {graph && (
+                <button
+                  onClick={() => runArchivistNow()}
+                  disabled={archiving}
+                  title={archiving ? "L'Archiviste travaille…" : "Lancer l'Archiviste (ranger/fusionner les pages)"}
+                  className={cn(
+                    "rounded-full p-1.5 transition-colors disabled:cursor-not-allowed",
+                    archiving
+                      ? "text-[var(--color-accent)]"
+                      : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
+                  )}
+                >
+                  {archiving ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
                 </button>
               )}
               <div className="relative">

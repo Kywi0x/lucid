@@ -35,3 +35,6 @@ src-tauri/target/
 src-tauri/binaries/
 src-tauri/resources/
 dist-viewer/
+
+# Fixtures de test contenant des données réelles (brain.json de Liam) — jamais commit
+src-tauri/tests/fixtures/

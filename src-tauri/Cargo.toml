@@ -36,6 +36,7 @@ getrandom = "0.2"      # PKCE : verifier aléatoire (RNG OS)
 pdf-extract = "0.12"   # extraction texte PDF pure Rust — fallback quand poppler absent (Windows)
 calamine = "0.26"      # lecture .xlsx pure Rust — même parité Mac/Windows gratuite (pas de binaire externe)
 notify = "8"           # watch auto du dossier Claude Code (cross-platform Mac/Windows)
+rusqlite = { version = "0.32", features = ["bundled"] }  # SQLite embarqué (feature bundled) — zéro dépendance système, cf. ADR-0015
 # Crash reporting opt-in (rustls comme reqwest ci-dessus, pas de 2e stack TLS)
 sentry = { version = "0.42", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls"] }
 tauri-plugin-sentry = "0.5"

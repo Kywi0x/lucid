@@ -93,6 +93,10 @@ export interface BrainGraph {
   generated_at: string;
 }
 
+/** Graphe vide — pour monter le vrai canvas (BrainMap, zoom/pan réels) avant
+ *  qu'un cerveau existe (connexion, écran d'accueil), au lieu d'un décor factice. */
+export const EMPTY_GRAPH: BrainGraph = { nodes: [], edges: [], markdown: "", generated_at: "" };
+
 export interface SnapshotInfo {
   id: string;
   created_at: number; // unix seconds

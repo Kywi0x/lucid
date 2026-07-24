@@ -276,6 +276,20 @@ export function setMcpManualValidation(enabled: boolean): Promise<void> {
   return invoke("set_mcp_manual_validation", { enabled });
 }
 
+/** Lance une passe de l'Archiviste (rangement/fusion) — dépose ses propositions
+ *  dans le même circuit que le MCP (bulles fantômes ou auto selon le réglage
+ *  ci-dessus). Renvoie un rapport texte des actions proposées. */
+export function runArchivist(): Promise<string> {
+  return invoke("run_archivist");
+}
+
+/** Vrai si la dernière passe de l'Archiviste a été coupée avant la fin (app
+ *  fermée/crashée en cours de route) — sert à relancer une passe silencieuse
+ *  au démarrage plutôt que de laisser le reliquat en plan indéfiniment. */
+export function archivistWasInterrupted(): Promise<boolean> {
+  return invoke("archivist_was_interrupted");
+}
+
 /** Rapports de crash (Sentry) — opt-in, effet au redémarrage de l'app. */
 export function telemetryEnabled(): Promise<boolean> {
   return invoke("telemetry_enabled");

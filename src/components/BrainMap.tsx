@@ -4,6 +4,7 @@ import {
 import type { BrainGraph, BrainNode, Space } from "@/lib/types";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { NodePicker } from "@/components/NodePicker";
+import { ThinkingOrb, type OrbState } from "thinking-orbs";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -26,10 +27,13 @@ interface Props {
   panelOffset?: number;
   /** Centre la caméra sur ce nœud (k force le re-déclenchement). */
   focus?: { id: string; k: number } | null;
-  /** Régénération en cours (hors genesis) : le root pulse et « parle ». */
-  busy?: boolean;
-  /** Message façon Lucid affiché sous le root pendant `busy`. */
-  busyMessage?: string | null;
+  /** "scanning"/"generating" pilotent l'état de l'orbe-root (sinon elle
+   *  respire toute seule, cycle d'états au repos). */
+  phase?: "idle" | "scanning" | "generating";
+  /** Message affiché sous l'orbe (root) — remplace le texte dessiné dans le canvas. */
+  caption?: string | null;
+  /** Clic sur l'orbe quand aucun root n'existe encore (canvas vide, pré-scan). */
+  onOrbClick?: () => void;
 }
 
 interface NodeInfo {
@@ -373,15 +377,34 @@ function hexA(hex: string, a: number): string {
 
 // ─── BrainMap (rendu canvas constellation) ──────────────────────────────────────
 
+// États traversés au repos par l'orbe-root — juste de quoi rester « vivante ».
+const IDLE_ORB_STATES: OrbState[] = ["listening", "shaping", "composing"];
+
 export function BrainMap({
   graph, onSelect, selectedId, query,
   revealKey = 0,
   spaces, onAddNodeToSpace, onMoveNode, onDeleteNode, onImportFiles,
   onBackgroundClick, panelOffset = 0, focus = null,
-  busy = false, busyMessage = null,
+  phase = "idle", caption = null, onOrbClick,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const orbWrapRef = useRef<HTMLDivElement>(null);
+
+  // Pas de root = tout premier onboarding (canvas vide, avant le 1er scan) :
+  // l'orbe s'agite pour inviter au clic. Dès qu'un cerveau existe, elle garde
+  // un état par défaut fixe au repos — elle ne s'agite que scan/génération.
+  const hasRoot = graph.nodes.some((n) => n.kind === "root");
+  const [idleIdx, setIdleIdx] = useState(0);
+  useEffect(() => {
+    if (phase !== "idle" || hasRoot) return;
+    const id = setInterval(() => setIdleIdx((i) => (i + 1) % IDLE_ORB_STATES.length), 3500);
+    return () => clearInterval(id);
+  }, [phase, hasRoot]);
+  const orbState: OrbState = phase === "scanning" ? "searching"
+    : phase === "generating" ? "solving"
+    : hasRoot ? "listening"
+    : IDLE_ORB_STATES[idleIdx];
 
   const [ctxMenu, setCtxMenu] = useState<{ nodeId: string; x: number; y: number } | null>(null);
   const [movePicker, setMovePicker] = useState<string | null>(null); // nodeId à déplacer
@@ -473,7 +496,7 @@ export function BrainMap({
   S.current = {
     infos, childrenOf, colorOf, neighbors, q, selectedId, theme, linkEdges,
     onSelect, onMoveNode, onImportFiles, onBackgroundClick, rootId,
-    busy, busyMessage, maxR, recentK,
+    maxR, recentK, phase,
   };
 
   // Refit caméra au chargement / à chaque régénération.
@@ -643,8 +666,13 @@ export function BrainMap({
       const sx = (wx: number) => CX + (wx - c.x) * c.zoom;
       const sy = (wy: number) => H / 2 + (wy - c.y) * c.zoom;
       const t = s.theme as CanvasTheme;
-      // Fondu des feuilles autour du seuil de zoom (plus de pop)
-      const leafA = Math.max(0, Math.min(1, (c.zoom - (LEAF_ZOOM - LEAF_FADE / 2)) / LEAF_FADE));
+      // Fondu des feuilles autour du seuil de zoom (plus de pop) — désactivé
+      // pendant scan/génération : la carte doit se construire visiblement
+      // feuille par feuille, pas rester invisible sous le seuil de zoom tant
+      // que la caméra dézoome pour tout faire tenir (demandé par Liam le 2026-07-22).
+      const leafA = s.phase && s.phase !== "idle"
+        ? 1
+        : Math.max(0, Math.min(1, (c.zoom - (LEAF_ZOOM - LEAF_FADE / 2)) / LEAF_FADE));
 
       advancePositions();
 
@@ -717,6 +745,7 @@ export function BrainMap({
         if (!visible(info)) continue;
         const p = pos(info);
         const isRoot = info.node.kind === "root";
+        if (isRoot) continue; // remplacé par l'overlay HTML de l'orbe (root vivant)
         const isPending = info.node.kind === "pending";
         // Ambre fixe pour les propositions MCP : lisible dans les deux thèmes.
         const color = isPending ? "#e0a33c" : s.colorOf.get(info.id)!;
@@ -752,8 +781,8 @@ export function BrainMap({
           ctx.fillStyle = wg; ctx.beginPath(); ctx.arc(p.x, p.y, hr, 0, Math.PI * 2); ctx.fill();
         }
 
-        // halo très léger (racine et survol/sélection seulement)
-        if (isRoot || boost > 0) {
+        // halo très léger (survol/sélection seulement — le root a son propre halo HTML)
+        if (boost > 0) {
           const haloR = r * 2.6;
           const hg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, haloR);
           hg.addColorStop(0, hexA(color, 0.10 + boost * 0.14));
@@ -763,7 +792,7 @@ export function BrainMap({
 
         // anneau fin (1px écran)
         ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-        ctx.strokeStyle = hexA(color, 0.35 + boost * 0.4 + (isRoot ? 0.1 + 0.06 * pulse : 0));
+        ctx.strokeStyle = hexA(color, 0.35 + boost * 0.4);
         ctx.lineWidth = 1 / c.zoom;
         ctx.stroke();
 
@@ -778,21 +807,6 @@ export function BrainMap({
           ctx.lineWidth = 1.6 / c.zoom;
           ctx.stroke();
           ctx.setLineDash([]);
-        }
-        if (isRoot) {
-          ctx.beginPath(); ctx.arc(p.x, p.y, r * 1.5, 0, Math.PI * 2);
-          ctx.strokeStyle = hexA(color, 0.12 + 0.05 * pulse);
-          ctx.stroke();
-          // Régénération : ondes concentriques qui s'étendent (« Lucid analyse »).
-          if (s.busy) {
-            for (let k = 0; k < 3; k++) {
-              const prog = (time * 0.5 + k / 3) % 1;
-              ctx.beginPath(); ctx.arc(p.x, p.y, r * (1 + prog * 2.4), 0, Math.PI * 2);
-              ctx.strokeStyle = hexA(color, 0.28 * (1 - prog));
-              ctx.lineWidth = 1.2 / c.zoom;
-              ctx.stroke();
-            }
-          }
         }
         // Proposition MCP : anneau pointillé pulsant (« fantôme » à valider)
         if (isPending) {
@@ -828,6 +842,7 @@ export function BrainMap({
         if (spawnK(info.id) < 0.6) continue; // label après le pop de la bulle
         const kind = info.node.kind;
         const isRoot = kind === "root";
+        if (isRoot) continue; // label HTML sous l'orbe, pas de texte canvas pour le root
         const isLeaf = isLeafKind(kind);
         const isContainer = !isLeaf && !isRoot;
         const isHover = info.id === hv;
@@ -852,20 +867,18 @@ export function BrainMap({
       ctx.globalAlpha = 1;
       (ctx as any).letterSpacing = "0px";
 
-      // ── Lucid « parle » pendant la régénération (busy, hors genesis) ──
-      if (s.busy && s.busyMessage) {
+      // ── Position de l'overlay HTML de l'orbe (= le root, vivant) ──
+      // Suit le root projeté à l'écran ; s'il n'existe pas encore (canvas vide,
+      // pré-scan), l'orbe reste fixe au centre — même logique de clic.
+      if (orbWrapRef.current) {
         const rootInfo = s.infos.get(s.rootId);
         if (rootInfo) {
           const rp = pos(rootInfo);
-          const cy = sy(rp.y) + rootInfo.r * c.zoom + 38; // sous le label du root
-          const dots = ".".repeat(1 + (Math.floor(time * 2) % 3));
-          ctx.font = "500 12px ui-monospace, SFMono-Regular, Menlo, monospace";
-          ctx.textAlign = "center"; ctx.textBaseline = "middle";
-          ctx.shadowColor = t.dark ? "rgba(0,0,0,0.7)" : "rgba(245,247,251,0.9)";
-          ctx.shadowBlur = 4;
-          ctx.fillStyle = t.accent;
-          ctx.fillText(s.busyMessage + dots, sx(rp.x), cy);
-          ctx.shadowBlur = 0;
+          const scale = Math.min(1.6, Math.max(0.55, c.zoom));
+          orbWrapRef.current.style.transform =
+            `translate(${sx(rp.x)}px, ${sy(rp.y)}px) translate(-50%, -50%) scale(${scale})`;
+        } else {
+          orbWrapRef.current.style.transform = `translate(${CX}px, ${H / 2}px) translate(-50%, -50%)`;
         }
       }
 
@@ -1050,6 +1063,26 @@ export function BrainMap({
   return (
     <div ref={wrapRef} style={{ width: "100%", height: "100%", position: "relative", overflow: "hidden", background: "var(--canvas-bg)" }}>
       <canvas ref={canvasRef} style={{ display: "block", position: "absolute", inset: 0 }} />
+
+      {/* L'orbe EST le root : overlay HTML (pas un nœud canvas) positionné image
+          par image par la boucle de rendu ci-dessus, pour rester net au zoom/pan. */}
+      <div
+        ref={orbWrapRef}
+        onClick={() => {
+          const rootInfo = infos.get(rootId);
+          if (rootInfo) onSelect(rootInfo.node);
+          else onOrbClick?.();
+        }}
+        style={{ position: "absolute", left: 0, top: 0, zIndex: 5, cursor: "pointer", transform: "translate(-9999px,-9999px)" }}
+        className="group flex flex-col items-center gap-2"
+      >
+        <ThinkingOrb state={orbState} size={64} />
+        {caption && (
+          <span className="whitespace-nowrap text-xs text-[var(--color-muted)] group-hover:text-[var(--color-text)]">
+            {caption}
+          </span>
+        )}
+      </div>
 
       {ctxMenu && (onMoveNode || onDeleteNode || (spaces && onAddNodeToSpace)) && (
         <div

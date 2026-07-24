@@ -51,6 +51,7 @@ import {
   setActiveModel,
   mcpManualValidationEnabled,
   setMcpManualValidation,
+  runArchivist,
   exportBackup,
   importBackup,
   resetEnvironment,
@@ -1061,7 +1062,7 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
 
   async function handleRestore(name: string) {
     if (!supabase || !uid) return;
-    if (!confirm("Restaurer cette sauvegarde ? Le cerveau actuel sera remplacé (une copie locale de brain.json est gardée).")) return;
+    if (!confirm("Restaurer cette sauvegarde ? Le cerveau actuel sera remplacé (une copie locale est gardée).")) return;
     setBusy(name); setMsg(null);
     try {
       const { data, error } = await supabase.storage.from(BACKUP_BUCKET).download(`${uid}/${name}`);
@@ -1238,10 +1239,25 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
           </p>
           <button
             onClick={async () => {
-              if (!confirm("Reset complet : cerveau, connecteurs, session et onboarding effacés (modèles IA gardés). Continuer ?")) return;
+              if (!confirm("Reset complet : cerveau, connecteurs, session, onboarding ET sauvegarde cloud effacés (modèles IA gardés). Continuer ?")) return;
               setBusy("reset"); setMsg(null);
               try {
                 await resetEnvironment();
+                // Vide aussi la sauvegarde cloud (sync.zip) : sinon, une fois reconnecté
+                // au même compte, le premier syncNow() voit un dossier local vide et
+                // retélécharge cette sauvegarde — annulant le reset (le cloud fait foi
+                // par design quand le local est vide, cf. sync.ts). Doit tourner AVANT
+                // le signOut (besoin de la session pour le uid + les droits RLS).
+                // Constaté par Liam le 2026-07-22 : reset → reconnexion → données de retour.
+                const { data: userData } = (await supabase?.auth.getUser()) ?? {};
+                const uid = userData?.user?.id;
+                if (uid) await supabase?.storage.from(BACKUP_BUCKET).remove([`${uid}/${SYNC_FILE}`]);
+                // Déconnexion Supabase explicite (pas juste localStorage.clear()) :
+                // sans ça, la sync auto voit un dossier local vide juste après le
+                // reset et retélécharge aussitôt la dernière sauvegarde cloud du
+                // même compte — annulant le reset avant même que l'onboarding
+                // s'affiche (constaté par Liam le 2026-07-22).
+                await supabase?.auth.signOut();
                 localStorage.clear(); // flags lucid.* + session Supabase → onboarding complet
                 location.reload();
               } catch (e) {
@@ -1278,10 +1294,25 @@ export function AiClientsSection() {
   const [loadingUrl, setLoadingUrl] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [archiving, setArchiving] = useState(false);
+  const [archiveResult, setArchiveResult] = useState<string | null>(null);
 
   useEffect(() => {
     mcpManualValidationEnabled().then(setManualValidationState).catch(() => {});
   }, []);
+
+  async function handleRunArchivist() {
+    setArchiving(true);
+    setArchiveResult(null);
+    try {
+      const report = await runArchivist();
+      setArchiveResult(report.trim()); // toujours non-vide — le "rien à faire" est explicite côté Rust
+    } catch (e) {
+      setArchiveResult(String(e instanceof Error ? e.message : e));
+    } finally {
+      setArchiving(false);
+    }
+  }
 
   async function copyUrl(u: string) {
     if (await copyText(u)) { setCopied(true); setTimeout(() => setCopied(false), 2000); }
@@ -1377,6 +1408,20 @@ export function AiClientsSection() {
             </span>
           </span>
         </label>
+
+        <button
+          onClick={handleRunArchivist}
+          disabled={archiving}
+          className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] disabled:opacity-40"
+        >
+          {archiving ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+          Lancer l'Archiviste maintenant
+        </button>
+        {archiveResult && (
+          <p className="mt-2 whitespace-pre-line text-[11px] leading-relaxed text-[var(--color-muted)]">
+            {archiveResult}
+          </p>
+        )}
       </div>
     </div>
   );

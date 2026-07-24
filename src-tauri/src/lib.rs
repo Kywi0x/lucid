@@ -12,10 +12,12 @@ macro_rules! elog {
 }
 
 mod ai;
+mod archivist;
 mod backup;
 mod connectors;
 mod models;
 mod secrets;
+mod storage;
 
 use ai::{pipeline, LlamaEngine};
 use models::{BrainEdge, BrainGraph, BrainNode, ConnectorStatus, Conversation, ConversationSummary};
@@ -87,6 +89,519 @@ pub fn run_pipeline_demo(limit: usize) -> Result<BrainGraph, String> {
         let _ = backup::write_brain(&dir, &mut graph);
     }
     Ok(graph)
+}
+
+/// Dépose une proposition dans `mcp_pending/` — même circuit que le MCP
+/// (bulles fantômes pollées par le front), champs non pertinents pour `action`
+/// laissés vides. Id fourni par l'appelant (préfixe `arch-`, jamais de collision
+/// avec les ids MCP qui sont des uuids).
+#[allow(clippy::too_many_arguments)]
+fn write_pending_proposal(
+    dir: &std::path::Path,
+    id: &str,
+    action: &str,
+    parent_id: &str,
+    label: &str,
+    target_id: &str,
+    new_parent_id: &str,
+    merge_ids: &[String],
+) -> Result<(), String> {
+    let pdir = dir.join("mcp_pending");
+    std::fs::create_dir_all(&pdir).map_err(|e| e.to_string())?;
+    let proposal = serde_json::json!({
+        "id": id, "action": action, "parent_id": parent_id, "label": label, "content": "",
+        "target_id": target_id, "new_parent_id": new_parent_id, "merge_ids": merge_ids,
+        "link_target": "", "relation": "", "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(pdir.join(format!("{id}.json")), proposal.to_string()).map_err(|e| e.to_string())
+}
+
+/// Point d'entrée de l'Archiviste (prototype) — une passe unique : script
+/// (déplacements sûrs) + Gemma (fusions ambiguës), écrit des propositions,
+/// n'applique jamais rien directement. Utilisé par `examples/archivist.rs`
+/// pour tester sur le vrai cerveau de l'user avant de le brancher en fond.
+pub fn run_archivist_scan_once() -> Result<String, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    run_archivist_scan_once_in(&dir)
+}
+
+/// Variante injectable (dossier explicite) — testable sans toucher au vrai
+/// dossier de données de l'utilisateur, cf. `save_node_content_in` et consorts.
+fn run_archivist_scan_once_in(dir: &std::path::Path) -> Result<String, String> {
+    run_archivist_scan_once_in_progress(dir, |_, _| {})
+}
+
+/// Marqueur de passage en cours — écrit au début d'un passage, retiré
+/// uniquement s'il va jusqu'au bout (`Ok`). S'il traîne encore au lancement
+/// suivant de l'app, la dernière passe a été interrompue (app fermée/crashée
+/// en cours de route) : `archivist_was_interrupted` sert ce diagnostic au
+/// front, qui relance une passe silencieuse (cf. `runArchivistNow`). Comme le
+/// scan repart de l'état actuel du cerveau, les groupes déjà décidés avant la
+/// coupure (propositions déjà sur disque, appliquées au montage par le poll
+/// MCP habituel) ne réapparaissent pas — seul le reliquat est retraité.
+fn archivist_marker_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("archivist_running.marker")
+}
+
+#[tauri::command]
+fn archivist_was_interrupted() -> bool {
+    ai::llama::app_data_dir().is_some_and(|dir| archivist_marker_path(&dir).exists())
+}
+
+/// Comme `run_archivist_scan_once_in`, avec un callback de progression appelé
+/// avant chaque décision Gemma (`current`, `total` groupes de doublons) — c'est
+/// la partie qui domine le temps (un appel = un rechargement complet du modèle,
+/// cf. `ai/llama.rs`), donc c'est elle qu'on rapporte à l'UI plutôt que le reste
+/// (script, quasi instantané).
+fn run_archivist_scan_once_in_progress(
+    dir: &std::path::Path,
+    on_progress: impl Fn(usize, usize),
+) -> Result<String, String> {
+    let _ = std::fs::write(archivist_marker_path(dir), b"");
+    let graph: BrainGraph = backup::load_brain_cached(dir)?;
+    let result = archivist::scan(&graph);
+    let engine = LlamaEngine::detect().ok();
+
+    let mut report = String::new();
+    let mut n = 0usize;
+    let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone());
+
+    // Déplacements confiants (destination thématique existante) appliqués
+    // tout de suite. Les déplacements de repli vers le bac "Non triable" sont
+    // MIS DE CÔTÉ (`catchall_leftover`) : avant de les y ranger à plat, le
+    // clustering mécanique a déjà eu sa chance (dans `scan()`) et l'IA locale
+    // en a une seconde juste après (retour de Liam le 2026-07-23 : "il faut
+    // utiliser l'IA locale... au pire un combo des deux").
+    let mut catchall_leftover: Vec<(String, String)> = Vec::new(); // (id, label)
+    for mv in &result.moves {
+        if mv.target_label == archivist::CATCHALL_LABEL {
+            catchall_leftover.push((mv.node_id.clone(), mv.node_label.clone()));
+            continue;
+        }
+        let id = format!("arch-move-{n}");
+        n += 1;
+        write_pending_proposal(dir, &id, "move", "", "", &mv.node_id, &mv.new_parent_id, &[])?;
+        report.push_str(&format!("→ déplacer « {} » sous « {} »\n", mv.node_label, mv.target_label));
+    }
+    catchall_leftover.extend(
+        result.orphans_unresolved_ids.iter().cloned().zip(result.orphans_unresolved.iter().cloned())
+    );
+
+    // Applique un cluster de thème (mécanique OU IA, même forme) : crée le
+    // conteneur s'il n'existe pas encore et y range ses pages dans LE MÊME
+    // passage — le circuit de résolution des propositions boucle déjà jusqu'à
+    // ce que plus rien ne progresse, donc un "move" vers un id tout juste créé
+    // se retente une fois le "create" appliqué (sinon un thème neuf sortait
+    // vide de ce passage, ses pages restant noyées dans "Non triable" en
+    // attendant un passage suivant qui n'arrive pas forcément — bug réel
+    // remonté par Liam le 2026-07-23). Id déterministe (`arch-theme-<slug>`) :
+    // ne rematche QUE le conteneur que l'Archiviste a lui-même créé pour ce
+    // thème, jamais un nœud existant qui porterait le même libellé par pure
+    // coïncidence (autre bug réel du même jour).
+    let apply_theme_cluster = |cluster: &archivist::ThemeCluster, n: &mut usize, report: &mut String| -> Result<(), String> {
+        let theme_id = format!("arch-theme-{}", cluster.label.to_lowercase());
+        let existing = graph.nodes.iter().find(|c| c.id == theme_id);
+        match existing {
+            Some(container) => {
+                for node_id in &cluster.node_ids {
+                    let id = format!("arch-move-{n}");
+                    *n += 1;
+                    write_pending_proposal(dir, &id, "move", "", "", node_id, &container.id, &[])?;
+                }
+                report.push_str(&format!(
+                    "→ déplacer {} page(s) vers « {} »\n",
+                    cluster.node_ids.len(), cluster.label
+                ));
+            }
+            None => {
+                if let Some(root_id) = &root_id {
+                    write_pending_proposal(dir, &theme_id, "create", root_id, &cluster.label, "", "", &[])?;
+                    for node_id in &cluster.node_ids {
+                        let id = format!("arch-move-{n}");
+                        *n += 1;
+                        write_pending_proposal(dir, &id, "move", "", "", node_id, &theme_id, &[])?;
+                    }
+                    report.push_str(&format!(
+                        "→ créer « {} » et y ranger {} page(s)\n",
+                        cluster.label, cluster.node_ids.len()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Thèmes détectés mécaniquement (mot partagé par 3+ pages, zéro IA).
+    for cluster in &result.theme_clusters {
+        apply_theme_cluster(cluster, &mut n, &mut report)?;
+    }
+
+    // Passe IA (Gemma) sur ce qui reste VRAIMENT non groupable par mot commun
+    // — capte les regroupements de sens que le script ne peut pas voir (même
+    // sujet, aucun mot partagé). Jamais sur ce que le script a déjà su grouper
+    // seul (déjà retiré de `catchall_leftover` en amont, dans `scan()`).
+    let mut ai_clustered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(e) = &engine {
+        let ai_clusters = archivist::ai_cluster_leftovers(e, &catchall_leftover);
+        for cluster in &ai_clusters {
+            for id in &cluster.node_ids {
+                ai_clustered.insert(id.clone());
+            }
+            apply_theme_cluster(cluster, &mut n, &mut report)?;
+        }
+        if !ai_clusters.is_empty() {
+            report.push_str(&format!(
+                "→ IA : {} regroupement(s) sémantique(s) supplémentaire(s) (aucun mot de titre partagé)\n",
+                ai_clusters.len()
+            ));
+        }
+    }
+
+    // Bac "Non triable" : ce qui reste après le tri mécanique ET la passe IA.
+    // Crée le bac s'il n'existe pas encore, ou route vers son id réel
+    // (`result.catchall_id`, peut différer de la constante — dossier créé
+    // manuellement ou par une version antérieure) sinon.
+    let still_leftover: Vec<(String, String)> = catchall_leftover.into_iter()
+        .filter(|(id, _)| !ai_clustered.contains(id))
+        .collect();
+    if !still_leftover.is_empty() {
+        let target_id = match &result.catchall_id {
+            Some(existing) => existing.clone(),
+            None => {
+                if let Some(root_id) = &root_id {
+                    write_pending_proposal(
+                        dir, archivist::CATCHALL_ID, "create",
+                        root_id, archivist::CATCHALL_LABEL, "", "", &[],
+                    )?;
+                }
+                archivist::CATCHALL_ID.to_string()
+            }
+        };
+        for (orphan_id, _) in &still_leftover {
+            let id = format!("arch-move-{n}");
+            n += 1;
+            write_pending_proposal(dir, &id, "move", "", "", orphan_id, &target_id, &[])?;
+        }
+        report.push_str(&format!(
+            "→ ranger {} page(s) sans destination évidente dans « {} »\n",
+            still_leftover.len(), archivist::CATCHALL_LABEL
+        ));
+    }
+
+    let total_groups = result.groups.len();
+    for (gi, group) in result.groups.iter().enumerate() {
+        on_progress(gi + 1, total_groups);
+        match &engine {
+            Some(e) => match archivist::decide_group(e, group, &graph) {
+                archivist::GroupOutcome::Merge(d) => {
+                    let id = format!("arch-merge-{n}");
+                    n += 1;
+                    let mut ids = vec![d.survivor_id.clone()];
+                    ids.extend(d.dropped_ids.clone());
+                    write_pending_proposal(dir, &id, "merge", "", "", "", "", &ids)?;
+                    report.push_str(&format!(
+                        "→ fusionner « {} » ({} pages) — {}\n",
+                        group.label, group.node_ids.len(), d.reason
+                    ));
+                }
+                archivist::GroupOutcome::KeepSeparate { reason } => report.push_str(&format!(
+                    "· « {} » ({} pages) : gardées séparées — {}\n",
+                    group.label, group.node_ids.len(), reason
+                )),
+                archivist::GroupOutcome::ParseFailed { raw_excerpt } => report.push_str(&format!(
+                    "! « {} » ({} pages) : réponse IA inexploitable — {:?}\n",
+                    group.label, group.node_ids.len(), raw_excerpt
+                )),
+            },
+            None => report.push_str(&format!(
+                "· « {} » ({} pages) : IA locale indisponible, ignoré\n",
+                group.label, group.node_ids.len()
+            )),
+        }
+    }
+
+    // Pas de bloc "orphelines laissées de côté" ici : `result.orphans_unresolved`
+    // est désormais toujours routé vers le bac "Non triable" plus haut, dans le
+    // même passage (cf. commentaire sur `orphans_unresolved_ids`) — le laisser
+    // aurait rapporté deux fois la même chose sous deux formulations différentes.
+
+    // Le rapport ne doit JAMAIS être silencieux : sans ça, "rien à faire" et
+    // "je n'ai pas encore tourné" sont indiscernables pour l'utilisateur
+    // (retour de Liam le 2026-07-23 : impression que l'Archiviste ne fait rien).
+    if report.trim().is_empty() {
+        report.push_str(match &engine {
+            Some(_) => "Rien à ranger : ton cerveau est déjà bien organisé.",
+            None => "Rien à ranger côté script — IA locale indisponible, aucune fusion ambiguë tranchée.",
+        });
+    }
+
+    let _ = std::fs::remove_file(archivist_marker_path(dir));
+    Ok(report)
+}
+
+#[cfg(test)]
+mod archivist_orchestration_tests {
+    use super::*;
+
+    fn note(id: &str, parent: &str, label: &str) -> BrainNode {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "label": label, "kind": "note", "weight": 1, "parent_id": parent
+        }))
+        .unwrap()
+    }
+
+    /// Régression du bug remonté par Liam le 2026-07-23 : un cluster de thème
+    /// ("Facture", mot partagé par 3+ pages du bac "Non triable") matchait
+    /// n'importe quel nœud existant portant le même libellé PAR COÏNCIDENCE,
+    /// où qu'il soit dans le cerveau — une note perso sans rapport nommée
+    /// "Facture" absorbait alors toutes les pages du cluster. Doit maintenant
+    /// ignorer cette note et proposer un tout nouveau conteneur (id déterministe
+    /// `arch-theme-<slug>`), jamais deviné par correspondance de texte.
+    #[test]
+    fn theme_cluster_ignore_un_noeud_existant_qui_partage_juste_le_libelle() {
+        let dir = std::env::temp_dir().join("lucid_test_archivist_theme_collision");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = BrainGraph {
+            nodes: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "root", "label": "Lucid", "kind": "root", "weight": 5
+                }))
+                .unwrap(),
+                note(archivist::CATCHALL_ID, "root", archivist::CATCHALL_LABEL),
+                note("f1", archivist::CATCHALL_ID, "Facture Janvier"),
+                note("f2", archivist::CATCHALL_ID, "Facture Février"),
+                note("f3", archivist::CATCHALL_ID, "Facture Mars"),
+                // Un vrai dossier thématique existant (pas un orphelin sous la
+                // racine, sinon le script la range lui-même dans le bac avant
+                // même d'atteindre la logique de cluster qu'on veut isoler ici).
+                serde_json::from_value(serde_json::json!({
+                    "id": "cat-compta", "label": "Comptabilité", "kind": "container",
+                    "weight": 1, "parent_id": "root"
+                }))
+                .unwrap(),
+                // Note personnelle sans aucun rapport, qui porte par hasard le
+                // même libellé que le thème qui va être détecté.
+                note("note-perso-facture", "cat-compta", "Facture"),
+            ],
+            edges: vec![],
+            markdown: String::new(),
+            report: String::new(),
+            generated_at: "t".into(),
+        };
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph).unwrap()).unwrap();
+
+        run_archivist_scan_once_in(&dir).unwrap();
+
+        let proposals = load_proposals_in(&dir);
+        assert!(
+            proposals.iter().all(|p| p.new_parent_id != "note-perso-facture" && p.target_id != "note-perso-facture"),
+            "une page de facture a été proposée vers la note existante sans rapport : {:?}",
+            proposals.iter().map(|p| (&p.action, &p.target_id, &p.new_parent_id)).collect::<Vec<_>>()
+        );
+        assert!(
+            proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-facture"),
+            "attendu la création du thème « Facture » sous un id déterministe propre à l'Archiviste : {:?}",
+            proposals.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Régression du bug remonté par Liam le 2026-07-23 : après un reset +
+    /// premier scan (donc AUCUN bac "Non triable" encore présent), un seul
+    /// passage de l'Archiviste créait le bac mais n'y rangeait rien — "un
+    /// prochain passage" qui, en pratique, n'arrivait jamais tout seul. Perçu
+    /// comme "l'Archiviste n'a rien fait". Le bac doit maintenant être créé ET
+    /// peuplé dans le même passage.
+    #[test]
+    fn cree_le_bac_non_triable_et_y_range_les_orphelins_des_le_premier_passage() {
+        let dir = std::env::temp_dir().join("lucid_test_archivist_catchall_same_pass");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = BrainGraph {
+            nodes: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "root", "label": "Lucid", "kind": "root", "weight": 3
+                }))
+                .unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "id": "projet-a", "label": "Projet Alpha", "kind": "container",
+                    "weight": 2, "parent_id": "root"
+                }))
+                .unwrap(),
+                // Orphelin direct sous la racine, sans candidat thématique
+                // plausible — donc pas de bac "Non triable" présent nulle part.
+                note("orphelin", "root", "Facture Ünique 42"),
+            ],
+            edges: vec![],
+            markdown: String::new(),
+            report: String::new(),
+            generated_at: "t".into(),
+        };
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph).unwrap()).unwrap();
+
+        let report = run_archivist_scan_once_in(&dir).unwrap();
+        assert!(!report.trim().is_empty());
+
+        let proposals = load_proposals_in(&dir);
+        assert!(
+            proposals.iter().any(|p| p.action == "create" && p.id == archivist::CATCHALL_ID),
+            "le bac « Non triable » doit être proposé à la création : {:?}",
+            proposals.iter().map(|p| (&p.action, &p.id)).collect::<Vec<_>>()
+        );
+        assert!(
+            proposals.iter().any(|p| p.action == "move"
+                && p.target_id == "orphelin"
+                && p.new_parent_id == archivist::CATCHALL_ID),
+            "l'orphelin doit être rangé dans le bac DANS LE MÊME PASSAGE, pas laissé pour un suivant : {:?}",
+            proposals.iter().map(|p| (&p.action, &p.target_id, &p.new_parent_id)).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Régression du bug remonté par Liam le 2026-07-23 : sur un cerveau frais
+    /// (aucun bac "Non triable" existant), des factures/devis en vrac
+    /// atterrissaient TOUS à plat dans le bac, sans être groupés par thème —
+    /// le clustering ne regardait que les enfants DÉJÀ DANS le bac, qui
+    /// n'existaient pas encore dans ce même passage. Doit maintenant grouper
+    /// directement les factures dans un thème « Facture » et les devis dans un
+    /// thème « Devis », le bac plat ne recevant que ce qui ne se groupe pas.
+    #[test]
+    fn groupe_les_orphelins_par_theme_des_le_premier_passage_sans_bac_existant() {
+        let dir = std::env::temp_dir().join("lucid_test_archivist_cluster_same_pass");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = BrainGraph {
+            nodes: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "root", "label": "Lucid", "kind": "root", "weight": 3
+                }))
+                .unwrap(),
+                note("f1", "root", "Facture Janvier"),
+                note("f2", "root", "Facture Février"),
+                note("f3", "root", "Facture Mars"),
+                note("d1", "root", "Devis Toiture"),
+                note("d2", "root", "Devis Cuisine"),
+                note("d3", "root", "Devis Terrasse"),
+                // Un vrai isolé, sans mot partagé avec personne d'autre : lui
+                // seul doit finir dans le bac plat.
+                note("iso", "root", "Note diverse xyz"),
+            ],
+            edges: vec![],
+            markdown: String::new(),
+            report: String::new(),
+            generated_at: "t".into(),
+        };
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph).unwrap()).unwrap();
+
+        run_archivist_scan_once_in(&dir).unwrap();
+
+        let proposals = load_proposals_in(&dir);
+        let moved_to = |id: &str| -> Option<String> {
+            proposals.iter().find(|p| p.action == "move" && p.target_id == id).map(|p| p.new_parent_id.clone())
+        };
+
+        for id in ["f1", "f2", "f3"] {
+            assert_eq!(moved_to(id).as_deref(), Some("arch-theme-facture"),
+                "« {id} » doit rejoindre directement le thème « Facture », pas le bac plat : {:?}", moved_to(id));
+        }
+        for id in ["d1", "d2", "d3"] {
+            assert_eq!(moved_to(id).as_deref(), Some("arch-theme-devis"),
+                "« {id} » doit rejoindre directement le thème « Devis », pas le bac plat : {:?}", moved_to(id));
+        }
+        assert_eq!(moved_to("iso").as_deref(), Some(archivist::CATCHALL_ID),
+            "un isolé sans thème doit quand même finir dans le bac plat");
+
+        assert!(proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-facture"));
+        assert!(proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-devis"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Régression du bug remonté par Liam le 2026-07-23 : dès qu'un bac "Non
+    /// triable" existe déjà (donc à partir du DEUXIÈME passage), de nouveaux
+    /// orphelins qui partagent pourtant un mot ("INVOICE") repartaient par un
+    /// chemin qui contournait entièrement le clustering — ils atterrissaient
+    /// à plat dans le bac au lieu de se grouper. Doit maintenant clusterer
+    /// pareil, que le bac existe déjà ou non.
+    #[test]
+    fn clusterise_les_nouveaux_orphelins_meme_quand_le_bac_existe_deja() {
+        let dir = std::env::temp_dir().join("lucid_test_archivist_cluster_bac_existant");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut nodes = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "root", "label": "Lucid", "kind": "root", "weight": 3
+            }))
+            .unwrap(),
+            // Le bac existe déjà, vide (créé par un passage précédent).
+            note(archivist::CATCHALL_ID, "root", archivist::CATCHALL_LABEL),
+        ];
+        // 20 fichiers qui partagent le mot "INVOICE", nouvellement scannés —
+        // pas encore rangés nulle part (direct enfants de la racine).
+        for i in 0..20 {
+            nodes.push(note(&format!("inv{i}"), "root", &format!("INVOICE-{i:04}-XZ")));
+        }
+        let graph = BrainGraph {
+            nodes,
+            edges: vec![],
+            markdown: String::new(),
+            report: String::new(),
+            generated_at: "t".into(),
+        };
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph).unwrap()).unwrap();
+
+        run_archivist_scan_once_in(&dir).unwrap();
+
+        let proposals = load_proposals_in(&dir);
+        assert!(
+            proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-invoice"),
+            "un thème « Invoice » aurait dû être créé : {:?}",
+            proposals.iter().map(|p| (&p.action, &p.id)).collect::<Vec<_>>()
+        );
+        let moved_to_invoice_theme = proposals.iter()
+            .filter(|p| p.action == "move" && p.new_parent_id == "arch-theme-invoice")
+            .count();
+        assert_eq!(moved_to_invoice_theme, 20, "les 20 factures doivent rejoindre le thème, pas le bac plat");
+        let moved_to_flat_catchall = proposals.iter()
+            .filter(|p| p.action == "move" && p.new_parent_id == archivist::CATCHALL_ID)
+            .count();
+        assert_eq!(moved_to_flat_catchall, 0, "rien ne devrait rester à plat dans le bac ici");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Une seule passe de l'Archiviste à la fois (même logique que `GEN_LOCK` pour
+/// la génération) — évite deux déclencheurs concurrents (fin de scan + retour
+/// MCP + bouton manuel) de se marcher dessus sur `mcp_pending/`.
+static ARCHIVIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Commande Tauri de l'Archiviste — déclenchée en fin de scan machine, après
+/// qu'une IA (MCP) ait écrit dans le cerveau, ou manuellement depuis les
+/// Réglages. Dépose ses propositions dans `mcp_pending/` comme le ferait un
+/// MCP distant : le watcher existant (`start_mcp_pending_watcher`) prévient le
+/// front, qui les résout avec le même circuit (auto si autonome, bulles sinon)
+/// — aucune plomberie supplémentaire nécessaire pour l'appliquer.
+#[tauri::command]
+async fn run_archivist(app: tauri::AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = ARCHIVIST_LOCK.try_lock().map_err(|_| "L'Archiviste tourne déjà.".to_string())?;
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+        run_archivist_scan_once_in_progress(&dir, |current, total| {
+            let _ = app.emit("archivist-progress", serde_json::json!({
+                "current": current, "total": total,
+            }));
+        })
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
 /// Agrège toutes les sources connues.
@@ -577,35 +1092,38 @@ phrase d'introduction, pas de bloc de code englobant.";
 }
 
 /// Lit le graphe.
-/// Si `brain.md` est plus récent que `brain.json` (édition manuelle ou écriture LLM),
-/// on repparse brain.md et on met brain.json à jour avant de retourner le graphe.
+/// Migre `brain.json` vers `brain.db` au premier appel après mise à jour de
+/// l'app (one-shot, no-op ensuite — cf. Phase 2/4 du plan de migration SQLite).
+/// Si `brain.md` est plus récent que l'état persisté (édition manuelle ou
+/// écriture LLM), on repparse brain.md et on le persiste avant de retourner le graphe.
 #[tauri::command]
 fn read_brain_graph() -> Option<BrainGraph> {
     let dir = ai::llama::app_data_dir()?;
+    if let Err(e) = storage::migrate_json_to_sqlite(&dir) {
+        elog!("migration SQLite : {e}");
+    }
+    let db_path   = dir.join("brain.db");
     let json_path = dir.join("brain.json");
     let md_path   = dir.join("brain.md");
+    let state_path = if db_path.exists() { &db_path } else { &json_path };
 
     let md_newer = md_path.exists() && {
-        let jm = json_path.metadata().and_then(|m| m.modified()).ok();
+        let jm = state_path.metadata().and_then(|m| m.modified()).ok();
         let mm = md_path.metadata().and_then(|m| m.modified()).ok();
         match (jm, mm) {
             (Some(j), Some(m)) => m > j,
-            _ => !json_path.exists(),
+            _ => !state_path.exists(),
         }
     };
 
     if md_newer {
         let content = std::fs::read_to_string(&md_path).ok()?;
-        let graph = ai::brain_md::parse(&content);
-        if let Ok(json) = serde_json::to_string(&graph) {
-            let _ = std::fs::write(&json_path, json);
-        }
+        let mut graph = ai::brain_md::parse(&content);
+        let _ = backup::write_brain(&dir, &mut graph);
         return Some(graph);
     }
 
-    std::fs::read_to_string(&json_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    backup::load_brain_cached(&dir).ok()
 }
 
 /// Exporte un nœud + tous ses descendants en markdown standalone vers `path`.
@@ -751,7 +1269,7 @@ fn save_node_content(node_id: String, content: String) -> Result<(), String> {
 fn save_node_content_in(dir: &std::path::Path, node_id: &str, content: &str) -> Result<(), String> {
     let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
     save_node_content_on(dir, &mut graph, node_id, content)?;
-    backup::write_brain(dir, &mut graph)
+    backup::write_brain_touching(dir, &mut graph, &[node_id.to_string()], &[])
 }
 
 /// Mutation en mémoire seule (pas de lecture/écriture de brain.json) — permet
@@ -800,7 +1318,7 @@ fn insert_note_node(parent_id: String, label: String, content: String, source: O
 fn insert_note_node_in(dir: &std::path::Path, id: String, parent_id: String, label: String, content: String, source: Option<(&str, String)>) -> Result<BrainNode, String> {
     let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
     let node = insert_note_node_on(&mut graph, id, parent_id, label, content, source)?;
-    backup::write_brain(dir, &mut graph)?;
+    backup::write_brain_touching(dir, &mut graph, &[node.id.clone()], &[])?;
     Ok(node)
 }
 
@@ -1028,10 +1546,16 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
     // Zombie tolerance : le poll Supabase peut recréer localement une proposition
     // déjà appliquée (fenêtre de 10 min côté serveur) — une cible introuvable dans
     // ce cas n'est pas une vraie erreur, juste un nettoyage (même logique que
-    // "déjà présent" pour `create` plus bas).
+    // "déjà présent" pour `create` plus bas). Exclut EXPRÈS "Nœud parent … introuvable."
+    // (message distinct de `set_node_parent_on`, cf. juste en dessous) : ce n'est
+    // pas un zombie mais une vraie dépendance pas encore là (ex. accepter la bulle
+    // "déplacer vers X" avant celle "créer X") — la tolérer aurait fait disparaître
+    // le déplacement pour toujours (marqué résolu, fichier supprimé) sans jamais
+    // l'appliquer ni le signaler (bug réel remonté par Liam le 2026-07-23, trouvé
+    // via le même symptôme sur le lot automatique `resolve_all_pending_in`).
     fn tolerate_already_applied(r: Result<(), String>) -> Result<(), String> {
         match r {
-            Err(e) if e.ends_with("introuvable.") => Ok(()),
+            Err(e) if e.ends_with("introuvable.") && !e.starts_with("Nœud parent ") => Ok(()),
             other => other,
         }
     }
@@ -1152,23 +1676,50 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
     let mut resolved: Vec<String> = Vec::new();
     let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut created_parent_of: Vec<(String, String)> = Vec::new();
+    // Ids dont un CHAMP a réellement changé (pas juste une arête) — permet
+    // l'écriture ciblée en fin de lot (write_brain_touching) sans deviner par
+    // comparaison. "merge" reparente des enfants et redirige des wikilinks dans
+    // un ensemble de nœuds non prévisible à l'avance : dès qu'il apparaît dans
+    // le lot, on retombe sur le diff générique pour tout le lot (sûr, plus lent).
+    let mut touched_for_write: Vec<String> = Vec::new();
+    let mut used_merge = false;
 
     loop {
         let mut progressed = false;
         let mut remaining = Vec::new();
         for p in props {
             let ready = match p.action.as_str() {
-                "update" | "move" | "link" => graph.nodes.iter().any(|n| n.id == p.target_id),
+                "update" | "link" => graph.nodes.iter().any(|n| n.id == p.target_id),
+                // "move" a DEUX dépendances, pas juste la cible : la nouvelle
+                // destination doit aussi déjà exister (ex. un thème que
+                // l'Archiviste vient de créer dans LE MÊME lot). Sans vérifier
+                // `new_parent_id` ici, `set_node_parent_on` échouait plus bas
+                // avec "Nœud parent introuvable." — un message qui se termine
+                // par "introuvable.", donc TOLÉRÉ PLUS BAS comme un doublon
+                // déjà appliqué (zombie) au lieu d'être retenté au tour
+                // suivant : le déplacement disparaissait silencieusement pour
+                // toujours, le thème restant vide sans aucune erreur visible
+                // (bug réel remonté par Liam le 2026-07-23).
+                "move" => graph.nodes.iter().any(|n| n.id == p.target_id)
+                    && graph.nodes.iter().any(|n| n.id == p.new_parent_id),
                 "merge" => p.merge_ids.iter().all(|id| graph.nodes.iter().any(|n| &n.id == id)),
                 _ => graph.nodes.iter().any(|n| n.id == p.parent_id), // "create"
             };
             if !ready { remaining.push(p); continue; }
             progressed = true;
             let outcome: Result<Vec<String>, String> = match p.action.as_str() {
-                "update" => save_node_content_on(dir, &mut graph, &p.target_id, &p.content).map(|_| vec![p.target_id.clone()]),
-                "move" => set_node_parent_on(&mut graph, &p.target_id, &p.new_parent_id).map(|_| vec![p.target_id.clone()]),
+                "update" => save_node_content_on(dir, &mut graph, &p.target_id, &p.content).map(|_| {
+                    touched_for_write.push(p.target_id.clone());
+                    vec![p.target_id.clone()]
+                }),
+                "move" => set_node_parent_on(&mut graph, &p.target_id, &p.new_parent_id).map(|_| {
+                    touched_for_write.push(p.target_id.clone());
+                    vec![p.target_id.clone()]
+                }),
                 "link" => {
                     let relation = if p.relation.trim().is_empty() { None } else { Some(p.relation.clone()) };
+                    // link_nodes_on ne modifie que les arêtes (ni target_id ni link_target
+                    // ne changent de champ) — rien à ajouter à touched_for_write.
                     link_nodes_on(&mut graph, &p.target_id, &p.link_target, relation)
                         .map(|_| vec![p.target_id.clone(), p.link_target.clone()])
                 }
@@ -1177,13 +1728,18 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
                     match merge_nodes_on(&mut graph, &p.merge_ids, label) {
                         Ok(survivor) => {
                             for m in &p.merge_ids[1..] { tombstoned.insert(m.clone()); }
+                            used_merge = true;
                             Ok(vec![survivor.id])
                         }
                         Err(e) => Err(e),
                     }
                 }
                 _ => insert_note_node_on(&mut graph, p.id.clone(), p.parent_id.clone(), p.label.clone(), p.content.clone(), None)
-                    .map(|n| { created_parent_of.push((n.id.clone(), p.parent_id.clone())); vec![n.id] }),
+                    .map(|n| {
+                        created_parent_of.push((n.id.clone(), p.parent_id.clone()));
+                        touched_for_write.push(n.id.clone());
+                        vec![n.id]
+                    }),
             };
             match outcome {
                 Ok(ids) => {
@@ -1246,7 +1802,11 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
     }
 
     if !tombstoned.is_empty() { add_tombstones(dir, &tombstoned); }
-    backup::write_brain(dir, &mut graph)?;
+    if used_merge {
+        backup::write_brain(dir, &mut graph)?;
+    } else {
+        backup::write_brain_touching(dir, &mut graph, &touched_for_write, &[])?;
+    }
     let existing: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
     purge_dead_space_ids(dir, &existing);
     Ok(resolved)
@@ -1311,12 +1871,9 @@ fn import_mcp_proposal(
         return Ok(());
     }
     // "create" seul : garde-fou historique redondant mais inoffensif (le nœud
-    // vit déjà dans brain.json si accepté avant que ce registre n'existe).
+    // vit déjà dans le cerveau si accepté avant que ce registre n'existe).
     if action == "create" {
-        if let Ok(g) = std::fs::read_to_string(data_dir.join("brain.json"))
-            .map_err(|e| e.to_string())
-            .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).map_err(|e| e.to_string()))
-        {
+        if let Ok(g) = backup::load_brain_cached(&data_dir) {
             if g.nodes.iter().any(|n| n.id == id) {
                 return Ok(());
             }
@@ -1900,6 +2457,49 @@ mod mcp_proposal_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Vérification Phase 4 (couche d'écriture SQLite) : reproduit le scénario
+    /// mesuré le 2026-07-21 (lot de 44 créations via resolve_all_pending_in) sur
+    /// le VRAI cerveau de Liam (415 nœuds, ~50 Mo en JSON) plutôt que la petite
+    /// arborescence synthétique des autres tests — c'est la taille réelle qui
+    /// causait le freeze. Sautée si la fixture n'est pas présente (gitignored).
+    #[test]
+    fn resolve_all_lot_de_44_creations_sur_le_vrai_cerveau_pas_de_freeze() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/brain.liam.json");
+        if !fixture.exists() {
+            eprintln!("fixture réelle absente — test sauté (normal hors machine de Liam)");
+            return;
+        }
+
+        fn bench(dir: &std::path::Path, fixture: &std::path::Path, sqlite: bool) -> std::time::Duration {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir_all(mcp_pending_dir(dir)).unwrap();
+            std::fs::copy(fixture, dir.join("brain.json")).unwrap();
+            if sqlite {
+                crate::storage::migrate_json_to_sqlite(dir).unwrap();
+                assert!(dir.join("brain.db").exists());
+            }
+            for i in 0..44 {
+                propose(dir, &format!("bench-{i}"), "root", &format!("Bench {i}"));
+            }
+            let start = std::time::Instant::now();
+            let resolved = resolve_all_pending_in(dir).unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(resolved.len(), 44, "les 44 créations doivent toutes être résolues en un cycle");
+            elapsed
+        }
+
+        let dir_json = std::env::temp_dir().join("brainlink_test_bench_json");
+        let dir_sqlite = std::env::temp_dir().join("brainlink_test_bench_sqlite");
+        let t_json = bench(&dir_json, &fixture, false);
+        let t_sqlite = bench(&dir_sqlite, &fixture, true);
+
+        eprintln!("Phase 4 — lot de 44 créations sur brain réel (415 nœuds) : JSON = {t_json:?}, SQLite = {t_sqlite:?}");
+        assert!(t_sqlite < std::time::Duration::from_secs(2), "lot de 44 créations trop lent côté SQLite : {t_sqlite:?}");
+
+        let _ = std::fs::remove_dir_all(&dir_json);
+        let _ = std::fs::remove_dir_all(&dir_sqlite);
+    }
+
     #[test]
     fn resolve_all_laisse_en_attente_une_proposition_dont_la_cible_narrive_jamais() {
         let dir = setup("resolve_all_stuck");
@@ -2191,7 +2791,7 @@ fn set_node_parent(node_id: String, parent_id: String) -> Result<(), String> {
 fn set_node_parent_in(dir: &std::path::Path, node_id: &str, parent_id: &str) -> Result<(), String> {
     let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
     set_node_parent_on(&mut graph, node_id, parent_id)?;
-    backup::write_brain(dir, &mut graph)
+    backup::write_brain_touching(dir, &mut graph, &[node_id.to_string()], &[])
 }
 
 /// Mutation en mémoire seule — cf. `save_node_content_on`.
@@ -2234,7 +2834,9 @@ fn set_node_parent_on(graph: &mut BrainGraph, node_id: &str, parent_id: &str) ->
 fn link_nodes_in(dir: &std::path::Path, a: &str, b: &str, relation: Option<String>) -> Result<(), String> {
     let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
     link_nodes_on(&mut graph, a, b, relation)?;
-    backup::write_brain(dir, &mut graph)
+    // link_nodes_on ne modifie que les arêtes (ni a ni b ne changent de champ) —
+    // aucun nœud à ré-estampiller, seul le diff d'arêtes de write_brain_touching joue.
+    backup::write_brain_touching(dir, &mut graph, &[], &[])
 }
 
 /// Mutation en mémoire seule — cf. `save_node_content_on`.
@@ -2264,6 +2866,10 @@ fn merge_nodes_in(dir: &std::path::Path, ids: &[String], label: Option<String>) 
     let mut graph: BrainGraph = backup::load_brain_cached(dir)?;
     let result = merge_nodes_on(&mut graph, ids, label)?;
     add_tombstones(dir, &ids[1..].iter().cloned().collect());
+    // Reste sur le diff générique (write_brain, pas write_brain_touching) :
+    // merge_nodes_on reparente aussi les enfants des nœuds fusionnés et redirige
+    // les [[wikilinks]] dans un nombre de nœuds non borné à l'avance — pas un
+    // ensemble d'ids connu au moment de l'appel, contrairement aux 4 autres cas.
     backup::write_brain(dir, &mut graph)?;
     let existing: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
     purge_dead_space_ids(dir, &existing);
@@ -2385,6 +2991,77 @@ mod tombstone_tests {
         let t = load_tombstones(&dir);
         assert_eq!(t.len(), 2, "cumul sans doublon : {t:?}");
         assert!(t.contains("leaf:a") && t.contains("p:x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Phase 7 — snapshots via `VACUUM INTO` sur un compte migré SQLite. Avant ce
+/// correctif, `save_snapshot_in` faisait `if !brain_path.exists() { return; }`
+/// sur `brain.json` : une fois ce fichier renommé par la migration, plus AUCUN
+/// snapshot n'était pris, silencieusement — trouvé le 2026-07-22.
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn graph_with(ids: &[&str]) -> BrainGraph {
+        BrainGraph {
+            nodes: ids.iter().map(|id| serde_json::from_value(serde_json::json!({
+                "id": id, "label": id, "kind": if *id == "root" { "root" } else { "leaf" }, "weight": 1
+            })).unwrap()).collect(),
+            edges: vec![],
+            markdown: String::new(),
+            report: String::new(),
+            generated_at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn save_snapshot_produit_un_db_sur_compte_migre_et_se_liste() {
+        let dir = std::env::temp_dir().join("lucid_test_snapshot_db");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph_with(&["root", "A"])).unwrap()).unwrap();
+        storage::migrate_json_to_sqlite(&dir).unwrap();
+        assert!(dir.join("brain.db").exists());
+
+        save_snapshot_in(&dir, "test_reason");
+
+        let files: Vec<String> = std::fs::read_dir(dir.join("snapshots")).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .collect();
+        assert!(files.iter().any(|f| f.ends_with(".db")), "attendu un snapshot .db : {files:?}");
+
+        let infos = list_snapshots_in(&dir);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].reason, "test_reason");
+        assert_eq!(infos[0].node_count, 2, "le snapshot .db doit se lister avec le bon nombre de nœuds");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_snapshot_depuis_un_db_restaure_letat_sqlite_actif() {
+        let dir = std::env::temp_dir().join("lucid_test_restore_db");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph_with(&["root", "A"])).unwrap()).unwrap();
+        storage::migrate_json_to_sqlite(&dir).unwrap();
+
+        save_snapshot_in(&dir, "avant_suppression");
+        let infos = list_snapshots_in(&dir);
+        let snapshot_id = infos[0].id.clone();
+
+        // "A" disparaît après le snapshot (simule une suppression malencontreuse).
+        let mut graph = backup::load_brain_cached(&dir).unwrap();
+        graph.nodes.retain(|n| n.id != "A");
+        backup::write_brain(&dir, &mut graph).unwrap();
+        assert!(!backup::load_brain_cached(&dir).unwrap().nodes.iter().any(|n| n.id == "A"));
+
+        let restored = restore_snapshot_in(&dir, &snapshot_id).unwrap();
+        assert!(restored.nodes.iter().any(|n| n.id == "A"), "A doit revenir après restauration");
+
+        // Persisté pour de vrai dans brain.db, pas juste dans la valeur retournée.
+        let reloaded = backup::load_brain_cached(&dir).unwrap();
+        assert!(reloaded.nodes.iter().any(|n| n.id == "A"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -2528,17 +3205,26 @@ struct SnapshotInfo {
 
 /// `reason` identifie l'origine (ex. "mcp_accept") — sert au panneau Historique
 /// à retrouver « la dernière action de l'Archiviste » sans mécanisme dédié.
+/// Phase 7 : si `brain.db` existe, snapshot via `VACUUM INTO` (copie cohérente,
+/// WAL inclus) — sinon copie JSON classique (comptes pas encore migrés).
+/// Avant cette Phase 7, ce garde-fou ne prenait PLUS AUCUN snapshot une fois
+/// `brain.json` renommé par la migration (le test d'existence renvoyait
+/// silencieusement sans rien faire) : trouvé le 2026-07-22 en creusant le plan.
 fn save_snapshot_in(dir: &std::path::Path, reason: &str) {
-    let brain_path = dir.join("brain.json");
-    if !brain_path.exists() { return; }
     let snap_dir = dir.join("snapshots");
     if std::fs::create_dir_all(&snap_dir).is_err() { return; }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let _ = std::fs::copy(&brain_path, snap_dir.join(format!("brain_{ts}_{reason}.json")));
-    // Garder les 10 derniers
+    if dir.join("brain.db").exists() {
+        let _ = storage::snapshot_to(dir, &snap_dir.join(format!("brain_{ts}_{reason}.db")));
+    } else {
+        let brain_path = dir.join("brain.json");
+        if !brain_path.exists() { return; }
+        let _ = std::fs::copy(&brain_path, snap_dir.join(format!("brain_{ts}_{reason}.json")));
+    }
+    // Garder les 10 derniers (tous formats confondus — le nom trie chronologiquement).
     if let Ok(entries) = std::fs::read_dir(&snap_dir) {
         let mut files: Vec<_> = entries.flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("brain_"))
@@ -2552,23 +3238,36 @@ fn save_snapshot_in(dir: &std::path::Path, reason: &str) {
 #[tauri::command]
 fn list_snapshots() -> Vec<SnapshotInfo> {
     let Some(dir) = ai::llama::app_data_dir() else { return vec![]; };
+    list_snapshots_in(&dir)
+}
+
+/// Variante injectable (dossier explicite) — testable sans dépendre de
+/// `ai::llama::app_data_dir()`.
+fn list_snapshots_in(dir: &std::path::Path) -> Vec<SnapshotInfo> {
     let snap_dir = dir.join("snapshots");
     let mut infos: Vec<SnapshotInfo> = std::fs::read_dir(&snap_dir)
         .into_iter().flatten().flatten()
         .filter_map(|e| {
             let name = e.file_name();
             let s = name.to_string_lossy();
-            if !s.starts_with("brain_") || !s.ends_with(".json") { return None; }
-            let stem = s.strip_prefix("brain_")?.strip_suffix(".json")?;
+            // Phase 7 : les nouveaux snapshots sont des `.db` (VACUUM INTO) ; les
+            // `.json` restent lisibles (snapshots pris avant la migration du compte).
+            let is_db = s.ends_with(".db");
+            if !s.starts_with("brain_") || !(is_db || s.ends_with(".json")) { return None; }
+            let stem = s.strip_prefix("brain_")?.strip_suffix(if is_db { ".db" } else { ".json" })?;
             // Anciens snapshots : "brain_<ts>.json" (pas de raison) → "manual".
             let (ts_str, reason) = match stem.split_once('_') {
                 Some((ts, reason)) => (ts, reason.to_string()),
                 None => (stem, "manual".to_string()),
             };
             let created_at: u64 = ts_str.parse().ok()?;
-            let node_count = std::fs::read_to_string(e.path()).ok()
-                .and_then(|r| serde_json::from_str::<BrainGraph>(&r).ok())
-                .map(|g| g.nodes.len()).unwrap_or(0);
+            let node_count = if is_db {
+                storage::load_brain_graph_from_file(&e.path()).map(|g| g.nodes.len()).unwrap_or(0)
+            } else {
+                std::fs::read_to_string(e.path()).ok()
+                    .and_then(|r| serde_json::from_str::<BrainGraph>(&r).ok())
+                    .map(|g| g.nodes.len()).unwrap_or(0)
+            };
             Some(SnapshotInfo { id: format!("brain_{stem}"), created_at, node_count, reason })
         })
         .collect();
@@ -2579,19 +3278,33 @@ fn list_snapshots() -> Vec<SnapshotInfo> {
 #[tauri::command]
 fn restore_snapshot(snapshot_id: String) -> Result<BrainGraph, String> {
     let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    let src = dir.join("snapshots").join(format!("{snapshot_id}.json"));
-    save_snapshot_in(&dir, "pre_restore"); // snapshot de l'état actuel avant restauration
-    let raw = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
-    let mut graph: BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    restore_snapshot_in(&dir, &snapshot_id)
+}
+
+/// Variante injectable (dossier explicite) — testable sans dépendre de
+/// `ai::llama::app_data_dir()`.
+fn restore_snapshot_in(dir: &std::path::Path, snapshot_id: &str) -> Result<BrainGraph, String> {
+    let snap_dir = dir.join("snapshots");
+    let db_src = snap_dir.join(format!("{snapshot_id}.db"));
+    let json_src = snap_dir.join(format!("{snapshot_id}.json"));
+    save_snapshot_in(dir, "pre_restore"); // snapshot de l'état actuel avant restauration
     // write_brain (et pas une copie brute) : les nœuds qui changent par rapport à
     // l'état courant sont ré-estampillés, sinon la sync « annulerait » la restauration
-    // en re-fusionnant l'état cloud plus récent par-dessus.
-    backup::write_brain(&dir, &mut graph)?;
+    // en re-fusionnant l'état cloud plus récent par-dessus. Marche pareil pour un
+    // snapshot .db (Phase 7) : on lit son contenu et on le repasse par write_brain,
+    // qui écrit en JSON ou en SQLite selon ce que le compte actif utilise déjà.
+    let mut graph: BrainGraph = if db_src.exists() {
+        storage::load_brain_graph_from_file(&db_src)?
+    } else {
+        let raw = std::fs::read_to_string(&json_src).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    };
+    backup::write_brain(dir, &mut graph)?;
     // Un nœud créé après ce snapshot (ex. une note acceptée via MCP) peut encore
     // vivre dans un space : sans purge, le space affiche un nombre de nœuds sans
     // rien de visible sur le canvas (ids fantômes — bug remonté par Liam le 2026-07-21).
     let existing: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
-    purge_dead_space_ids(&dir, &existing);
+    purge_dead_space_ids(dir, &existing);
     Ok(graph)
 }
 
@@ -3030,6 +3743,10 @@ fn reset_environment() -> Result<(), String> {
     // reviendrait « connecté » après reset. On repart déconnecté (réactivable
     // dans Settings → Connecteurs), comme un utilisateur vierge.
     let _ = std::fs::write(dir.join("claude_code_disabled"), "");
+    // Le process Tauri ne redémarre pas au reload du front : sans vider le
+    // cache mémoire, une lecture juste après reconnexion renvoie l'ancien
+    // cerveau depuis la RAM, disque vide ou pas.
+    backup::clear_cache();
     Ok(())
 }
 
@@ -3345,10 +4062,14 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
         //    doit reconstruire que ce qui en vient. Une suppression = tombstone,
         //    jamais une absence de régénération.
         // Sauf en sortie de démo : le starter ne doit jamais fuiter dans le vrai cerveau.
+        // Passe par load_brain_cached (lit brain.db si migré, brain.json sinon) —
+        // une lecture directe de brain.json aurait silencieusement renvoyé "aucun
+        // état existant" pour tout compte déjà migré vers SQLite (le fichier a été
+        // renommé), effaçant notes manuelles et contenu édité à la régénération
+        // suivante (trouvé le 2026-07-22 en creusant la Phase 6, jamais déclenché
+        // en pratique mais aurait été un vrai bug silencieux).
         let prev_graph = if was_demo { None } else {
-            ai::llama::app_data_dir()
-                .and_then(|d| std::fs::read_to_string(d.join("brain.json")).ok())
-                .and_then(|raw| serde_json::from_str::<BrainGraph>(&raw).ok())
+            ai::llama::app_data_dir().and_then(|d| backup::load_brain_cached(&d).ok())
         };
         let saved_content: std::collections::HashMap<String, String> = prev_graph
             .as_ref()
@@ -3821,10 +4542,20 @@ pub fn run() {
             set_telemetry,
             sentry_active,
             crash_test,
-            ai_info
+            ai_info,
+            run_archivist,
+            archivist_was_interrupted
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app_handle, event| {
+            // Le serveur d'inférence persistant (cf. ai/llama.rs) doit mourir
+            // avec l'app — sinon un process GPU-actif traîne après la
+            // fermeture de Lucid.
+            if let tauri::RunEvent::Exit = event {
+                ai::llama::shutdown_server();
+            }
+        });
 }
 
 #[cfg(test)]

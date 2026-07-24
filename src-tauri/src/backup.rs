@@ -7,8 +7,12 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 /// Fichiers / dossiers embarqués dans la sauvegarde (relatifs au dossier de données).
+/// `brain.db` (Phase 8) coexiste avec `brain.json` : un compte migré n'a plus
+/// que le premier, un compte pas encore migré n'a que le second — `is_file()`
+/// dans `export_in` ignore silencieusement celui qui est absent.
 pub const FILES: &[&str] = &[
     "brain.json",
+    "brain.db",
     "brain.md",
     "spaces.json",
     "deleted_nodes.json",
@@ -44,12 +48,30 @@ fn set_cache(dir: &Path, graph: &crate::models::BrainGraph) {
     *cache = Some((dir.to_path_buf(), graph.clone()));
 }
 
-/// Charge brain.json — depuis le cache mémoire s'il correspond au même dossier
-/// (compte actif inchangé), sinon relit le disque et peuple le cache.
+/// Invalide le cache mémoire — nécessaire après toute suppression de fichiers
+/// qui ne passe pas par `write_brain`/`merge_in` (ex. `reset_environment`) :
+/// le process Tauri ne redémarre pas quand le front recharge la page, donc
+/// sans ça une prochaine lecture renvoie l'ancien cerveau depuis la RAM même
+/// si le disque est vide (bug remonté par Liam le 2026-07-22 : reset → data
+/// toujours là après reconnexion, alors que disque ET cloud étaient vides).
+pub fn clear_cache() {
+    let mut cache = BRAIN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    *cache = None;
+}
+
+/// Charge le cerveau — depuis le cache mémoire s'il correspond au même dossier
+/// (compte actif inchangé), sinon relit le disque et peuple le cache. Lit
+/// `brain.db` s'il existe (post-migration SQLite, Phase 3a), sinon `brain.json`
+/// (comportement historique — tant que la migration n'est pas déclenchée au
+/// démarrage, cf. Phase 4, tous les comptes existants restent sur ce chemin).
 pub fn load_brain_cached(dir: &Path) -> Result<crate::models::BrainGraph, String> {
     if let Some(g) = cached_for(dir) { return Ok(g); }
-    let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
-    let graph: crate::models::BrainGraph = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let graph = if dir.join("brain.db").exists() {
+        crate::storage::load_brain_graph(dir)?
+    } else {
+        let raw = std::fs::read_to_string(dir.join("brain.json")).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    };
     set_cache(dir, &graph);
     Ok(graph)
 }
@@ -88,6 +110,18 @@ pub fn migrate_unsafe_names(dir: &Path) {
     }
 }
 
+/// Force l'écriture du WAL dans `brain.db` avant de le zipper (Phase 8).
+/// En mode WAL, un commit récent peut n'exister que dans `brain.db-wal` —
+/// zipper `brain.db` seul sans checkpoint produirait une sauvegarde qui a
+/// l'air correcte mais qui manque les toutes dernières écritures (bien pire
+/// qu'un simple fichier texte, qui n'a pas ce problème). No-op si pas migré.
+fn checkpoint_wal(dir: &Path) {
+    if !dir.join("brain.db").exists() { return; }
+    if let Ok(conn) = crate::storage::open_or_init(dir) {
+        let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+    }
+}
+
 /// Chemin relatif d'une entrée de zip, chaque composant assaini — les zips
 /// produits par d'anciens builds Mac contiennent des `:` qui feraient planter
 /// toute écriture sur Windows.
@@ -100,6 +134,7 @@ fn safe_rel(rel: &Path) -> std::path::PathBuf {
 /// Zippe les données du cerveau. Renvoie les octets du zip.
 pub fn export_in(dir: &Path) -> Result<Vec<u8>, String> {
     migrate_unsafe_names(dir);
+    checkpoint_wal(dir);
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
@@ -150,7 +185,11 @@ pub fn fingerprint_in(dir: &Path) -> u64 {
     };
     let files = FILES.iter().map(|f| dir.join(f));
     let dirs = DIRS.iter().flat_map(|d| walk(&dir.join(d)));
-    files.chain(dirs).map(|p| mtime(&p)).max().unwrap_or(0)
+    // brain.db-wal : en mode WAL, un commit récent peut n'exister que là — sans
+    // le compter, l'empreinte ne bougerait pas juste après une écriture tant
+    // qu'aucun checkpoint n'a eu lieu, et la sync croirait que rien n'a changé.
+    let wal = std::iter::once(dir.join("brain.db-wal"));
+    files.chain(dirs).chain(wal).map(|p| mtime(&p)).max().unwrap_or(0)
 }
 
 /// Fichiers d'une arborescence (récursif, fichiers seulement).
@@ -172,10 +211,13 @@ pub fn import_in(dir: &Path, bytes: &[u8]) -> Result<usize, String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("Archive illisible : {e}"))?;
 
-    // Filet : brain.json actuel sauvegardé avant écrasement.
-    let brain = dir.join("brain.json");
-    if brain.exists() {
-        let _ = std::fs::copy(&brain, dir.join("brain.json.avant-restauration"));
+    // Filet : état actuel sauvegardé avant écrasement (brain.json ou brain.db
+    // selon ce que le compte utilise).
+    for name in ["brain.json", "brain.db"] {
+        let p = dir.join(name);
+        if p.exists() {
+            let _ = std::fs::copy(&p, dir.join(format!("{name}.avant-restauration")));
+        }
     }
 
     let mut count = 0;
@@ -218,12 +260,30 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Sérialise un nœud SANS son champ `updated_at` — pour comparer deux versions
-/// d'un nœud sans que l'estampille elle-même compte comme une différence.
-fn node_sig(n: &crate::models::BrainNode) -> String {
-    let mut v = serde_json::to_value(n).unwrap_or_default();
-    if let Some(o) = v.as_object_mut() { o.remove("updated_at"); }
-    v.to_string()
+/// Compare deux nœuds SANS leur `updated_at` — pour détecter si un nœud a
+/// vraiment changé sans que l'estampille elle-même compte comme une
+/// différence. Comparaison directe des champs, pas de sérialisation JSON :
+/// l'ancienne version (`node_sig`, un `serde_json::to_value` par nœud) coûtait
+/// cher sur les 415 nœuds à CHAQUE écriture, avec des `source_text` moyens de
+/// ~100+ Ko — délai perceptible remonté par Liam le 2026-07-22 sur la simple
+/// création d'une note (~1s rien que pour ce diff, avant même la persistance).
+fn node_unchanged(a: &crate::models::BrainNode, b: &crate::models::BrainNode) -> bool {
+    a.label == b.label
+        && a.kind == b.kind
+        && a.weight == b.weight
+        && a.summary == b.summary
+        && a.keywords == b.keywords
+        && a.decisions == b.decisions
+        && a.patterns == b.patterns
+        && a.community == b.community
+        && a.parent_id == b.parent_id
+        && a.synthesized_at == b.synthesized_at
+        && a.date == b.date
+        && a.content == b.content
+        && a.connector == b.connector
+        && a.source_id == b.source_id
+        && a.source_project == b.source_project
+        && a.source_text == b.source_text
 }
 
 /// Écrit brain.json en estampillant `updated_at` sur chaque nœud nouveau ou
@@ -231,6 +291,9 @@ fn node_sig(n: &crate::models::BrainNode) -> String {
 /// unique : tous les writers de brain.json doivent l'utiliser, sinon les
 /// modifications ne se propagent pas dans la fusion de sync.
 pub fn write_brain(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
+    if dir.join("brain.db").exists() {
+        return write_brain_sqlite(dir, graph);
+    }
     // "old" vient du cache mémoire quand possible — évite une lecture complète
     // de plus du disque en plus de celle déjà faite par l'appelant pour
     // préparer `graph` (cf. `load_brain_cached`).
@@ -238,13 +301,13 @@ pub fn write_brain(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
         std::fs::read_to_string(dir.join("brain.json")).ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
     });
-    let old_by_id: std::collections::HashMap<String, (Option<u64>, String)> = old
-        .map(|g| g.nodes.into_iter().map(|n| (n.id.clone(), (n.updated_at, node_sig(&n)))).collect())
+    let old_by_id: std::collections::HashMap<String, (Option<u64>, crate::models::BrainNode)> = old
+        .map(|g| g.nodes.into_iter().map(|n| (n.id.clone(), (n.updated_at, n))).collect())
         .unwrap_or_default();
     let now = now_secs();
     for n in &mut graph.nodes {
         n.updated_at = match old_by_id.get(&n.id) {
-            Some((stamp, sig)) if *sig == node_sig(n) => stamp.or(Some(now)),
+            Some((stamp, old_n)) if node_unchanged(old_n, n) => stamp.or(Some(now)),
             _ => Some(now),
         };
     }
@@ -253,6 +316,182 @@ pub fn write_brain(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
         serde_json::to_string_pretty(graph).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    set_cache(dir, graph);
+    Ok(())
+}
+
+/// Variante SQLite de `write_brain` (Phase 4). Même règle d'estampillage
+/// (`node_unchanged`, comparaison à l'ancien graphe), mais la persistance devient un
+/// `UPDATE`/`INSERT` ciblé par nœud réellement modifié + un `DELETE` par nœud
+/// disparu, dans une seule transaction — plus de sérialisation d'un blob de
+/// plusieurs dizaines de Mo à chaque mutation (c'est ce qui causait le freeze
+/// du lot de 44 créations MCP, 2026-07-21). Les arêtes suivent le même diff
+/// ciblé (clé naturelle source/target/kind/relation, pas d'id stable dans le
+/// modèle actuel). `markdown`/`report` (le texte complet du cerveau, plusieurs
+/// Mo, pas encore recalculés depuis SQL — Phase 6) ne sont ré-écrits QUE s'ils
+/// ont réellement changé : les réécrire à chaque mutation (constaté le
+/// 2026-07-22 : ~18 ms sur ~28 ms pour l'ajout d'une seule note, l'essentiel
+/// du coût restant) recréait exactement le problème que SQLite devait éliminer.
+fn write_brain_sqlite(dir: &Path, graph: &mut BrainGraph) -> Result<(), String> {
+    let old: Option<BrainGraph> = cached_for(dir).or_else(|| crate::storage::load_brain_graph(dir).ok());
+    let (old_by_id, old_edges, old_meta): (
+        std::collections::HashMap<String, (Option<u64>, crate::models::BrainNode)>,
+        std::collections::HashSet<(String, String, String, String)>,
+        Option<(String, String, String)>,
+    ) = match old {
+        Some(BrainGraph { nodes, edges, markdown, report, generated_at }) => {
+            let edges_set = edges.into_iter().map(|e| (e.source, e.target, e.kind, e.relation)).collect();
+            let by_id = nodes.into_iter().map(|n| (n.id.clone(), (n.updated_at, n))).collect();
+            (by_id, edges_set, Some((markdown, report, generated_at)))
+        }
+        None => (Default::default(), Default::default(), None),
+    };
+    let old_ids: std::collections::HashSet<String> = old_by_id.keys().cloned().collect();
+    let now = now_secs();
+
+    let mut changed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for n in &mut graph.nodes {
+        match old_by_id.get(&n.id) {
+            Some((stamp, old_n)) if node_unchanged(old_n, n) => {
+                if stamp.is_none() { changed_ids.insert(n.id.clone()); }
+                n.updated_at = stamp.or(Some(now));
+            }
+            _ => {
+                n.updated_at = Some(now);
+                changed_ids.insert(n.id.clone());
+            }
+        }
+    }
+    let new_ids: std::collections::HashSet<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+    let removed_ids: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
+
+    let new_edges: std::collections::HashSet<(String, String, String, String)> = graph.edges.iter()
+        .map(|e| (e.source.clone(), e.target.clone(), e.kind.clone(), e.relation.clone()))
+        .collect();
+    let edges_to_add: Vec<&(String, String, String, String)> = new_edges.difference(&old_edges).collect();
+    let edges_to_remove: Vec<&(String, String, String, String)> = old_edges.difference(&new_edges).collect();
+
+    let (old_markdown, old_report, old_generated_at) = match &old_meta {
+        Some((m, r, g)) => (Some(m.as_str()), Some(r.as_str()), Some(g.as_str())),
+        None => (None, None, None),
+    };
+
+    let mut conn = crate::storage::open_or_init(dir).map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // Un lot peut contenir un enfant AVANT son parent tout juste créé dans le
+    // même lot (ex. l'Archiviste qui crée un dossier de thème et y déplace ses
+    // pages en une seule résolution) — sans ça, `nodes.parent_id REFERENCES
+    // nodes(id)` échoue en "FOREIGN KEY constraint failed" dès que l'ordre
+    // d'itération de `graph.nodes` traite l'enfant avant le parent (bug réel
+    // remonté par Liam le 2026-07-23 : 244 propositions marquées résolues côté
+    // fichiers, mais AUCUNE persistée dans brain.db — l'écriture finale
+    // échouait silencieusement après coup). Reporte la vérification des clés
+    // étrangères au COMMIT : l'ordre d'insertion dans CE lot n'a plus besoin
+    // d'être topologique tant que l'ensemble est cohérent à la fin.
+    tx.pragma_update(None, "defer_foreign_keys", true).map_err(|e| e.to_string())?;
+    for n in graph.nodes.iter().filter(|n| changed_ids.contains(&n.id)) {
+        crate::storage::upsert_node(&tx, n).map_err(|e| format!("upsert nœud {} : {e}", n.id))?;
+    }
+    for id in &removed_ids {
+        tx.execute("DELETE FROM nodes WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
+    }
+    sync_edges_tx(&tx, &edges_to_add, &edges_to_remove)?;
+    if old_markdown != Some(graph.markdown.as_str()) {
+        crate::storage::set_meta(&tx, "markdown", &graph.markdown).map_err(|e| e.to_string())?;
+    }
+    if old_report != Some(graph.report.as_str()) {
+        crate::storage::set_meta(&tx, "report", &graph.report).map_err(|e| e.to_string())?;
+    }
+    if old_generated_at != Some(graph.generated_at.as_str()) {
+        crate::storage::set_meta(&tx, "generated_at", &graph.generated_at).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    set_cache(dir, graph);
+    Ok(())
+}
+
+type EdgeKey = (String, String, String, String);
+
+fn sync_edges_tx(tx: &rusqlite::Transaction, to_add: &[&EdgeKey], to_remove: &[&EdgeKey]) -> Result<(), String> {
+    if !to_remove.is_empty() {
+        let mut del = tx
+            .prepare("DELETE FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3 AND relation = ?4")
+            .map_err(|e| e.to_string())?;
+        for (s, t, k, r) in to_remove {
+            del.execute(rusqlite::params![s, t, k, r]).map_err(|e| e.to_string())?;
+        }
+    }
+    if !to_add.is_empty() {
+        let mut ins = tx
+            .prepare("INSERT INTO edges (source, target, kind, relation) VALUES (?1,?2,?3,?4)")
+            .map_err(|e| e.to_string())?;
+        for (s, t, k, r) in to_add {
+            ins.execute(rusqlite::params![s, t, k, r]).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Variante ciblée : pour les appelants qui savent PRÉCISÉMENT quels nœuds ils
+/// viennent de créer/modifier/supprimer (les 5 fonctions `_on` et
+/// `resolve_all_pending_in`) — aucune lecture ni comparaison du graphe entier,
+/// juste l'écriture des lignes concernées. Le diff générique de
+/// `write_brain_sqlite` (charger l'ancien graphe, comparer les 415 nœuds un
+/// par un) n'a de sens que quand l'appelant ne sait pas ce qui a changé
+/// (régénération complète du pipeline IA) ; ici on le sait déjà, le déduire à
+/// nouveau par comparaison est un travail inutile (constaté avec Liam le
+/// 2026-07-22). Les arêtes restent diffées, mais contre une lecture légère
+/// (`storage::load_edges`, pas de gros `source_text` à charger) — les `_on`
+/// ne signalent pas encore précisément quelles arêtes elles ont touchées.
+/// `markdown`/`report`/`generated_at` ne sont jamais écrits ici : seule la
+/// régénération complète les modifie, et elle passe par `write_brain`.
+pub fn write_brain_touching(
+    dir: &Path,
+    graph: &mut BrainGraph,
+    touched_ids: &[String],
+    removed_ids: &[String],
+) -> Result<(), String> {
+    if !dir.join("brain.db").exists() {
+        // Pas encore migré vers SQLite : le fichier JSON n'a pas de notion de
+        // ligne — retombe sur l'écriture pleine (diff générique, sur un
+        // fichier et non une base, comportement inchangé).
+        return write_brain(dir, graph);
+    }
+    let now = now_secs();
+    let touched: std::collections::HashSet<&str> = touched_ids.iter().map(|s| s.as_str()).collect();
+    for n in graph.nodes.iter_mut() {
+        if touched.contains(n.id.as_str()) {
+            n.updated_at = Some(now);
+        }
+    }
+
+    let old_edges: std::collections::HashSet<EdgeKey> = crate::storage::load_edges(dir)?
+        .into_iter()
+        .map(|e| (e.source, e.target, e.kind, e.relation))
+        .collect();
+    let new_edges: std::collections::HashSet<EdgeKey> = graph.edges.iter()
+        .map(|e| (e.source.clone(), e.target.clone(), e.kind.clone(), e.relation.clone()))
+        .collect();
+    let edges_to_add: Vec<&EdgeKey> = new_edges.difference(&old_edges).collect();
+    let edges_to_remove: Vec<&EdgeKey> = old_edges.difference(&new_edges).collect();
+
+    let mut conn = crate::storage::open_or_init(dir).map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // Même raison que dans `write_brain_sqlite` : un lot peut créer un parent
+    // ET déplacer ses enfants dedans en une seule résolution, dans un ordre
+    // qui n'est pas forcément topologique — cf. commentaire là-bas (bug réel
+    // du 2026-07-23, "FOREIGN KEY constraint failed" silencieux).
+    tx.pragma_update(None, "defer_foreign_keys", true).map_err(|e| e.to_string())?;
+    for n in graph.nodes.iter().filter(|n| touched.contains(n.id.as_str())) {
+        crate::storage::upsert_node(&tx, n).map_err(|e| format!("upsert nœud {} : {e}", n.id))?;
+    }
+    for id in removed_ids {
+        tx.execute("DELETE FROM nodes WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
+    }
+    sync_edges_tx(&tx, &edges_to_add, &edges_to_remove)?;
+    tx.commit().map_err(|e| e.to_string())?;
+
     set_cache(dir, graph);
     Ok(())
 }
@@ -313,15 +552,50 @@ fn zip_json<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&raw).ok()
 }
 
+/// Pendant binaire de `zip_json` pour "brain.db" (Phase 8) : extrait l'entrée
+/// vers un fichier temporaire (SQLite n'ouvre pas une base depuis un buffer
+/// mémoire) et la lit comme un graphe.
+fn zip_brain_db(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Option<BrainGraph> {
+    let mut entry = archive.by_name("brain.db").ok()?;
+    let mut buf = Vec::new();
+    entry.read_to_end(&mut buf).ok()?;
+    drop(entry);
+    let tmp = std::env::temp_dir().join(format!("lucid_merge_remote_{}_{}.db", now_secs(), std::process::id()));
+    std::fs::write(&tmp, &buf).ok()?;
+    let graph = crate::storage::load_brain_graph_from_file(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    graph
+}
+
+/// Persiste un graphe déjà fusionné — les estampilles ont été décidées par la
+/// fusion LWW (celles du camp qui gagne) et ne doivent JAMAIS être recalculées
+/// à l'écriture (contrairement à `write_brain`) : SQLite si le compte y est
+/// déjà, JSON sinon.
+fn persist_merged(dir: &Path, graph: &BrainGraph) -> Result<(), String> {
+    if dir.join("brain.db").exists() {
+        crate::storage::replace_graph(dir, graph)?;
+    } else {
+        std::fs::write(
+            dir.join("brain.json"),
+            serde_json::to_string_pretty(graph).map_err(|e| e.to_string())?,
+        ).map_err(|e| e.to_string())?;
+    }
+    set_cache(dir, graph);
+    Ok(())
+}
+
 /// Fusionne une sauvegarde distante dans les données locales (sync cloud).
 pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
     migrate_unsafe_names(dir);
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("Archive illisible : {e}"))?;
 
-    // Filet : brain.json actuel gardé avant fusion.
-    if dir.join("brain.json").exists() {
-        let _ = std::fs::copy(dir.join("brain.json"), dir.join("brain.json.avant-restauration"));
+    // Filet : état actuel gardé avant fusion (brain.json ou brain.db selon le compte).
+    for name in ["brain.json", "brain.db"] {
+        let p = dir.join(name);
+        if p.exists() {
+            let _ = std::fs::copy(&p, dir.join(format!("{name}.avant-restauration")));
+        }
     }
 
     let mut local_extra = false;
@@ -338,11 +612,13 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
         let _ = std::fs::write(dir.join("deleted_nodes.json"), json);
     }
 
-    // brain.json : nœud par nœud, le plus récent gagne ; union des deux côtés,
-    // moins les tombstones. Écrit tel quel (les estampilles fusionnées font foi).
-    let local_brain: Option<BrainGraph> = std::fs::read_to_string(dir.join("brain.json"))
-        .ok().and_then(|r| serde_json::from_str(&r).ok());
-    let remote_brain: Option<BrainGraph> = zip_json(&mut archive, "brain.json");
+    // Nœud par nœud, le plus récent gagne ; union des deux côtés, moins les
+    // tombstones. Écrit tel quel (les estampilles fusionnées font foi) — lu
+    // depuis brain.db si le compte est migré, brain.json sinon (Phase 8) ;
+    // même chose côté distant selon ce que contient l'archive.
+    let local_brain: Option<BrainGraph> = load_brain_cached(dir).ok();
+    let remote_brain: Option<BrainGraph> = zip_brain_db(&mut archive)
+        .or_else(|| zip_json(&mut archive, "brain.json"));
     match (local_brain, remote_brain) {
         (Some(local), Some(remote)) => {
             let mut by_id: std::collections::HashMap<String, crate::models::BrainNode> =
@@ -353,7 +629,7 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
                 let keep_local = match by_id.get(&ln.id) {
                     Some(rn) => {
                         let remote_newer = rn.updated_at.unwrap_or(0) > ln.updated_at.unwrap_or(0);
-                        if !remote_newer && node_sig(rn) != node_sig(&ln) { local_extra = true; }
+                        if !remote_newer && !node_unchanged(rn, &ln) { local_extra = true; }
                         !remote_newer
                     }
                     None => { local_extra = true; true }
@@ -378,21 +654,10 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
                 generated_at,
             };
             rebuild_tree_edges(&mut merged);
-            std::fs::write(
-                dir.join("brain.json"),
-                serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?,
-            ).map_err(|e| e.to_string())?;
-            // Seul autre écrivain de brain.json en dehors de `write_brain` (sync
-            // cloud) — doit lui aussi tenir le cache mémoire à jour, sinon une
-            // lecture juste après une fusion servirait une version périmée.
-            set_cache(dir, &merged);
+            persist_merged(dir, &merged)?;
         }
         (None, Some(remote)) => {
-            std::fs::write(
-                dir.join("brain.json"),
-                serde_json::to_string_pretty(&remote).map_err(|e| e.to_string())?,
-            ).map_err(|e| e.to_string())?;
-            set_cache(dir, &remote);
+            persist_merged(dir, &remote)?;
         }
         (Some(_), None) => { local_extra = true; }
         (None, None) => {}
@@ -437,7 +702,7 @@ pub fn merge_in(dir: &Path, bytes: &[u8]) -> Result<MergeReport, String> {
 
     // Fichiers annexes (historique, images, snapshots…) : additifs — on n'écrase
     // jamais un fichier local existant, on ajoute ce qui manque.
-    let merged_by_hand = ["brain.json", "spaces.json", "deleted_nodes.json"];
+    let merged_by_hand = ["brain.json", "brain.db", "spaces.json", "deleted_nodes.json"];
     let mut files = 0;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
@@ -505,6 +770,47 @@ mod tests {
         for d in [&remote, &local] { let _ = std::fs::remove_dir_all(d); }
     }
 
+    /// Phase 8 — même scénario que `merge_prend_le_plus_recent_et_ne_perd_rien`,
+    /// mais les deux côtés sont déjà migrés SQLite : `export_in` doit zipper
+    /// `brain.db` (pas `brain.json`, absent), et `merge_in` doit le lire/écrire
+    /// via SQLite sans perdre la sémantique LWW existante.
+    #[test]
+    fn merge_prend_le_plus_recent_et_ne_perd_rien_sqlite() {
+        let remote = std::env::temp_dir().join("brainlink_test_merge_remote_sqlite");
+        let local = std::env::temp_dir().join("brainlink_test_merge_local_sqlite");
+        for d in [&remote, &local] { let _ = std::fs::remove_dir_all(d); std::fs::create_dir_all(d).unwrap(); }
+
+        // Distant : A modifié récemment, C nouveau, tombstone sur D. Compte migré SQLite.
+        std::fs::write(remote.join("brain.json"),
+            serde_json::to_string(&g(vec![n("A", "A-distant", 20), n("C", "C", 5), n("D", "D", 1)])).unwrap()).unwrap();
+        std::fs::write(remote.join("deleted_nodes.json"), r#"[]"#).unwrap();
+        crate::storage::migrate_json_to_sqlite(&remote).unwrap();
+        assert!(remote.join("brain.db").exists());
+        let zip = export_in(&remote).unwrap();
+
+        // Local : A ancien, B local-only, D supprimé ici (tombstone locale). Migré aussi.
+        std::fs::write(local.join("brain.json"),
+            serde_json::to_string(&g(vec![n("A", "A-local", 10), n("B", "B", 100)])).unwrap()).unwrap();
+        std::fs::write(local.join("deleted_nodes.json"), r#"["D"]"#).unwrap();
+        crate::storage::migrate_json_to_sqlite(&local).unwrap();
+        assert!(local.join("brain.db").exists());
+
+        let report = merge_in(&local, &zip).unwrap();
+        assert!(report.local_extra, "B est local-only → il faut repousser");
+
+        let merged = crate::storage::load_brain_graph(&local).unwrap(); // hors cache, lecture directe
+        let label = |id: &str| merged.nodes.iter().find(|x| x.id == id).map(|x| x.label.clone());
+        assert_eq!(label("A").as_deref(), Some("A-distant"), "le plus récent gagne");
+        assert!(label("B").is_some(), "le nœud local-only survit");
+        assert!(label("C").is_some(), "le nœud distant arrive");
+        assert!(label("D").is_none(), "la suppression locale tient malgré le distant");
+
+        let a = merged.nodes.iter().find(|x| x.id == "A").unwrap();
+        assert_eq!(a.updated_at, Some(20), "l'estampille fusionnée ne doit pas être recalculée à l'écriture");
+
+        for d in [&remote, &local] { let _ = std::fs::remove_dir_all(d); }
+    }
+
     #[test]
     fn write_brain_estampille_les_noeuds_modifies() {
         let dir = std::env::temp_dir().join("brainlink_test_stamp");
@@ -518,6 +824,222 @@ mod tests {
         let b = graph.nodes.iter().find(|x| x.id == "B").unwrap();
         assert_eq!(a.updated_at, Some(10), "nœud inchangé → garde son estampille");
         assert!(b.updated_at.unwrap() > 10, "nœud modifié → ré-estampillé maintenant");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_brain_sqlite_ne_touche_que_les_noeuds_reellement_modifies() {
+        let dir = std::env::temp_dir().join("brainlink_test_stamp_sqlite");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"),
+            serde_json::to_string(&g(vec![n("A", "A", 10), n("B", "B", 10), n("C", "C", 10)])).unwrap()).unwrap();
+        crate::storage::migrate_json_to_sqlite(&dir).unwrap();
+        assert!(dir.join("brain.db").exists());
+
+        // B change de label (modifié), A inchangé, C disparaît (supprimé), D arrive (nouveau).
+        let mut graph = g(vec![n("A", "A", 0), n("B", "B2", 0), n("D", "D", 0)]);
+        write_brain(&dir, &mut graph).unwrap();
+
+        let a = graph.nodes.iter().find(|x| x.id == "A").unwrap();
+        let b = graph.nodes.iter().find(|x| x.id == "B").unwrap();
+        let d = graph.nodes.iter().find(|x| x.id == "D").unwrap();
+        assert_eq!(a.updated_at, Some(10), "nœud inchangé → garde son estampille");
+        assert!(b.updated_at.unwrap() > 10, "nœud modifié → ré-estampillé maintenant");
+        assert!(d.updated_at.unwrap() > 10, "nouveau nœud → estampillé");
+
+        // Relecture directe de brain.db (hors cache mémoire) pour vérifier ce qui a
+        // vraiment été persisté : A/B/D présents, C supprimé, B porte le nouveau label.
+        let conn = crate::storage::open_or_init(&dir).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 3, "A, B, D restent ; C a été supprimé");
+        let c_gone: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE id='C'", [], |r| r.get(0)).unwrap();
+        assert_eq!(c_gone, 0);
+        let b_label: String = conn.query_row("SELECT label FROM nodes WHERE id='B'", [], |r| r.get(0)).unwrap();
+        assert_eq!(b_label, "B2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 5 — vérification empirique AVANT de retirer `GEN_LOCK`, comme le
+    /// demande le plan. Verdict : le verrou reste nécessaire, on ne le retire
+    /// PAS. Sans lui (constaté en supprimant temporairement les deux
+    /// `crate::GEN_LOCK.lock()` ci-dessous pendant l'investigation), ce test
+    /// échoue de façon reproductible : le nœud MCP créé pendant la fenêtre de
+    /// la régénération disparaît, effacé par l'écriture de la régénération —
+    /// exactement le bug du 2026-07-21 ("le canvas s'est vidé"). Les
+    /// transactions SQLite ne protègent PAS contre ça : chaque écriture est
+    /// atomique, mais la régénération diffe contre un INSTANTANÉ pris au début
+    /// de son analyse (plusieurs secondes/minutes avec un LLM) — un nœud créé
+    /// entre cet instantané et l'écriture finale n'existe pas dans son idée du
+    /// monde, donc son diff le classe "supprimé". C'est une perte de mise à
+    /// jour (lost update) applicative, pas un problème de concurrence au
+    /// niveau fichier/base — WAL n'a aucune prise dessus.
+    #[test]
+    fn gen_lock_protege_lacceptation_mcp_pendant_une_regeneration() {
+        let dir = std::env::temp_dir().join("brainlink_test_concurrence_gen_lock");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"),
+            serde_json::to_string(&g(vec![n("root", "Cerveau", 1)])).unwrap()).unwrap();
+        crate::storage::migrate_json_to_sqlite(&dir).unwrap();
+
+        let dir_regen = dir.clone();
+        let regen = std::thread::spawn(move || {
+            let _gen = crate::GEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // Instantané pris AVANT que le thread MCP n'ajoute son nœud —
+            // représente l'analyse (LLM, plusieurs secondes en vrai) qui tourne
+            // sur un état déjà périmé au moment où elle écrit.
+            let mut snapshot = load_brain_cached(&dir_regen).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            // "Nouveau" graphe issu de la régénération : ne contient QUE ce que
+            // l'analyse connaissait à son démarrage (le nœud MCP n'y est pas).
+            write_brain(&dir_regen, &mut snapshot).unwrap();
+        });
+
+        let dir_mcp = dir.clone();
+        let mcp = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20)); // tente de démarrer pendant la fenêtre de la régénération
+            let _gen = crate::GEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let mut graph = load_brain_cached(&dir_mcp).unwrap();
+            graph.nodes.push(n("mcp-note", "Note MCP", 0));
+            graph.edges.push(crate::models::BrainEdge {
+                source: "root".into(), target: "mcp-note".into(), kind: "contains".into(), relation: "contains".into(),
+            });
+            write_brain_touching(&dir_mcp, &mut graph, &["mcp-note".to_string()], &[]).unwrap();
+        });
+
+        mcp.join().unwrap();
+        regen.join().unwrap();
+
+        let conn = crate::storage::open_or_init(&dir).unwrap();
+        let survives: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = 'mcp-note'", [], |r| r.get(0)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(survives, 1, "le verrou doit garantir que les deux opérations ne se chevauchent jamais");
+    }
+
+    #[test]
+    fn write_brain_touching_ne_touche_que_les_ids_annonces() {
+        let dir = std::env::temp_dir().join("brainlink_test_touching");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"),
+            serde_json::to_string(&g(vec![n("A", "A", 10), n("B", "B", 10), n("C", "C", 10)])).unwrap()).unwrap();
+        crate::storage::migrate_json_to_sqlite(&dir).unwrap();
+
+        // B est modifié (nouveau label), D est créé — seuls ceux-là sont annoncés
+        // comme touchés. A et C ne changent pas et ne figurent PAS dans la liste :
+        // write_brain_touching ne doit ni les lire ni les comparer.
+        let mut graph = g(vec![n("A", "A", 10), n("B", "B2", 10), n("C", "C", 10), n("D", "D", 0)]);
+        write_brain_touching(&dir, &mut graph, &["B".to_string(), "D".to_string()], &[]).unwrap();
+
+        let conn = crate::storage::open_or_init(&dir).unwrap();
+        let ts = |id: &str| -> i64 { conn.query_row("SELECT updated_at FROM nodes WHERE id = ?1", [id], |r| r.get(0)).unwrap() };
+        assert_eq!(ts("A"), 10, "A n'était pas annoncé comme touché → estampille inchangée");
+        assert_eq!(ts("C"), 10, "C n'était pas annoncé comme touché → estampille inchangée");
+        assert!(ts("B") > 10, "B annoncé comme touché → ré-estampillé");
+        assert!(ts("D") > 10, "D annoncé comme touché (nouveau) → estampillé");
+        let b_label: String = conn.query_row("SELECT label FROM nodes WHERE id='B'", [], |r| r.get(0)).unwrap();
+        assert_eq!(b_label, "B2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Régression du bug remonté par Liam le 2026-07-23 : un lot qui crée un
+    /// PARENT et y déplace des enfants EN MÊME TEMPS (ex. l'Archiviste : crée
+    /// un dossier de thème puis y range ses pages, tout dans une seule
+    /// résolution) échouait en "FOREIGN KEY constraint failed" dès que l'ordre
+    /// d'itération de `graph.nodes` traitait un enfant avant son parent tout
+    /// juste créé — silencieusement en pratique : les propositions étaient déjà
+    /// marquées résolues (fichiers supprimés, `mcp_resolved.json` à jour) avant
+    /// que l'écriture finale échoue, donnant l'illusion que tout avait marché
+    /// alors que RIEN n'était persisté dans brain.db.
+    #[test]
+    fn write_brain_touching_accepte_un_enfant_avant_son_parent_dans_le_meme_lot() {
+        let dir = std::env::temp_dir().join("brainlink_test_fk_order");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"),
+            serde_json::to_string(&g(vec![n("root", "Root", 0)])).unwrap()).unwrap();
+        crate::storage::migrate_json_to_sqlite(&dir).unwrap();
+
+        // "child" (parent_id = "new-parent") apparaît AVANT "new-parent" lui-même
+        // dans le Vec — exactement l'ordre qui faisait échouer la FK avant le fix.
+        let child: crate::models::BrainNode = serde_json::from_value(serde_json::json!({
+            "id": "child", "label": "Enfant", "kind": "note", "weight": 1,
+            "parent_id": "new-parent", "updated_at": 0
+        })).unwrap();
+        let new_parent: crate::models::BrainNode = serde_json::from_value(serde_json::json!({
+            "id": "new-parent", "label": "Nouveau thème", "kind": "note", "weight": 1,
+            "parent_id": "root", "updated_at": 0
+        })).unwrap();
+        let mut graph = g(vec![n("root", "Root", 0), child, new_parent]);
+
+        write_brain_touching(&dir, &mut graph, &["child".to_string(), "new-parent".to_string()], &[])
+            .expect("l'ordre enfant-avant-parent dans le même lot ne doit pas faire échouer l'écriture");
+
+        let conn = crate::storage::open_or_init(&dir).unwrap();
+        let parent_of: String = conn.query_row("SELECT parent_id FROM nodes WHERE id='child'", [], |r| r.get(0)).unwrap();
+        assert_eq!(parent_of, "new-parent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reproduit précisément le cas remonté par Liam le 2026-07-22 : un délai
+    /// perceptible à la création d'UNE SEULE note sur son vrai cerveau (415
+    /// nœuds). Utilise le chemin RÉEL (`write_brain_touching`, ce que
+    /// `insert_note_node_in` appelle vraiment) — pas de lecture ni comparaison
+    /// des 415 nœuds existants, juste l'écriture de la note créée.
+    #[test]
+    fn creation_dune_seule_note_reste_rapide() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/brain.liam.json");
+        if !fixture.exists() {
+            eprintln!("fixture réelle absente — test sauté (normal hors machine de Liam)");
+            return;
+        }
+        let dir = std::env::temp_dir().join("brainlink_test_une_seule_note");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&fixture, dir.join("brain.json")).unwrap();
+        crate::storage::migrate_json_to_sqlite(&dir).unwrap();
+
+        // Reproduit exactement le chemin réel : load_brain_cached (peuple le
+        // cache) puis une seule mutation avant write_brain_touching, comme le
+        // fait insert_note_node_in derrière la commande Tauri `create_note_node`.
+        let mut graph = load_brain_cached(&dir).unwrap();
+        graph.nodes.push(n("note-bench", "Ma note", 0));
+        graph.edges.push(crate::models::BrainEdge {
+            source: "root".into(), target: "note-bench".into(), kind: "contains".into(), relation: "contains".into(),
+        });
+
+        let start = std::time::Instant::now();
+        write_brain_touching(&dir, &mut graph, &["note-bench".to_string()], &[]).unwrap();
+        let elapsed = start.elapsed();
+
+        eprintln!("Phase 4 — création d'une seule note sur brain réel (415 nœuds) : {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(50), "délai perceptible pour une seule note : {elapsed:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_brain_cached_lit_json_si_pas_de_db() {
+        let dir = std::env::temp_dir().join("brainlink_test_load_json_only");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&g(vec![n("A", "A-json", 1)])).unwrap()).unwrap();
+
+        let graph = load_brain_cached(&dir).unwrap();
+        assert_eq!(graph.nodes[0].label, "A-json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_brain_cached_prefere_sqlite_quand_brain_db_existe() {
+        // Phase 3a : une fois brain.db présent (post-migration), la lecture doit
+        // passer par storage::load_brain_graph plutôt que par brain.json.
+        let dir = std::env::temp_dir().join("brainlink_test_load_prefere_sqlite");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&g(vec![n("A", "A-sqlite", 1)])).unwrap()).unwrap();
+        crate::storage::migrate_json_to_sqlite(&dir).unwrap();
+        assert!(!dir.join("brain.json").exists(), "la migration doit avoir renommé le json");
+
+        let graph = load_brain_cached(&dir).unwrap();
+        assert_eq!(graph.nodes[0].label, "A-sqlite", "doit être lu depuis brain.db, pas brain.json (absent)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -620,6 +1142,48 @@ mod tests {
         // Le brain.json écrasé a été gardé de côté
         assert!(dst.join("brain.json.avant-restauration").exists());
         for d in [&src, &dst] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    /// Phase 8 — point d'attention explicite du plan : en mode WAL, un commit
+    /// récent peut n'exister que dans `brain.db-wal`. Sans checkpoint avant de
+    /// zipper, l'export capturerait un `brain.db` incohérent (sans les
+    /// dernières écritures) — pire qu'un simple fichier texte.
+    #[test]
+    fn export_in_checkpoint_le_wal_avant_de_zipper() {
+        let dir = std::env::temp_dir().join("brainlink_test_export_wal_checkpoint");
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brain.json"), serde_json::to_string(&g(vec![n("A", "A", 1)])).unwrap()).unwrap();
+        crate::storage::migrate_json_to_sqlite(&dir).unwrap();
+
+        // Connexion maintenue ouverte : SQLite checkpointe automatiquement à la
+        // fermeture de la DERNIÈRE connexion — sans ce garde, l'insert ci-dessous
+        // se retrouverait déjà checkpointé avant même d'appeler export_in, et le
+        // test ne prouverait rien.
+        let _guard = crate::storage::open_or_init(&dir).unwrap();
+        {
+            let conn = crate::storage::open_or_init(&dir).unwrap();
+            conn.execute("INSERT INTO nodes (id, label, kind, weight) VALUES ('B', 'B', 'leaf', 1)", []).unwrap();
+        }
+        assert!(dir.join("brain.db-wal").exists(), "le commit doit atterrir dans le WAL, pas encore checkpointé");
+
+        let zip = export_in(&dir).unwrap();
+
+        // Extrait le brain.db du zip vers un fichier indépendant et vérifie
+        // que B (écrit seulement via le WAL) y est bien présent.
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.as_slice())).unwrap();
+        let mut entry = archive.by_name("brain.db").unwrap();
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).unwrap();
+        drop(entry);
+        let extracted = std::env::temp_dir().join("brainlink_test_export_wal_extracted.db");
+        std::fs::write(&extracted, &buf).unwrap();
+        let conn = rusqlite::Connection::open(&extracted).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = 'B'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "B (écrit via le WAL) doit être présent dans le brain.db exporté");
+
+        drop(_guard);
+        let _ = std::fs::remove_file(&extracted);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

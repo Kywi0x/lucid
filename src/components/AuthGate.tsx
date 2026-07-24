@@ -3,7 +3,8 @@ import type { Session } from "@supabase/supabase-js";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowRight, Loader2, Lock, Mail } from "lucide-react";
 import { supabase } from "@/lib/supabase";
-import { NeuralBg, LucidOrb } from "@/components/NeuralBg";
+import { BrainMap } from "@/components/BrainMap";
+import { EMPTY_GRAPH } from "@/lib/types";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { cn } from "@/lib/utils";
 
@@ -76,18 +77,23 @@ export function AuthGate({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-/** Écran plein : constellation en fond, carte panel centrée, thème basculable. */
-function Shell({ children }: { children: ReactNode }) {
+/** Écran plein : le vrai canvas (BrainMap, vide) en fond — l'orbe vivante qu'il
+ *  affiche EST le root, une seule fois, jamais dupliquée avec un mark statique
+ *  dans la carte. `caption` : texte affiché sous cette orbe (ex. « Connecte-toi
+ *  pour commencer »), optionnel pour ne rien changer aux écrans annexes
+ *  (config manquante, chargement). */
+function Shell({ children, caption }: { children: ReactNode; caption?: string }) {
   return (
     <div className="relative flex h-screen items-center justify-center overflow-hidden px-6">
-      <NeuralBg />
+      <div className="absolute inset-0">
+        <BrainMap graph={EMPTY_GRAPH} onSelect={() => {}} selectedId={null} query="" caption={caption} />
+      </div>
       <div className="absolute right-4 top-4 z-10">
         <ThemeToggle />
       </div>
       <div className="lucid-rise panel relative w-full max-w-sm rounded-2xl p-7">
         <div className="mb-6 flex flex-col items-center text-center">
-          <LucidOrb size={44} />
-          <p className="mt-3 font-mono text-sm font-semibold tracking-[0.28em] text-[var(--color-text)]">
+          <p className="font-mono text-sm font-semibold tracking-[0.28em] text-[var(--color-text)]">
             LUCID
           </p>
           <p className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--color-muted)]">
@@ -151,7 +157,7 @@ function LoginScreen() {
   const signup = mode === "signup";
 
   return (
-    <Shell>
+    <Shell caption={signup ? "Inscris-toi pour commencer" : "Connecte-toi pour commencer"}>
       <form className="space-y-2.5" onSubmit={(e) => { e.preventDefault(); auth(); }}>
         <Field
           icon={<Mail className="size-4" />}
