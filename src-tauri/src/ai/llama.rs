@@ -493,6 +493,19 @@ const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 struct ServerProc {
     child: std::process::Child,
     model: PathBuf,
+    token: String,
+}
+
+/// Clé d'API aléatoire, une par lancement de serveur — sans ça, `llama-server`
+/// tourne CORS ouvert ("allow all origins") sans authentification (avertissement
+/// constaté au smoke test manuel du 2026-07-24) : n'importe quelle page web
+/// ouverte dans le navigateur pourrait alors requêter le port loopback pendant
+/// qu'il tourne. Le port reste local (`--host 127.0.0.1`), mais la clé ferme ce
+/// cran d'attaque restant.
+fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("RNG OS indisponible");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Drop for ServerProc {
@@ -512,14 +525,29 @@ fn server_slot() -> &'static Mutex<Option<ServerProc>> {
 /// emplacements possibles : override env, sidecar packagé, build dev) — pas
 /// besoin de dupliquer `resolve_binary`, juste chercher son voisin.
 fn resolve_server_binary() -> Option<PathBuf> {
-    let completion = resolve_binary()?;
-    let candidate = completion.with_file_name(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
+    if let Ok(p) = std::env::var("SECOND_BRAIN_LLAMA_SERVER_BIN") {
+        let p = PathBuf::from(p);
+        if p.is_file() { return Some(p); }
+    }
+    // App packagée : sidecar à côté de `llama-completion` (même dossier) —
+    // pas encore bundlé aujourd'hui (chantier séparé : scripts CI + vérif
+    // parité Windows avant tout passage en prod).
+    if let Some(completion) = resolve_binary() {
+        let candidate = completion.with_file_name(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
+        if candidate.is_file() { return Some(candidate); }
+    }
+    // Dev : release officielle isolée dans son propre dossier (jamais mélangée
+    // à `build/`/`build-static/`, où vivent les binaires custom déjà utilisés
+    // par `llama-completion` — deux versions de dylibs de même nom dans un
+    // seul dossier écraseraient/casseraient l'existant).
+    let candidate = shared_data_dir()?.join("llama.cpp").join("server-release").join("llama-server");
     candidate.is_file().then_some(candidate)
 }
 
-fn server_health(port: u16) -> bool {
+fn server_health(token: &str) -> bool {
     reqwest::blocking::Client::new()
-        .get(format!("http://127.0.0.1:{port}/health"))
+        .get(format!("http://127.0.0.1:{SERVER_PORT}/health"))
+        .bearer_auth(token)
         .timeout(Duration::from_millis(500))
         .send()
         .map(|r| r.status().is_success())
@@ -528,31 +556,34 @@ fn server_health(port: u16) -> bool {
 
 /// Démarre (ou réutilise) le serveur pour CE modèle précis. `None` si le
 /// binaire est absent ou si le démarrage échoue — l'appelant retombe alors sur
-/// le mode one-shot.
-fn ensure_server(binary: &Path, model: &Path) -> Option<u16> {
+/// le mode one-shot. Renvoie la clé d'API à utiliser pour les requêtes.
+fn ensure_server(binary: &Path, model: &Path) -> Option<String> {
     let mut slot = server_slot().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(s) = slot.as_ref() {
-        if s.model == model && server_health(SERVER_PORT) {
-            return Some(SERVER_PORT);
+        if s.model == model && server_health(&s.token) {
+            return Some(s.token.clone());
         }
         // Modèle changé (bascule utilisateur) ou process mort : on repart propre.
         *slot = None;
     }
+    let token = random_token();
     let mut cmd = low_priority_command(binary);
     cmd.arg("-m").arg(model)
         .args(["-ngl", "99"])
         .args(["-t", &worker_threads().to_string()])
         .args(["-c", &CONTEXT_TOKENS.to_string()])
+        .args(["--host", "127.0.0.1"]) // jamais accessible depuis le réseau, explicite plutôt que compter sur le défaut
         .args(["--port", &SERVER_PORT.to_string()])
+        .args(["--api-key", &token]) // sans ça : CORS ouvert + pas d'auth (avertissement llama-server)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = cmd.spawn().ok()?;
-    let mut proc = ServerProc { child, model: model.to_path_buf() };
+    let mut proc = ServerProc { child, model: model.to_path_buf(), token: token.clone() };
     let started = Instant::now();
     while started.elapsed() < SERVER_STARTUP_TIMEOUT {
-        if server_health(SERVER_PORT) {
+        if server_health(&token) {
             *slot = Some(proc);
-            return Some(SERVER_PORT);
+            return Some(token);
         }
         if let Ok(Some(_)) = proc.child.try_wait() {
             return None; // mort avant même de répondre (modèle/flags invalides)
@@ -568,7 +599,7 @@ pub fn shutdown_server() {
     *server_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
-fn complete_via_server(port: u16, prompt: &str, max_tokens: u32) -> Result<String, String> {
+fn complete_via_server(token: &str, prompt: &str, max_tokens: u32) -> Result<String, String> {
     let body = serde_json::json!({
         "prompt": prompt,
         "n_predict": max_tokens,
@@ -577,7 +608,8 @@ fn complete_via_server(port: u16, prompt: &str, max_tokens: u32) -> Result<Strin
         "cache_prompt": true,
     });
     let resp = reqwest::blocking::Client::new()
-        .post(format!("http://127.0.0.1:{port}/completion"))
+        .post(format!("http://127.0.0.1:{SERVER_PORT}/completion"))
+        .bearer_auth(token)
         .json(&body)
         .timeout(Duration::from_secs(180))
         .send()
@@ -619,8 +651,8 @@ impl LlamaEngine {
         let formatted = format_prompt(&filename, system, user);
 
         if let Some(server_bin) = resolve_server_binary() {
-            if let Some(port) = ensure_server(&server_bin, &self.model) {
-                match complete_via_server(port, &formatted, max_tokens) {
+            if let Some(token) = ensure_server(&server_bin, &self.model) {
+                match complete_via_server(&token, &formatted, max_tokens) {
                     Ok(out) => return Ok(out),
                     Err(e) => crate::elog!("⚠️ llama-server en échec ({e}), retour au mode one-shot."),
                 }
