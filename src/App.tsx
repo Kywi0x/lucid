@@ -15,7 +15,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { notify } from "@/lib/notify";
 import { BrainMap, isLeafKind } from "@/components/BrainMap";
 import { CommandPalette } from "@/components/CommandPalette";
 import { FolderView } from "@/components/FolderView";
@@ -62,6 +62,7 @@ import {
   claudeCodeReconnect,
   runArchivist,
   archivistWasInterrupted,
+  setArchivistActive,
   type BrainProgress,
   type LocalFolderProgress,
 } from "@/lib/api";
@@ -97,18 +98,6 @@ function filterGraphBySpace(graph: BrainGraph, nodeIds: string[]): BrainGraph {
   const nodeSet = new Set(nodes.map((n) => n.id));
   const edges = graph.edges.filter((e) => nodeSet.has(e.source) && nodeSet.has(e.target));
   return { ...graph, nodes, edges };
-}
-
-/** Notification macOS/Windows native — l'Archiviste en mode autonome n'affiche
- *  rien à l'écran (ni bulle ni panneau), donc sans ça l'utilisateur n'a aucun
- *  moyen de savoir qu'une action a eu lieu, ou qu'une proposition reste bloquée
- *  (demandé par Liam le 2026-07-21). Best-effort : jamais bloquant si refusée. */
-async function notify(title: string, body: string) {
-  try {
-    let granted = await isPermissionGranted();
-    if (!granted) granted = (await requestPermission()) === "granted";
-    if (granted) sendNotification({ title, body });
-  } catch { /* pas grave, juste pas de notification cette fois */ }
 }
 
 /** Libellés FR du panneau Historique — le plus récent tagué "mcp_accept" est
@@ -364,6 +353,10 @@ function App() {
     return () => clearTimeout(t);
   }, [needsSetup]);
 
+  // Reflète l'activité de l'Archiviste sur l'icône barre de menu (point « • » +
+  // tooltip), pour la voir même quand l'app est réduite (demandé par Liam).
+  useEffect(() => { void setArchivistActive(archiving); }, [archiving]);
+
   // Premier lancement (modèle prêt, pas de cerveau, jamais onboardé) : plus de
   // seed automatique (décision Liam, 2026-07-21) — l'utilisateur atterrit sur
   // l'écran GenerateEmpty et choisit explicitement : scanner sa machine ou
@@ -458,6 +451,14 @@ function App() {
       readBrainGraph().then((g) => { if (g) setGraph(g); });
       connectorsStatus().then(setConnectors);
       void syncNow();
+      // Auto-classement à chaud : `brain-updated` n'est émis QUE par une régé
+      // AUTO (watcher fs / rattrapage démarrage), jamais par « Générer » manuel
+      // (qui lance déjà l'Archiviste). Donc un fichier/connecteur ajouté a fait
+      // apparaître de nouvelles pages non rangées → l'Archiviste les file en
+      // silence. Il est incrémental (ne touche pas à l'existant) et self-gate
+      // (aucune proposition s'il n'y a rien à ranger). Pas de boucle : ses
+      // propositions sont préfixées « arch- » et ne réémettent pas brain-updated.
+      if (!archivingRef.current) void runArchivistNow({ silent: true });
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
@@ -692,10 +693,11 @@ function App() {
     const tick = async () => {
       if (running) return;
       // L'Archiviste écrit encore (cf. `runArchivistNow`) : ne rien appliquer/
-      // rafraîchir tant qu'il n'a pas fini, sinon chacune de ses propositions
-      // déclenche son propre reflow du canvas au fil de l'eau — saccadé, pages
-      // qui sautent d'un coup, plusieurs fois de suite. Il redéclenche lui-même
-      // un cycle une fois terminé (`scheduleMcpTickRef`).
+      // rafraîchir tant qu'il n'a pas fini — zéro résolution concurrente pendant
+      // que Gemma tranche encore les groupes, donc zéro risque sur le résultat.
+      // Il redéclenche lui-même un cycle une fois terminé (`scheduleMcpTickRef`).
+      // Le "bloc" visible à la fin est géré côté rendu (fade-out/cascade sur les
+      // nœuds déplacés/fusionnés, cf. `BrainMap.tsx`), pas en étalant l'écriture.
       if (archivingRef.current) return;
       running = true;
       try {
@@ -725,9 +727,15 @@ function App() {
             // Une IA (MCP) vient d'écrire — l'Archiviste repasse derrière pour
             // ranger/fusionner (ex. si elle a mal placé une page). Jamais après
             // une résolution qui ne contient QUE ses propres propositions
-            // (préfixe "arch-"), sinon il se redéclenche indéfiniment sur ses
-            // propres écritures.
-            if (resolvedIds.some((id) => !id.startsWith("arch-"))) {
+            // (préfixe "arch-" sur l'id de LA PROPOSITION elle-même — `p`, pas
+            // `resolvedIds` : ce dernier liste les pages AFFECTÉES (target_id
+            // d'un déplacement, id du survivant d'une fusion), jamais préfixées
+            // "arch-" même quand la proposition vient de l'Archiviste. Le
+            // vérifier sur `resolvedIds` faisait boucler l'Archiviste sur
+            // lui-même indéfiniment dès qu'il déplaçait/fusionnait quoi que ce
+            // soit — donc à peu près toujours — bug remonté par Liam le
+            // 2026-07-26 : "1/1 qui stagne, ça s'arrête et recommence").
+            if (p.some((prop) => !prop.id.startsWith("arch-"))) {
               void runArchivistNow({ silent: true });
             }
           }
@@ -1149,6 +1157,7 @@ function App() {
               // ci-dessous, pas de la phase.
               phase={scanning ? "scanning" : generating ? "generating" : "idle"}
               caption={busyMessage}
+              archiving={archiving}
               spaces={spaces}
               onAddNodeToSpace={handleAddNodeToSpace}
               onMoveNode={handleMoveNode}

@@ -62,6 +62,7 @@ import {
   type ModelInfo,
 } from "@/lib/api";
 import { supabase, BACKUP_BUCKET } from "@/lib/supabase";
+import { notify } from "@/lib/notify";
 import type { ConnectorStatus, Space } from "@/lib/types";
 import { cn, relativeDate, copyText } from "@/lib/utils";
 import { McpConnectGuide } from "@/components/McpConnectGuide";
@@ -1097,6 +1098,24 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
         <strong> sauvegarder ton cerveau dans le cloud</strong> (~2 Mo chiffrés au repos)
         et de le retrouver sur une autre machine.
       </p>
+
+      {/* Notifications système : bouton de test. La 1re fois, macOS demande
+          l'autorisation. En `tauri dev` la notif est attribuée au terminal
+          parent (cf. lib/notify.ts + README) — normal, corrigé en `tauri build`. */}
+      <div className="mb-4 flex items-center justify-between gap-2 rounded-xl border border-[var(--color-border)] px-3.5 py-2.5">
+        <p className="min-w-0 flex-1 text-sm text-[var(--color-text)]">
+          Notifications système
+          <span className="mt-0.5 block text-xs text-[var(--color-muted)]">
+            Lucid t'avertit quand l'Archiviste met ton cerveau à jour.
+          </span>
+        </p>
+        <button
+          onClick={() => void notify("Lucid", "Les notifications fonctionnent 🎉")}
+          className="shrink-0 rounded-lg px-2.5 py-1 text-xs font-medium text-[var(--color-accent)] hover:bg-[var(--color-accent-soft)]"
+        >
+          Tester
+        </button>
+      </div>
 
       {!session ? (
         <div className="space-y-2">

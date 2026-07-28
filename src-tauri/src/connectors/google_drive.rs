@@ -315,6 +315,62 @@ fn build_container_path(
     path
 }
 
+/// Empreinte bon marché (nombre de fichiers + date de modif la plus récente) —
+/// watch auto : Drive n'a pas d'équivalent `notify` (rien sur le disque local
+/// à surveiller, l'API ne pousse rien sans webhook joignable depuis internet,
+/// hors de portée d'une app desktop locale). Un sondage périodique reste donc
+/// nécessaire, mais celui-ci ne télécharge que `modifiedTime` par fichier —
+/// même pagination que `sync_docs`, sans le contenu ni les champs superflus —
+/// jamais un `sync_docs()` complet juste pour savoir si quelque chose a changé.
+pub fn changed_fingerprint() -> Option<String> {
+    #[derive(Deserialize)]
+    struct MetaList {
+        #[serde(default)]
+        files: Vec<FileMeta>,
+        #[serde(rename = "nextPageToken")]
+        next_page_token: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct FileMeta {
+        #[serde(rename = "modifiedTime")]
+        modified_time: Option<String>,
+    }
+
+    let access_token = valid_access_token().ok()?;
+    let client = reqwest::blocking::Client::new();
+    let mut count = 0usize;
+    let mut max_modified = String::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut req = client
+            .get("https://www.googleapis.com/drive/v3/files")
+            .query(&[
+                ("q", "trashed=false"),
+                ("fields", "nextPageToken,files(modifiedTime)"),
+                ("pageSize", "1000"),
+                ("corpora", "allDrives"),
+                ("includeItemsFromAllDrives", "true"),
+                ("supportsAllDrives", "true"),
+            ])
+            .bearer_auth(&access_token);
+        if let Some(ref token) = page_token {
+            req = req.query(&[("pageToken", token.as_str())]);
+        }
+        let resp = req.send().ok()?;
+        if !resp.status().is_success() { return None; }
+        let page: MetaList = resp.json().ok()?;
+        count += page.files.len();
+        for f in &page.files {
+            if let Some(m) = &f.modified_time {
+                if m.as_str() > max_modified.as_str() { max_modified = m.clone(); }
+            }
+        }
+        page_token = page.next_page_token;
+        if page_token.is_none() { break; }
+    }
+    Some(format!("{count}:{max_modified}"))
+}
+
 /// Tous les fichiers Drive (tous formats, drives partagés inclus).
 /// Renvoie (count_ingested, count_total).
 pub fn sync_docs() -> Result<(usize, usize), String> {

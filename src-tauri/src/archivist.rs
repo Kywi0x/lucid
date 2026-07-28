@@ -224,7 +224,13 @@ pub fn scan(graph: &BrainGraph) -> ScanResult {
         for n in &graph.nodes {
             // Le bac lui-même n'est jamais un candidat (protège aussi le tout
             // premier passage, où il vient d'être créé et n'a encore aucun enfant).
-            if Some(n.id.as_str()) == catchall_id || has_children.contains(n.id.as_str()) {
+            // Idem pour un nœud-entité (société/client) : c'est un hub relié par
+            // des `link`, pas par des `contains`, donc absent de `has_children` —
+            // sans ce garde il serait rangé comme un orphelin dans un thème.
+            if Some(n.id.as_str()) == catchall_id
+                || has_children.contains(n.id.as_str())
+                || n.id.starts_with("arch-entity-")
+            {
                 continue;
             }
             let direct_root_child = n.parent_id.as_ref() == Some(root);
@@ -494,20 +500,41 @@ pub enum GroupOutcome {
 // masquer en silence.
 const AI_CLUSTER_MAX_CANDIDATES: usize = 100;
 
-fn ai_cluster_prompt(leftover: &[(String, String)]) -> String {
+/// Court extrait du CONTENU réel d'une page pour les passes IA : `content`
+/// (édité par l'user) sinon `source_text` (texte extrait des PDF/CSV/docx à la
+/// génération, sans IA). C'est le levier pour ranger par SUJET les fichiers mal
+/// nommés (hash, `IMG_1234`, `ACFrOgDw==`) dont le seul libellé ne dit rien.
+/// Normalisé sur une ligne, tronqué à `max` caractères.
+fn snippet_for(node: &BrainNode, max: usize) -> String {
+    let raw = if !node.content.trim().is_empty() { node.content.as_str() } else { node.source_text.as_str() };
+    let one_line: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > max {
+        one_line.chars().take(max).collect::<String>() + "…"
+    } else {
+        one_line
+    }
+}
+
+fn ai_cluster_prompt(leftover: &[(String, String, String)]) -> String {
     let mut out = format!(
         "Voici {n} pages du second cerveau d'un utilisateur, actuellement sans dossier clair \
-         (aucun mot de titre partagé assez souvent pour un rangement mécanique).\n\n",
+         (aucun mot de titre partagé assez souvent pour un rangement mécanique). Pour chaque page : \
+         son titre, puis un extrait de son contenu réel (après le tiret) — le titre peut être \
+         inutile (nom de fichier codé), l'extrait dit alors le vrai sujet.\n\n",
         n = leftover.len(),
     );
-    for (id, label) in leftover {
-        out.push_str(&format!("- id `{id}` : {label}\n"));
+    for (id, label, snippet) in leftover {
+        if snippet.is_empty() {
+            out.push_str(&format!("- id `{id}` : {label}\n"));
+        } else {
+            out.push_str(&format!("- id `{id}` : {label} — {snippet}\n"));
+        }
     }
     out.push_str(
         "\nPropose de regrouper par THÈME les pages qui traitent clairement du même sujet concret \
-         (même type de document, même projet, même fournisseur...), MÊME si leurs titres ne partagent \
-         aucun mot — c'est tout l'intérêt de cette passe, le tri mécanique par mot commun a déjà eu sa \
-         chance avant toi. Un groupe doit contenir au moins 3 pages et un thème réel, pas un fourre-tout \
+         (même type de document, même projet, même fournisseur...), en te fondant sur le titre ET \
+         l'extrait de contenu, MÊME si les titres ne partagent aucun mot — c'est tout l'intérêt de \
+         cette passe. Un groupe doit contenir au moins 3 pages et un thème réel, pas un fourre-tout \
          vague (\"Divers\", \"Autres\"...). Laisse de côté (n'inclus dans aucun groupe) toute page isolée \
          ou dont le sujet est incertain — ne devine jamais.\n\n\
          Renvoie UNIQUEMENT un JSON :\n\
@@ -521,14 +548,24 @@ fn ai_cluster_prompt(leftover: &[(String, String)]) -> String {
 /// mot commun — capte les regroupements qu'un script ne peut pas voir (même
 /// sujet, aucun mot partagé). Jamais appelé sur ce que le script a déjà su
 /// grouper seul.
-pub fn ai_cluster_leftovers(engine: &LlamaEngine, leftover: &[(String, String)]) -> Vec<ThemeCluster> {
+pub fn ai_cluster_leftovers(engine: &LlamaEngine, leftover: &[(String, String)], graph: &BrainGraph) -> Vec<ThemeCluster> {
     if leftover.len() < MIN_CLUSTER {
         return Vec::new();
     }
     let capped: Vec<(String, String)> = leftover.iter().take(AI_CLUSTER_MAX_CANDIDATES).cloned().collect();
     let valid_ids: HashSet<&str> = capped.iter().map(|(id, _)| id.as_str()).collect();
 
-    let prompt = ai_cluster_prompt(&capped);
+    // Enrichit chaque candidat d'un extrait de son contenu réel — un fichier mal
+    // nommé se range alors par sujet, plus par son titre inexploitable.
+    let by_id: HashMap<&str, &BrainNode> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let enriched: Vec<(String, String, String)> = capped.iter()
+        .map(|(id, label)| {
+            let snip = by_id.get(id.as_str()).map(|n| snippet_for(n, 200)).unwrap_or_default();
+            (id.clone(), label.clone(), snip)
+        })
+        .collect();
+
+    let prompt = ai_cluster_prompt(&enriched);
     let Ok(raw) = engine.complete(Some(SYSTEM_PROMPT), &prompt, 700) else {
         return Vec::new();
     };
@@ -571,6 +608,175 @@ fn parse_ai_cluster_response(raw: &str, valid_ids: &HashSet<&str>) -> Vec<ThemeC
             assigned.insert(id.clone());
         }
         out.push(ThemeCluster { label: label.to_string(), node_ids: fresh });
+    }
+    out
+}
+
+pub struct ThemeGroup {
+    /// Titre explicite du dossier parent (français), proposé par l'IA.
+    pub parent_label: String,
+    /// Ids des conteneurs-thèmes à ranger sous ce parent.
+    pub theme_ids: Vec<String>,
+}
+
+/// Un parent doit chapeauter au moins 2 thèmes — sinon ce n'est pas un
+/// regroupement, juste un renommage déguisé.
+const MIN_SUPERGROUP: usize = 2;
+
+fn theme_group_prompt(themes: &[(String, String)]) -> String {
+    let mut out = format!(
+        "Voici {n} dossiers thématiques du second cerveau d'un utilisateur, tous au même niveau \
+         (à la racine). Certains relèvent d'un même domaine plus large même si leurs noms diffèrent \
+         (ex. « Devis », « Facture », « Estimation » relèvent tous de la facturation).\n\n",
+        n = themes.len(),
+    );
+    for (id, label) in themes {
+        out.push_str(&format!("- id `{id}` : {label}\n"));
+    }
+    out.push_str(
+        "\nRegroupe UNIQUEMENT les dossiers qui relèvent clairement d'un même domaine plus large, \
+         sous un dossier parent au titre explicite (français, 1 à 3 mots). Un parent doit chapeauter \
+         AU MOINS 2 dossiers réellement liés — jamais un fourre-tout (« Divers », « Autres »), et laisse \
+         à la racine (n'inclus nulle part) tout dossier isolé ou dont le rapprochement est incertain. \
+         Ne devine jamais.\n\n\
+         Renvoie UNIQUEMENT un JSON :\n\
+         {\"groups\": [{\"parent\": \"Titre du parent\", \"themes\": [\"id ci-dessus\", ...]}]}\n\
+         (\"groups\" peut être vide si rien ne se regroupe clairement.)\n",
+    );
+    out
+}
+
+/// Regroupement SÉMANTIQUE des dossiers-thèmes sous des parents explicites
+/// (Gemma) : la hiérarchie à 2 niveaux demandée par Liam le 2026-07-28 —
+/// « Facturation » › { Devis, Facture, Estimation } plutôt que 3 bacs à plat.
+/// Ne touche qu'aux thèmes fournis (l'orchestrateur ne passe que ceux à la
+/// racine), jamais aux pages elles-mêmes.
+pub fn ai_group_themes(engine: &LlamaEngine, themes: &[(String, String)]) -> Vec<ThemeGroup> {
+    // Rien à chapeauter tant qu'il n'y a pas de quoi former un parent ET laisser
+    // au moins un thème dehors (sinon un unique parent avalerait tout).
+    if themes.len() <= MIN_SUPERGROUP {
+        return Vec::new();
+    }
+    let valid_ids: HashSet<&str> = themes.iter().map(|(id, _)| id.as_str()).collect();
+    let prompt = theme_group_prompt(themes);
+    let Ok(raw) = engine.complete(Some(SYSTEM_PROMPT), &prompt, 500) else {
+        return Vec::new();
+    };
+    parse_theme_groups(&raw, &valid_ids)
+}
+
+/// Partie pure (parsing + validation) de `ai_group_themes`, testable sans le
+/// moteur IA. Défensif : ids hallucinés filtrés, parents sous MIN_SUPERGROUP
+/// thèmes écartés, un thème dans au plus un parent (le premier gagne).
+fn parse_theme_groups(raw: &str, valid_ids: &HashSet<&str>) -> Vec<ThemeGroup> {
+    let Some(json_str) = crate::ai::pipeline::extract_json(raw) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else { return Vec::new() };
+    let Some(groups) = v.get("groups").and_then(|g| g.as_array()) else { return Vec::new() };
+
+    let mut assigned: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for g in groups {
+        let parent = g.get("parent").and_then(|l| l.as_str()).unwrap_or("").trim();
+        if parent.is_empty() { continue; }
+        let Some(ids) = g.get("themes").and_then(|i| i.as_array()) else { continue };
+        let fresh: Vec<String> = ids.iter()
+            .filter_map(|v| v.as_str())
+            .filter(|id| valid_ids.contains(id) && !assigned.contains(*id))
+            .map(String::from)
+            .collect();
+        if fresh.len() < MIN_SUPERGROUP { continue; }
+        for id in &fresh { assigned.insert(id.clone()); }
+        out.push(ThemeGroup { parent_label: parent.to_string(), theme_ids: fresh });
+    }
+    out
+}
+
+// ─── Couche entités (sociétés / clients) ────────────────────────────────────
+// Extrait les organisations nommées dans le CONTENU d'un document et les
+// matérialise en nœuds-entités reliés aux docs (wikilinks doc↔client). C'est
+// ce qui fait passer Lucid d'un arbre de dossiers à un vrai graphe de
+// connaissances : cliquer un client montre tous ses docs, où qu'ils soient
+// rangés. Sort en propositions (create + link), jamais d'écriture directe.
+
+/// On lit BEAUCOUP plus que les 200 car du clustering (le nom du client est
+/// souvent en en-tête ou en pied de page), mais borné : un devis/facture/contrat
+/// tient largement là-dedans, et ça garde le prompt raisonnable pour Gemma 3 4B.
+const ENTITY_MAX_CHARS: usize = 4000;
+/// Fenêtre de taille "document business" : sous ENTITY_MIN = trop court pour
+/// contenir une entité fiable ; au-dessus de ENTITY_MAX = data-dump (CSV/export
+/// géant) où extraire des entités n'a pas de sens et coûte cher pour rien.
+const ENTITY_MIN_TEXT: usize = 120;
+const ENTITY_MAX_TEXT: usize = 60_000;
+
+fn entity_prompt(label: &str, text: &str) -> String {
+    format!(
+        "Document : « {label} »\n\nExtrait de son contenu :\n{text}\n\n\
+         Extrais les ORGANISATIONS et CLIENTS nommés dans ce document (sociétés, entreprises, \
+         cabinets, administrations, fournisseurs...). Uniquement des entités RÉELLES et NOMMÉES — \
+         jamais un terme générique (« le client », « la société »), jamais une personne physique \
+         seule, jamais un simple lieu. Si aucune organisation nommée n'apparaît clairement, renvoie \
+         une liste vide. Ne devine jamais.\n\n\
+         Renvoie UNIQUEMENT un JSON :\n\
+         {{\"entities\": [\"Nom exact de l'organisation\", ...]}}\n"
+    )
+}
+
+/// Organisations nommées dans un document (via Gemma). Vide si le texte est
+/// hors de la fenêtre "document business" ou si l'IA ne trouve rien de sûr.
+pub fn extract_doc_entities(engine: &LlamaEngine, node: &BrainNode) -> Vec<String> {
+    let text = if !node.content.trim().is_empty() { node.content.as_str() } else { node.source_text.as_str() };
+    let len = text.chars().count();
+    if len < ENTITY_MIN_TEXT || len > ENTITY_MAX_TEXT {
+        return Vec::new();
+    }
+    let snippet: String = text.chars().take(ENTITY_MAX_CHARS).collect();
+    let prompt = entity_prompt(&node.label, &snippet);
+    let Ok(raw) = engine.complete(Some(SYSTEM_PROMPT), &prompt, 300) else {
+        return Vec::new();
+    };
+    parse_entities(&raw)
+}
+
+fn is_generic_entity(name: &str) -> bool {
+    let l = name.to_lowercase();
+    let l = l.trim();
+    matches!(l,
+        "client" | "le client" | "la société" | "la societe" | "société" | "societe"
+        | "entreprise" | "l'entreprise" | "fournisseur" | "n/a" | "na" | "inconnu"
+        | "divers" | "autres" | "sarl" | "sas" | "sa"
+    )
+}
+
+/// Clé de résolution d'entités : minuscule, suffixes juridiques retirés (SARL,
+/// SAS, SA, EURL...), ponctuation ôtée → « Société Y », « Y SARL », « Y. » donnent
+/// le MÊME slug « societe-y » / « y ». Sert d'id (`arch-entity-<slug>`) et de clé
+/// de dédup entre documents (deux orthographes → un seul nœud-entité).
+pub fn entity_slug(name: &str) -> String {
+    const LEGAL: &[&str] = &["sarl", "sas", "sasu", "sa", "eurl", "sci", "scop", "gmbh", "ltd", "llc", "inc", "&", "et"];
+    let lower = name.to_lowercase();
+    let cleaned: String = lower.chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
+    cleaned
+        .split_whitespace()
+        .filter(|w| !LEGAL.contains(w))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Partie pure (parsing/validation), testable sans moteur IA. Défensif :
+/// génériques filtrés, dédup par slug DANS le doc, JSON invalide toléré.
+fn parse_entities(raw: &str) -> Vec<String> {
+    let Some(js) = crate::ai::pipeline::extract_json(raw) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(js) else { return Vec::new() };
+    let Some(arr) = v.get("entities").and_then(|e| e.as_array()) else { return Vec::new() };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for x in arr {
+        let Some(name) = x.as_str() else { continue };
+        let name = name.trim();
+        if name.chars().count() < 2 || is_generic_entity(name) { continue; }
+        let slug = entity_slug(name);
+        if slug.is_empty() || !seen.insert(slug) { continue; }
+        out.push(name.to_string());
     }
     out
 }
@@ -883,5 +1089,53 @@ mod tests {
         assert!(parse_ai_cluster_response("ceci n'est pas du JSON", &valid).is_empty());
         assert!(parse_ai_cluster_response(r#"{"groups": []}"#, &valid).is_empty());
         assert!(parse_ai_cluster_response(r#"{"autre_chose": 1}"#, &valid).is_empty());
+    }
+
+    #[test]
+    fn parse_theme_groups_chapeaute_les_themes_lies() {
+        let valid: HashSet<&str> = ["arch-theme-devis", "arch-theme-invoice", "arch-theme-estimation", "arch-theme-lyon"]
+            .into_iter().collect();
+        let raw = r#"{"groups": [{"parent": "Facturation", "themes": ["arch-theme-devis", "arch-theme-invoice", "arch-theme-estimation"]}]}"#;
+        let out = parse_theme_groups(raw, &valid);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].parent_label, "Facturation");
+        assert_eq!(out[0].theme_ids.len(), 3);
+    }
+
+    #[test]
+    fn entity_slug_resout_les_variantes() {
+        // Suffixe juridique + ponctuation ne doivent pas produire des entités distinctes.
+        assert_eq!(entity_slug("Y SARL"), entity_slug("Y."));
+        assert_eq!(entity_slug("Y SARL"), "y");
+        assert_eq!(entity_slug("Acme Corp SAS"), "acme-corp");
+        // Conservateur : on ne fusionne PAS sur un mot commun générique ("société").
+        assert_ne!(entity_slug("Société Y"), entity_slug("Y SARL"));
+    }
+
+    #[test]
+    fn parse_entities_filtre_generiques_et_dedup() {
+        let raw = r#"{"entities": ["Acme SARL", "le client", "Acme", "Beta Corp"]}"#;
+        let out = parse_entities(raw);
+        // "Acme SARL" et "Acme" → même slug (une seule), "le client" générique écarté.
+        assert_eq!(out.len(), 2, "attendu Acme + Beta Corp : {out:?}");
+        assert!(out.iter().any(|e| e.starts_with("Acme")));
+        assert!(out.contains(&"Beta Corp".to_string()));
+    }
+
+    #[test]
+    fn parse_entities_tolere_l_inexploitable() {
+        assert!(parse_entities("pas du json").is_empty());
+        assert!(parse_entities(r#"{"entities": []}"#).is_empty());
+        assert!(parse_entities(r#"{"autre": 1}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_theme_groups_defensif() {
+        let valid: HashSet<&str> = ["arch-theme-devis", "arch-theme-invoice"].into_iter().collect();
+        // parent chapeautant < MIN_SUPERGROUP (2) thèmes valides → écarté
+        assert!(parse_theme_groups(r#"{"groups": [{"parent": "X", "themes": ["arch-theme-devis", "zzz"]}]}"#, &valid).is_empty());
+        // id halluciné filtré, parent vide écarté, JSON invalide toléré
+        assert!(parse_theme_groups(r#"{"groups": [{"parent": "", "themes": ["arch-theme-devis", "arch-theme-invoice"]}]}"#, &valid).is_empty());
+        assert!(parse_theme_groups("pas du json", &valid).is_empty());
     }
 }

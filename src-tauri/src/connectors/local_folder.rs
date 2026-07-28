@@ -22,7 +22,7 @@ pub const SOURCE: &str = "local-folder";
 /// code rangés dans Documents). .doc/.ppt sont inclus exprès : l'extraction
 /// peut échouer (Windows, format legacy) mais l'échec est alors expliqué
 /// dans le rapport plutôt que le fichier ignoré sans un mot.
-const EXTENSIONS: &[&str] = &["pdf", "docx", "doc", "pptx", "ppt", "xlsx", "csv"];
+pub const EXTENSIONS: &[&str] = &["pdf", "docx", "doc", "pptx", "ppt", "xlsx", "csv"];
 
 /// Dossiers de dépendances/build jamais descendus, même s'ils ne sont pas
 /// cachés — un `node_modules` contient des centaines de sous-dossiers, jamais

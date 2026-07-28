@@ -32,6 +32,13 @@ interface Props {
   phase?: "idle" | "scanning" | "generating";
   /** Message affiché sous l'orbe (root) — remplace le texte dessiné dans le canvas. */
   caption?: string | null;
+  /** Passe de l'Archiviste en cours : rien ne change à l'écran tant qu'elle
+   *  n'est pas finie (propositions batchées, cf. `archivingRef` dans App.tsx),
+   *  donc la boucle de rendu se met en veille (~6 fps) pour libérer le GPU
+   *  pendant que Gemma tourne dessus — sans ça le canvas redessine à 60 fps en
+   *  continu pour rien, contention réelle avec l'inférence (retour de Liam le
+   *  2026-07-25 : micro-freezes persistants même après le fix llama-server). */
+  archiving?: boolean;
   /** Clic sur l'orbe quand aucun root n'existe encore (canvas vide, pré-scan). */
   onOrbClick?: () => void;
 }
@@ -386,6 +393,7 @@ export function BrainMap({
   spaces, onAddNodeToSpace, onMoveNode, onDeleteNode, onImportFiles,
   onBackgroundClick, panelOffset = 0, focus = null,
   phase = "idle", caption = null, onOrbClick,
+  archiving = false,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -424,7 +432,33 @@ export function BrainMap({
   // stabilise le layout pendant qu'un graphe grandit en direct (scan, génération,
   // watch auto) au lieu de tout reshuffler à chaque nouveau nœud.
   const layoutAnchors = useRef(new Map<string, { x: number; y: number }>());
-  const { infos, childrenOf } = useMemo(() => buildLayout(graph, layoutAnchors.current), [graph]);
+  // Dernier parent connu par nœud — sert à repérer un reparentage (déplacement/
+  // fusion Archiviste, MCP, drag manuel) AVANT de calculer le layout suivant.
+  const lastParentOf = useRef<Map<string, string | null> | null>(null);
+  const { infos, childrenOf } = useMemo(() => {
+    // Un reparentage (lot Archiviste, MCP, drag) = réorganisation STRUCTURELLE.
+    // Effacer la seule ancre du nœud déplacé ne suffisait pas : ses descendants
+    // (les pages sous un conteneur-thème que l'Archiviste range sous un parent)
+    // gardaient leur ancienne position → structure à moitié re-disposée, propre
+    // seulement après relancement (ancres vides au boot). Dès qu'UN reparentage
+    // est vu, on vide TOUTES les ancres → re-layout propre from scratch, comme au
+    // lancement. Le layout étant déterministe, les sous-arbres non touchés
+    // gardent la même position (aucun jump) ; seuls les sous-arbres concernés se
+    // replacent, et le lerp de rendu (`livePos`) anime la transition — pas de
+    // mélange à 85% conçu pour la croissance organique (source des pointes qui
+    // traversaient le canvas, Liam le 2026-07-26).
+    const parentOf = new Map(graph.nodes.map((n) => [n.id, n.parent_id ?? null]));
+    const prev = lastParentOf.current;
+    let reparented = false;
+    if (prev) {
+      for (const [id, parentId] of parentOf) {
+        if (prev.has(id) && prev.get(id) !== parentId) { reparented = true; break; }
+      }
+    }
+    lastParentOf.current = parentOf;
+    if (reparented) layoutAnchors.current.clear();
+    return buildLayout(graph, layoutAnchors.current);
+  }, [graph]);
 
   // Couleur par nœud : racine = accent du thème, sinon couleur du cluster.
   const { colorOf, neighbors, maxR } = useMemo(() => {
@@ -477,6 +511,8 @@ export function BrainMap({
   // régénération) glissent via le lerp caméra au lieu de sauter.
   const didFit = useRef(false);
   const panelOff = useRef({ cur: 0, target: 0 });
+  const archivingRef = useRef(false);
+  useEffect(() => { archivingRef.current = archiving; }, [archiving]);
   const needsFit = useRef(true);
   const dragOffsets = useRef(new Map<string, { dx: number; dy: number }>());
   const hovered = useRef<string | null>(null);
@@ -486,6 +522,19 @@ export function BrainMap({
   // pas de téléportation quand des sœurs apparaissent — replay, watch auto, régén).
   const livePos = useRef(new Map<string, { x: number; y: number; vx?: number; vy?: number }>());
   const prevIds = useRef<Set<string> | null>(null);
+  // Snapshot des infos du rendu précédent — sert à repérer qui a disparu
+  // (fusion Archiviste) et qui a juste changé de place (déplacement de lot).
+  const prevInfosRef = useRef<Map<string, NodeInfo> | null>(null);
+  // Nœuds fusionnés/supprimés : fondu court sur leur dernière position connue
+  // au lieu d'un pop instantané (retour de Liam le 2026-07-26 : une passe
+  // Archiviste qui range des dizaines de pages d'un coup doit se voir comme un
+  // rangement, pas comme un bloc qui saute).
+  const ghosts = useRef(new Map<string, { info: NodeInfo; x: number; y: number; color: string; removedAt: number }>());
+  const GHOST_FADE_MS = 450;
+  // Nœuds déplacés (parent changé) : décalage de départ en cascade avant que le
+  // lerp de position ne prenne le relais (même retour — un gros lot qui glisse
+  // tout d'un coup est aussi peu lisible qu'une téléportation).
+  const moveDelay = useRef(new Map<string, number>());
   const drag = useRef<{ mode: "node" | "pan"; id?: string; ids?: string[]; moved: number; sx: number; sy: number } | null>(null);
   // Matière : distance en sauts au nœud attrapé — la grappe suit en ressort avec
   // une raideur décroissante par saut, pendant le drag et jusqu'à se reposer.
@@ -511,14 +560,49 @@ export function BrainMap({
   // moins d'animations.
   useEffect(() => {
     const ids = new Set(graph.nodes.map((n) => n.id));
+    const prevInfos = prevInfosRef.current;
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // Ghosts : capture la dernière position connue de tout nœud qui vient de
+    // disparaître (fusion, suppression) avant de purger sa position vivante —
+    // `draw()` le fait fondre brièvement au lieu de le faire vanish net.
+    if (prevInfos && !reduced) {
+      for (const [id, info] of prevInfos) {
+        if (ids.has(id) || ghosts.current.has(id)) continue;
+        const lp = livePos.current.get(id);
+        ghosts.current.set(id, {
+          info, x: lp?.x ?? info.finalX, y: lp?.y ?? info.finalY,
+          color: colorOf.get(id) ?? CLUSTER_FALLBACK, removedAt: performance.now(),
+        });
+      }
+    }
+
     // Purge les positions vivantes des nœuds disparus (scrub timeline arrière…).
     for (const id of [...livePos.current.keys()]) {
       if (!ids.has(id)) livePos.current.delete(id);
     }
     const prev = prevIds.current;
     prevIds.current = ids;
+
+    // Cascade des nœuds DÉPLACÉS (parent changé par un lot) : sans délai de
+    // départ échelonné, tout glisse vers sa nouvelle place dans la même frame —
+    // lisible pour 1-2 nœuds (édition manuelle), pas pour un gros lot (passage
+    // Archiviste) qui doit se voir comme un rangement progressif.
+    if (prevInfos && !reduced) {
+      const moved = [...infos.values()].filter((info) => {
+        const before = prevInfos.get(info.id);
+        return before && (Math.abs(before.finalX - info.finalX) > 4 || Math.abs(before.finalY - info.finalY) > 4);
+      });
+      if (moved.length > 1) {
+        const step = Math.min(80, 500 / moved.length);
+        const now = performance.now();
+        moved.forEach((info, i) => moveDelay.current.set(info.id, now + i * step));
+      }
+    }
+    prevInfosRef.current = infos;
+
     if (!prev || prev.size === 0) return;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    if (reduced) return;
     const fresh = [...ids].filter((id) => !prev.has(id));
     if (fresh.length === 0) return;
     // Cascade bornée : peu de nœuds → 90 ms d'écart ; gros lot (replay, scrub,
@@ -588,6 +672,7 @@ export function BrainMap({
     // naissent sur leur parent puis glissent vers leur place.
     const advancePositions = () => {
       const s = S.current;
+      const now = performance.now();
       const firstLayout = livePos.current.size === 0;
       const k = reduce ? 1 : 0.16;
       // Matière : répulsion très douce du curseur (hors drag) — appliquée à la
@@ -598,8 +683,19 @@ export function BrainMap({
       const repulseR = 70 / zoom;
       for (const info of s.infos.values() as Iterable<NodeInfo>) {
         const o = dragOffsets.current.get(info.id) ?? { dx: 0, dy: 0 };
-        let tx = info.finalX + o.dx, ty = info.finalY + o.dy;
         let lp = livePos.current.get(info.id);
+        // Cascade de déplacement : pas encore son tour → la cible reste sa
+        // position actuelle (immobile) au lieu de sauter vers la nouvelle tout
+        // de suite, cf. `moveDelay` posé dans l'effet de détection plus haut.
+        const holdUntil = moveDelay.current.get(info.id);
+        if (holdUntil !== undefined) {
+          if (now < holdUntil) {
+            if (!lp) { lp = { x: info.finalX, y: info.finalY }; livePos.current.set(info.id, lp); }
+            continue;
+          }
+          moveDelay.current.delete(info.id);
+        }
+        let tx = info.finalX + o.dx, ty = info.finalY + o.dy;
         if (!lp) {
           const par = info.parentId ? livePos.current.get(info.parentId) : undefined;
           lp = firstLayout || !par ? { x: tx, y: ty } : { x: par.x, y: par.y };
@@ -637,6 +733,7 @@ export function BrainMap({
       }
     };
 
+    let lastLabelDraw = 0;
     const draw = (ts: number) => {
       // Le DPR change sans resize CSS (fenêtre déplacée entre écrans, création
       // avant affectation à l'écran Retina) → re-dimensionner le backing store.
@@ -740,6 +837,23 @@ export function BrainMap({
       }
       ctx.globalAlpha = 1;
 
+      // ── Fantômes : nœuds fusionnés/supprimés, fondu court sur leur dernière
+      // position connue (cf. `ghosts` posé dans l'effet de détection) ──
+      if (ghosts.current.size > 0) {
+        for (const [id, gh] of ghosts.current) {
+          const age = ts - gh.removedAt;
+          if (age >= GHOST_FADE_MS) { ghosts.current.delete(id); continue; }
+          const alpha = 1 - age / GHOST_FADE_MS;
+          const r = gh.info.r * (1 - 0.35 * (age / GHOST_FADE_MS));
+          ctx.globalAlpha = alpha * 0.8;
+          ctx.beginPath(); ctx.arc(gh.x, gh.y, r, 0, Math.PI * 2);
+          ctx.strokeStyle = hexA(gh.color, 0.35); ctx.lineWidth = 1 / c.zoom; ctx.stroke();
+          ctx.beginPath(); ctx.arc(gh.x, gh.y, Math.max(1.6, r * 0.5), 0, Math.PI * 2);
+          ctx.fillStyle = gh.color; ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+
       // ── Nœuds (constellation : point net + anneau fin) ──
       for (const info of s.infos.values()) {
         if (!visible(info)) continue;
@@ -768,11 +882,11 @@ export function BrainMap({
         const r = info.r * rScale;
         ctx.globalAlpha = vis * spawnAlpha;
 
-        // Halo chaud : les pages créées cette semaine « couvent » — teinte chaude,
-        // intensité qui décroît avec l'âge, respiration lente (fixe si reduce).
+        // Halo vert : les pages créées cette semaine « couvent » — intensité
+        // qui décroît avec l'âge, respiration lente (fixe si reduce).
         const rk = s.recentK.get(info.id) ?? 0;
         if (rk > 0.02 && !isPending) {
-          const warm = t.dark ? "#e8a04b" : "#c9873a";
+          const warm = t.dark ? "#4ade80" : "#16a34a";
           const breathe = reduce ? 0.75 : 0.65 + 0.35 * Math.sin(time * 1.1 + phase);
           const hr = r * (2.6 + rk * 1.2);
           const wg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, hr);
@@ -797,7 +911,7 @@ export function BrainMap({
         ctx.stroke();
 
         // Modification MCP en attente (update/move/merge/link) : anneau orange
-        // pointillé distinct de l'ambre des créations — le nœud existe déjà,
+        // pointillé distinct du vert des créations — le nœud existe déjà,
         // seul son état va changer si la proposition est acceptée.
         if (info.node.pendingAction) {
           ctx.beginPath();
@@ -837,32 +951,42 @@ export function BrainMap({
       ctx.restore();
 
       // ── Labels (espace écran, monospace, taille constante) ──
-      for (const info of s.infos.values()) {
-        if (!visible(info)) continue;
-        if (spawnK(info.id) < 0.6) continue; // label après le pop de la bulle
-        const kind = info.node.kind;
-        const isRoot = kind === "root";
-        if (isRoot) continue; // label HTML sous l'orbe, pas de texte canvas pour le root
-        const isLeaf = isLeafKind(kind);
-        const isContainer = !isLeaf && !isRoot;
-        const isHover = info.id === hv;
-        const always = isRoot || (isContainer && kind === "group") || kind === "pending";
-        const show = always || isHover || (!!hv && near!(info.id)) || info.id === s.selectedId;
-        if (!show) continue;
-        const p = pos(info);
-        // Texte calé sur la grille de pixels : net à l'arrêt comme en vol.
-        const px = Math.round(sx(p.x)), py = sy(p.y);
-        const fs = isRoot ? 12 : isContainer ? 10.5 : 9.5;
-        ctx.font = `500 ${fs}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-        ctx.textAlign = "center"; ctx.textBaseline = "middle";
-        const ly = Math.round(py + info.r * c.zoom + (isRoot ? 18 : 12));
-        ctx.globalAlpha = isLeaf ? leafA : 1;
-        ctx.shadowColor = t.dark ? "rgba(0,0,0,0.7)" : "rgba(245,247,251,0.9)";
-        ctx.shadowBlur = 4;
-        ctx.fillStyle = isHover || info.id === s.selectedId ? t.sel : isLeaf ? t.labelDim : t.label;
-        (ctx as any).letterSpacing = isRoot ? "1.5px" : "0.4px";
-        ctx.fillText(isRoot ? info.node.label.toUpperCase() : info.node.label, px, ly);
-        ctx.shadowBlur = 0;
+      // `shadowBlur` (ligne plus bas) est l'op Canvas2D la plus coûteuse d'ici —
+      // pendant une passe Archiviste, le GPU est déjà sollicité par l'inférence
+      // Gemma (llama-server persistant), donc on retombe à ~10 fps sur CETTE
+      // boucle précise (bulles/caméra/interactions restent fluides à 60 fps,
+      // seul le texte traîne un peu) plutôt que de tout figer (retour de Liam
+      // le 2026-07-25 : figer le canvas entier pendant l'archivage rend l'app
+      // sourde/lente en continu, pire qu'un micro-freeze ponctuel).
+      if (!archivingRef.current || ts - lastLabelDraw >= 100) {
+        lastLabelDraw = ts;
+        for (const info of s.infos.values()) {
+          if (!visible(info)) continue;
+          if (spawnK(info.id) < 0.6) continue; // label après le pop de la bulle
+          const kind = info.node.kind;
+          const isRoot = kind === "root";
+          if (isRoot) continue; // label HTML sous l'orbe, pas de texte canvas pour le root
+          const isLeaf = isLeafKind(kind);
+          const isContainer = !isLeaf && !isRoot;
+          const isHover = info.id === hv;
+          const always = isRoot || (isContainer && kind === "group") || kind === "pending";
+          const show = always || isHover || (!!hv && near!(info.id)) || info.id === s.selectedId;
+          if (!show) continue;
+          const p = pos(info);
+          // Texte calé sur la grille de pixels : net à l'arrêt comme en vol.
+          const px = Math.round(sx(p.x)), py = sy(p.y);
+          const fs = isRoot ? 12 : isContainer ? 10.5 : 9.5;
+          ctx.font = `500 ${fs}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+          ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          const ly = Math.round(py + info.r * c.zoom + (isRoot ? 18 : 12));
+          ctx.globalAlpha = isLeaf ? leafA : 1;
+          ctx.shadowColor = t.dark ? "rgba(0,0,0,0.7)" : "rgba(245,247,251,0.9)";
+          ctx.shadowBlur = 4;
+          ctx.fillStyle = isHover || info.id === s.selectedId ? t.sel : isLeaf ? t.labelDim : t.label;
+          (ctx as any).letterSpacing = isRoot ? "1.5px" : "0.4px";
+          ctx.fillText(isRoot ? info.node.label.toUpperCase() : info.node.label, px, ly);
+          ctx.shadowBlur = 0;
+        }
       }
       ctx.globalAlpha = 1;
       (ctx as any).letterSpacing = "0px";

@@ -179,6 +179,33 @@ pub fn load_by_id(id: &str) -> Option<Conversation> {
     load_conversations().into_iter().find(|c| c.summary.id == id)
 }
 
+/// Fichier où Notes.app persiste tout (WAL actif en pratique, cf. `-wal` à
+/// côté) — jamais lu directement (cf. l'en-tête du module), seulement surveillé
+/// comme SIGNAL : sa date de modif change dès qu'une note bouge, ce qui donne
+/// un vrai déclencheur fs pour le watch auto au lieu d'un sondage à l'aveugle.
+/// Peut être derrière l'autorisation "Accès complet au disque" selon la
+/// version de macOS — dans ce cas `notify` échoue proprement à l'ouverture et
+/// l'appelant retombe sur `changed_fingerprint` (sondage), jamais un échec
+/// silencieux (ADR-0015).
+#[cfg(target_os = "macos")]
+pub fn notestore_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?
+        .join("Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"))
+}
+#[cfg(not(target_os = "macos"))]
+pub fn notestore_path() -> Option<PathBuf> { None }
+
+/// Empreinte bon marché (nombre de notes + date de modif la plus récente) —
+/// filet de sondage périodique si `notestore_path` n'est pas surveillable
+/// (permission refusée). Coût identique à `sync()` (une bibliothèque de notes
+/// reste petite), mais ne réécrit rien : juste de quoi détecter un changement.
+pub fn changed_fingerprint() -> Option<String> {
+    if !is_connected() { return None; }
+    let notes = fetch_notes().ok()?;
+    let max_mod = notes.iter().map(|n| n.mod_date.as_str()).max().unwrap_or("").to_string();
+    Some(format!("{}:{}", notes.len(), max_mod))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

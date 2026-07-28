@@ -389,6 +389,11 @@ export function appleNotesSync(): Promise<number> {
   return invoke("apple_notes_sync");
 }
 
+/** Reflète l'activité de l'Archiviste sur l'icône barre de menu (visible app réduite). */
+export function setArchivistActive(active: boolean): Promise<void> {
+  return invoke("set_archivist_active", { active });
+}
+
 /** Déconnecte les notes Apple (supprime config + cache). */
 export function appleNotesDisconnect(): Promise<void> {
   return invoke("apple_notes_disconnect");

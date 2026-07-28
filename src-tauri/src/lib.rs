@@ -3,12 +3,35 @@
 
 /// Log vers stderr sans paniquer : `crate::elog!` panique si stderr est fermé
 /// (parent mort → Broken pipe), ce qui tuait la génération. Ici on ignore l'échec.
+/// Doublé dans `lucid.log` (dossier de données machine) : en `tauri dev` le
+/// terminal suffit, mais une fois l'app lancée seule (double-clic, packagée)
+/// il n'y a plus de terminal du tout — sans fichier, aucun des diagnostics
+/// posés ici (respawn `llama-server`, boucle Archiviste…) n'est récupérable
+/// après coup (demandé par Liam le 2026-07-26).
 #[macro_export]
 macro_rules! elog {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), $($arg)*);
+        let msg = format!($($arg)*);
+        let _ = writeln!(std::io::stderr(), "{msg}");
+        $crate::log_to_file(&msg);
     }};
+}
+
+/// Écriture best-effort dans `<dossier machine>/lucid.log` — jamais bloquant,
+/// jamais de panique si le dossier est absent ou le fichier verrouillé.
+/// ponytail: pas de rotation ; à ajouter si le fichier devient gênant en taille
+/// (aucun signe que ce soit le cas avec ~35 sites d'appel, tous best-effort).
+pub fn log_to_file(msg: &str) {
+    use std::io::Write as _;
+    let Some(dir) = ai::llama::shared_data_dir() else { return };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("lucid.log")) {
+        let _ = writeln!(f, "[{secs}] {msg}");
+    }
 }
 
 mod ai;
@@ -114,6 +137,39 @@ fn write_pending_proposal(
         "link_target": "", "relation": "", "created_at": chrono::Utc::now().to_rfc3339(),
     });
     std::fs::write(pdir.join(format!("{id}.json")), proposal.to_string()).map_err(|e| e.to_string())
+}
+
+/// Proposition de LIEN (wikilink) entre deux nœuds — `write_pending_proposal`
+/// force `link_target`/`relation` à vide, on écrit donc le JSON directement.
+fn write_link_proposal(dir: &std::path::Path, id: &str, source_id: &str, link_target: &str, relation: &str) -> Result<(), String> {
+    let pdir = dir.join("mcp_pending");
+    std::fs::create_dir_all(&pdir).map_err(|e| e.to_string())?;
+    let proposal = serde_json::json!({
+        "id": id, "action": "link", "parent_id": "", "label": "", "content": "",
+        "target_id": source_id, "new_parent_id": "", "merge_ids": [],
+        "link_target": link_target, "relation": relation, "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(pdir.join(format!("{id}.json")), proposal.to_string()).map_err(|e| e.to_string())
+}
+
+/// Cache d'extraction d'entités par document (`archivist_entities.json`) : évite
+/// de rappeler Gemma sur un doc inchangé. `sig` = signature bon marché
+/// (updated_at + taille du texte) — change dès que le doc change.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct EntityCacheEntry { sig: String, entities: Vec<String> }
+
+fn entity_cache_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_entities.json") }
+
+fn load_entity_cache(dir: &std::path::Path) -> std::collections::HashMap<String, EntityCacheEntry> {
+    std::fs::read_to_string(entity_cache_path(dir)).ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default()
+}
+
+fn save_entity_cache(dir: &std::path::Path, cache: &std::collections::HashMap<String, EntityCacheEntry>) {
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = std::fs::write(entity_cache_path(dir), json);
+    }
 }
 
 /// Point d'entrée de l'Archiviste (prototype) — une passe unique : script
@@ -241,20 +297,21 @@ fn run_archivist_scan_once_in_progress(
     // sujet, aucun mot partagé). Jamais sur ce que le script a déjà su grouper
     // seul (déjà retiré de `catchall_leftover` en amont, dans `scan()`).
     let mut ai_clustered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(e) = &engine {
-        let ai_clusters = archivist::ai_cluster_leftovers(e, &catchall_leftover);
-        for cluster in &ai_clusters {
-            for id in &cluster.node_ids {
-                ai_clustered.insert(id.clone());
-            }
-            apply_theme_cluster(cluster, &mut n, &mut report)?;
+    let ai_clusters: Vec<archivist::ThemeCluster> = match &engine {
+        Some(e) => archivist::ai_cluster_leftovers(e, &catchall_leftover, &graph),
+        None => Vec::new(),
+    };
+    for cluster in &ai_clusters {
+        for id in &cluster.node_ids {
+            ai_clustered.insert(id.clone());
         }
-        if !ai_clusters.is_empty() {
-            report.push_str(&format!(
-                "→ IA : {} regroupement(s) sémantique(s) supplémentaire(s) (aucun mot de titre partagé)\n",
-                ai_clusters.len()
-            ));
-        }
+        apply_theme_cluster(cluster, &mut n, &mut report)?;
+    }
+    if !ai_clusters.is_empty() {
+        report.push_str(&format!(
+            "→ IA : {} regroupement(s) sémantique(s) supplémentaire(s) (aucun mot de titre partagé)\n",
+            ai_clusters.len()
+        ));
     }
 
     // Bac "Non triable" : ce qui reste après le tri mécanique ET la passe IA.
@@ -288,21 +345,69 @@ fn run_archivist_scan_once_in_progress(
         ));
     }
 
+    // Super-groupement : chapeauter les dossiers-thèmes proches sous un parent
+    // explicite (root › « Facturation » › { Devis, Facture, Estimation }),
+    // demandé par Liam le 2026-07-28. Passe sémantique (Gemma) sur les LIBELLÉS
+    // des thèmes — deux thèmes d'un même domaine ne partagent aucun mot commun,
+    // seul le sens les rapproche. Ne considère que les thèmes à plat sous la
+    // racine (ceux créés ce passage — id déterministe — plus ceux déjà présents,
+    // hors thèmes déjà rangés sous un parent). Le circuit de résolution applique
+    // le "create parent" avant les "move" de thèmes (dépendance new_parent_id).
+    if let Some(e) = &engine {
+        let mut themes: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in result.theme_clusters.iter().chain(ai_clusters.iter()) {
+            let id = format!("arch-theme-{}", c.label.to_lowercase());
+            if seen.insert(id.clone()) { themes.push((id, c.label.clone())); }
+        }
+        for node in &graph.nodes {
+            if node.id.starts_with("arch-theme-")
+                && node.parent_id.as_deref() == root_id.as_deref()
+                && seen.insert(node.id.clone())
+            {
+                themes.push((node.id.clone(), node.label.clone()));
+            }
+        }
+        for grp in archivist::ai_group_themes(e, &themes) {
+            let slug = grp.parent_label.to_lowercase().replace(' ', "-");
+            let group_id = format!("arch-group-{slug}");
+            if let Some(root_id) = &root_id {
+                if !graph.nodes.iter().any(|c| c.id == group_id) {
+                    write_pending_proposal(dir, &group_id, "create", root_id, &grp.parent_label, "", "", &[])?;
+                }
+            }
+            for theme_id in &grp.theme_ids {
+                let id = format!("arch-move-{n}");
+                n += 1;
+                write_pending_proposal(dir, &id, "move", "", "", theme_id, &group_id, &[])?;
+            }
+            report.push_str(&format!(
+                "→ regrouper {} thème(s) sous « {} »\n", grp.theme_ids.len(), grp.parent_label
+            ));
+        }
+    }
+
     let total_groups = result.groups.len();
     for (gi, group) in result.groups.iter().enumerate() {
         on_progress(gi + 1, total_groups);
         match &engine {
             Some(e) => match archivist::decide_group(e, group, &graph) {
                 archivist::GroupOutcome::Merge(d) => {
-                    let id = format!("arch-merge-{n}");
-                    n += 1;
                     let mut ids = vec![d.survivor_id.clone()];
                     ids.extend(d.dropped_ids.clone());
-                    write_pending_proposal(dir, &id, "merge", "", "", "", "", &ids)?;
-                    report.push_str(&format!(
-                        "→ fusionner « {} » ({} pages) — {}\n",
-                        group.label, group.node_ids.len(), d.reason
-                    ));
+                    // Une fusion exige AU MOINS 2 ids : sans ce garde, une décision
+                    // dégénérée (survivant sans doublon) produisait une proposition
+                    // `merge` à 1 id, impossible à appliquer et rejouée en boucle
+                    // (bug du 2026-07-28). On l'ignore proprement plutôt que de la créer.
+                    if ids.len() >= 2 {
+                        let id = format!("arch-merge-{n}");
+                        n += 1;
+                        write_pending_proposal(dir, &id, "merge", "", "", "", "", &ids)?;
+                        report.push_str(&format!(
+                            "→ fusionner « {} » ({} pages) — {}\n",
+                            group.label, group.node_ids.len(), d.reason
+                        ));
+                    }
                 }
                 archivist::GroupOutcome::KeepSeparate { reason } => report.push_str(&format!(
                     "· « {} » ({} pages) : gardées séparées — {}\n",
@@ -319,6 +424,83 @@ fn run_archivist_scan_once_in_progress(
             )),
         }
     }
+
+    // ─── Couche entités : relie les documents à leurs sociétés/clients ──────────
+    // Fait passer d'un arbre de dossiers à un vrai graphe : « Société Y » devient
+    // un nœud-hub, chaque doc qui la cite y est relié par un `link` (pont visible
+    // sur le canvas). Extraction Gemma par doc, CACHÉE (seuls les docs neufs/
+    // modifiés repassent) — incrémental comme l'extraction du pipeline. Sort en
+    // propositions (create entité + link), jamais d'écriture directe.
+    //
+    // DÉSACTIVÉE le 2026-07-28 : sur des données mixtes (transcripts Claude Code +
+    // docs dev), Gemma ramasse surtout des noms d'OUTILS (claude, gemini, xano,
+    // supabase, cursor, obsidian...) pris pour des « organisations » → 80 entités +
+    // 301 liens = graphe illisible (retour Liam, captures à l'appui). À réactiver
+    // seulement avec : (1) stoplist de noms tech/produits/IA, (2) extraction limitée
+    // aux sources « document business » (pas les transcripts/notes dev), (3) rendu
+    // des liens borné au nœud sélectionné (sinon hairball quel que soit le nombre).
+    const ENTITY_LAYER_ENABLED: bool = false;
+    if ENTITY_LAYER_ENABLED {
+    if let Some(e) = &engine {
+        let mut cache = load_entity_cache(dir);
+        // Flush périodique : sans ça une passe interrompue (app fermée) redoit
+        // TOUTES les extractions Gemma de la passe au prochain lancement. On
+        // persiste le cache tous les 10 docs extraits → une reprise ne reperd
+        // au pire que ~10 extractions.
+        let mut dirty = 0usize;
+        // slug -> (libellé d'affichage, ids des docs qui la citent)
+        let mut entity_docs: std::collections::HashMap<String, (String, Vec<String>)> = std::collections::HashMap::new();
+        let docs: Vec<&BrainNode> = graph.nodes.iter().filter(|nd| nd.kind == "leaf").collect();
+        let total_docs = docs.len();
+        for (i, node) in docs.iter().enumerate() {
+            on_progress(i + 1, total_docs);
+            let sig = format!("{}:{}", node.updated_at.unwrap_or(0), node.source_text.len());
+            let names = match cache.get(&node.id) {
+                Some(c) if c.sig == sig => c.entities.clone(),
+                _ => {
+                    let names = archivist::extract_doc_entities(e, node);
+                    cache.insert(node.id.clone(), EntityCacheEntry { sig, entities: names.clone() });
+                    dirty += 1;
+                    if dirty >= 10 { save_entity_cache(dir, &cache); dirty = 0; }
+                    names
+                }
+            };
+            for name in names {
+                let slug = archivist::entity_slug(&name);
+                if slug.is_empty() { continue; }
+                let entry = entity_docs.entry(slug).or_insert_with(|| (name.clone(), Vec::new()));
+                if !entry.1.contains(&node.id) { entry.1.push(node.id.clone()); }
+            }
+        }
+        if dirty > 0 { save_entity_cache(dir, &cache); }
+
+        let mut linked = 0usize;
+        for (slug, (display, doc_ids)) in entity_docs {
+            // Une entité citée par UN seul doc ne crée aucun pont utile → ignorée
+            // (évite aussi une explosion de nœuds-entités à une feuille).
+            if doc_ids.len() < 2 { continue; }
+            let entity_id = format!("arch-entity-{slug}");
+            if !graph.nodes.iter().any(|c| c.id == entity_id) {
+                if let Some(root_id) = &root_id {
+                    write_pending_proposal(dir, &entity_id, "create", root_id, &display, "", "", &[])?;
+                }
+            }
+            for doc_id in &doc_ids {
+                // Lien déjà présent → ne pas re-proposer (idempotent entre passes).
+                let exists = graph.edges.iter().any(|ed| ed.kind == "link"
+                    && ((ed.source == *doc_id && ed.target == entity_id) || (ed.source == entity_id && ed.target == *doc_id)));
+                if exists { continue; }
+                let id = format!("arch-link-{n}");
+                n += 1;
+                write_link_proposal(dir, &id, doc_id, &entity_id, "client")?;
+            }
+            linked += 1;
+        }
+        if linked > 0 {
+            report.push_str(&format!("→ {linked} société(s)/client(s) reliée(s) à leurs documents (wikilinks)\n"));
+        }
+    }
+    } // fin ENTITY_LAYER_ENABLED
 
     // Pas de bloc "orphelines laissées de côté" ici : `result.orphans_unresolved`
     // est désormais toujours routé vers le bac "Non triable" plus haut, dans le
@@ -1689,7 +1871,15 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
         let mut remaining = Vec::new();
         for p in props {
             let ready = match p.action.as_str() {
-                "update" | "link" => graph.nodes.iter().any(|n| n.id == p.target_id),
+                "update" => graph.nodes.iter().any(|n| n.id == p.target_id),
+                // "link" a DEUX dépendances comme "move" : les deux extrémités
+                // doivent exister. Sans vérifier `link_target`, un lien doc→entité
+                // proposé dans le même lot que la CRÉATION de l'entité pouvait
+                // s'appliquer avant elle → `link_nodes_on` renvoie "…introuvable.",
+                // toléré plus bas comme zombie et la proposition DROPPÉE : le lien
+                // ne se formait jamais (même piège que le bug "move" de 2026-07-23).
+                "link" => graph.nodes.iter().any(|n| n.id == p.target_id)
+                    && graph.nodes.iter().any(|n| n.id == p.link_target),
                 // "move" a DEUX dépendances, pas juste la cible : la nouvelle
                 // destination doit aussi déjà exister (ex. un thème que
                 // l'Archiviste vient de créer dans LE MÊME lot). Sans vérifier
@@ -1754,9 +1944,17 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
                     let _ = remove_pending_file(dir, &p.id);
                     mark_proposal_resolved(dir, &p.id);
                 }
+                // Erreur NON tolérée après avoir passé le contrôle de dépendances
+                // (readiness) : l'opération est intrinsèquement invalide (fusion à
+                // <2 ids, cycle, auto-lien…) → elle ne réussira JAMAIS. On la met en
+                // quarantaine (retirée + loggée, donc pas « perdue en silence »)
+                // plutôt que de la re-empiler : sinon chaque poll la rejoue en boucle
+                // → flood du log + CPU à fond, l'app ne s'ouvre plus (bug remonté par
+                // Liam le 2026-07-28 : `arch-merge-3` avec un seul id).
                 Err(e) => {
-                    elog!("mcp: proposition {} non appliquée : {e}", p.id);
-                    remaining.push(p); // reste en attente, visible — jamais perdue en silence
+                    elog!("mcp: proposition {} REJETÉE (invalide, retirée) : {e}", p.id);
+                    let _ = remove_pending_file(dir, &p.id);
+                    mark_proposal_resolved(dir, &p.id);
                 }
             }
         }
@@ -3038,6 +3236,33 @@ mod snapshot_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Régression du bug remonté par Liam le 2026-07-28 : une régénération (auto
+    /// ou manuelle) détruisait la réorganisation de l'Archiviste — le pipeline
+    /// re-rattachait chaque feuille à son conteneur d'origine (source), effaçant
+    /// les déplacements. `reapply_overrides` doit préserver le parent choisi pour
+    /// tout nœud modifié (updated_at → saved_parent), et laisser les autres tels
+    /// que le pipeline les a placés.
+    #[test]
+    fn reapply_overrides_preserve_les_deplacements_de_larchiviste() {
+        use std::collections::HashMap;
+        let mut fresh: BrainGraph = serde_json::from_value(serde_json::json!({
+            "nodes": [
+                {"id":"leaf:x","label":"Doc","kind":"leaf","weight":1,"parent_id":"container:source"},
+                {"id":"leaf:y","label":"Autre","kind":"leaf","weight":1,"parent_id":"container:source"}
+            ],
+            "edges": [], "markdown": "", "report": "", "generated_at": ""
+        })).unwrap();
+        // L'Archiviste avait déplacé leaf:x sous son conteneur (updated_at posé → saved_parent).
+        let saved_parent = HashMap::from([("leaf:x".to_string(), Some("arch-theme-factures".to_string()))]);
+
+        reapply_overrides(&mut fresh, &HashMap::new(), &saved_parent);
+
+        assert_eq!(fresh.nodes[0].parent_id.as_deref(), Some("arch-theme-factures"),
+            "le déplacement de l'Archiviste doit survivre à la régénération");
+        assert_eq!(fresh.nodes[1].parent_id.as_deref(), Some("container:source"),
+            "un nœud non modifié garde le placement du pipeline");
+    }
+
     #[test]
     fn restore_snapshot_depuis_un_db_restaure_letat_sqlite_actif() {
         let dir = std::env::temp_dir().join("lucid_test_restore_db");
@@ -4023,8 +4248,59 @@ async fn generate_brain(app: tauri::AppHandle) -> Result<BrainGraph, String> {
 }
 
 /// Cœur bloquant de la génération (commande Tauri + watch auto).
+/// Un vrai cerveau existe-t-il pour ce compte ? `brain.db` après la migration
+/// SQLite (Phase 8), `brain.json` avant. Les gardes des régénérations auto ne
+/// testaient QUE `brain.json` → cassées en silence pour tout compte migré (la
+/// migration renomme `brain.json` en `brain.json.migre-*`), donc watch auto ET
+/// rattrapage démarrage ne se déclenchaient plus jamais (bug remonté par Liam le
+/// 2026-07-28 : note + fichiers ajoutés jamais ingérés).
+fn has_real_brain(dir: &std::path::Path) -> bool {
+    dir.join("brain.db").exists() || dir.join("brain.json").exists()
+}
+
+/// Rafraîchit les caches des connecteurs à cache (Notes Apple, Drive, dossiers
+/// locaux) — `run_generation` lit ces caches, PAS la source en direct. Sans ça,
+/// un ajout/une modif hors-ligne n'apparaît jamais, même via « Générer » (bug
+/// remonté par Liam le 2026-07-28). Best-effort, jamais bloquant : si un
+/// connecteur échoue (permission révoquée, réseau coupé…) on log et on continue
+/// avec les autres, jamais un échec silencieux (ADR-0015).
+/// ponytail: re-sync à chaque génération ; incrémental donc bon marché (mtime
+/// pour les fichiers, seulement les docs Drive modifiés). Si ça devient trop
+/// lourd un jour, gater sur un fingerprint par connecteur.
+fn refresh_connector_caches() {
+    if connectors::apple_notes::is_connected() {
+        if let Err(e) = connectors::apple_notes::sync() { crate::elog!("⚠️ sync Notes Apple : {e}"); }
+    }
+    if connectors::google_drive::is_connected() {
+        if let Err(e) = connectors::google_drive::sync_docs() { crate::elog!("⚠️ sync Drive : {e}"); }
+    }
+    if connectors::local_folder::is_connected() {
+        if let Err(e) = connectors::local_folder::sync(|_, _, _| {}) { crate::elog!("⚠️ sync dossiers locaux : {e}"); }
+    }
+}
+
+/// Ré-applique par-dessus le graphe fraîchement régénéré les surcharges que le
+/// pipeline (déterministe, dérivé des seules sources) ignore : contenu édité et
+/// parent choisi par l'Archiviste/l'utilisateur (déplacements). Nœuds seulement —
+/// les arêtes de contenance sont reconstruites ensuite depuis `parent_id`.
+fn reapply_overrides(
+    graph: &mut BrainGraph,
+    saved_content: &std::collections::HashMap<String, String>,
+    saved_parent: &std::collections::HashMap<String, Option<String>>,
+) {
+    for node in &mut graph.nodes {
+        if node.content.is_empty() {
+            if let Some(c) = saved_content.get(&node.id) { node.content = c.clone(); }
+        }
+        if let Some(p) = saved_parent.get(&node.id) { node.parent_id = p.clone(); }
+    }
+}
+
 fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
     {
+        // Sources rafraîchies AVANT lecture des caches — sinon on régénère à partir
+        // de données figées (note/fichier ajouté hors app jamais ingéré).
+        refresh_connector_caches();
         // Sans IA locale la génération marche quand même (structure + texte source).
         let engine = LlamaEngine::detect().ok();
         let mut convs = load_all_conversations();
@@ -4082,6 +4358,17 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
             .as_ref()
             .map(|g| g.nodes.iter().filter(|n| n.kind != "root").cloned().collect())
             .unwrap_or_default();
+        // Structure décidée par l'Archiviste / l'utilisateur : tout nœud
+        // explicitement modifié (`updated_at` posé — un « move » MCP change
+        // parent_id, donc write_brain le ré-estampille) garde SON parent à la
+        // régénération. Sans ça le pipeline le re-rattache à son conteneur
+        // d'origine (dérivé de la source) et efface tous les déplacements — la
+        // régénération détruisait la réorganisation de l'Archiviste (bug remonté
+        // par Liam le 2026-07-28).
+        let saved_parent: std::collections::HashMap<String, Option<String>> = carried.iter()
+            .filter(|n| n.updated_at.is_some())
+            .map(|n| (n.id.clone(), n.parent_id.clone()))
+            .collect();
         let prev_links: Vec<BrainEdge> = prev_graph
             .map(|g| g.edges.into_iter().filter(|e| e.kind != "contains").collect())
             .unwrap_or_default();
@@ -4119,14 +4406,8 @@ fn run_generation(app: &tauri::AppHandle) -> Result<BrainGraph, String> {
             },
         )?;
 
-        // Réinjecte le contenu utilisateur sur les nœuds correspondants
-        for node in &mut graph.nodes {
-            if node.content.is_empty() {
-                if let Some(c) = saved_content.get(&node.id) {
-                    node.content = c.clone();
-                }
-            }
-        }
+        // Réinjecte le contenu utilisateur + la structure préservée (cf. saved_parent).
+        reapply_overrides(&mut graph, &saved_content, &saved_parent);
 
         // Pass-through : ré-ajoute tel quel tout nœud absent de la nouvelle
         // génération (l'estampille updated_at reste intacte → la fusion de sync
@@ -4336,49 +4617,110 @@ fn start_data_watcher(app: tauri::AppHandle) {
 /// ci-dessous, indépendamment du nombre de rafales détectées par le watcher.
 static LAST_AUTO_REGEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Chemins fs surveillables MAINTENANT (source → chemin) — recalculé à chaque
+/// tour plutôt qu'une seule fois au démarrage : un dossier ajouté/retiré dans
+/// Réglages, ou Notes Apple connectée en cours de route, doit rejoindre le
+/// watch sans relancer l'app. Le pipeline (`run_generation`) agrège déjà
+/// toutes les sources d'un coup — peu importe QUI a déclenché, une seule
+/// régénération suffit, jamais une par connecteur.
+fn fs_watch_targets() -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(d) = connectors::claude_code::projects_dir() { out.push(("claude-code", d)); }
+    for f in connectors::local_folder::folders() { out.push(("local-folder", std::path::PathBuf::from(f))); }
+    if let Some(v) = connectors::obsidian::vault_path() { out.push(("obsidian", std::path::PathBuf::from(v))); }
+    // Le dossier, pas le fichier : Notes.app écrit surtout dans `-wal` (mode WAL
+    // SQLite), pas dans `NoteStore.sqlite` lui-même — un watch sur le seul
+    // fichier principal manquerait la plupart des écritures réelles.
+    if let Some(dir) = connectors::apple_notes::notestore_path().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
+        if dir.exists() { out.push(("apple-notes", dir)); }
+    }
+    out
+}
+
+/// Le chemin touché par un évènement fs vaut-il déclencheur ? Un filtre par
+/// source (extension ou nom de fichier) pour ignorer le bruit — chaque
+/// connecteur a son propre format de fichiers pertinents.
+fn fs_event_relevant(p: &std::path::Path) -> bool {
+    if p.extension().is_some_and(|e| e == "jsonl" || e == "md") { return true; }
+    if connectors::local_folder::EXTENSIONS.iter().any(|ext| p.extension().is_some_and(|e| e == *ext)) { return true; }
+    p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("NoteStore.sqlite"))
+}
+
+/// Entre deux tours : resynchronise les chemins fs surveillés (Réglages a pu
+/// changer) ET sonde les sources sans signal fs (Drive, Notes Apple en
+/// secours si `NoteStore.sqlite` n'est pas surveillable — cf. `notestore_path`).
+const WATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn start_watcher(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         use notify::Watcher;
-        // Attend que le dossier existe (1er lancement : connecteur pas encore actif).
-        let dir = loop {
-            if let Some(d) = connectors::claude_code::projects_dir() { break d; }
-            std::thread::sleep(std::time::Duration::from_secs(60));
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tx_events = tx.clone();
         let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(ev) = res {
-                // Seules les sessions (*.jsonl) déclenchent une régénération.
-                if ev.paths.iter().any(|p| p.extension().is_some_and(|e| e == "jsonl")) {
-                    let _ = tx.send(());
-                }
+                if ev.paths.iter().any(|p| fs_event_relevant(p)) { let _ = tx_events.send(()); }
             }
         }) {
             Ok(w) => w,
             Err(e) => { crate::elog!("⚠️ watch auto indisponible : {e}"); return; }
         };
-        if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::Recursive) {
-            crate::elog!("⚠️ watch auto indisponible : {e}");
-            return;
-        }
-        while rx.recv().is_ok() {
-            // Debounce : une session claude écrit en continu → attendre l'accalmie.
+        let mut watched: std::collections::HashMap<&'static str, std::path::PathBuf> = std::collections::HashMap::new();
+        let mut fingerprints: std::collections::HashMap<&'static str, String> = std::collections::HashMap::new();
+
+        loop {
+            let targets = fs_watch_targets();
+            let target_keys: std::collections::HashSet<&str> = targets.iter().map(|(k, _)| *k).collect();
+            // Retire ce qui n'est plus une cible valide (dossier supprimé, connecteur coupé).
+            let stale: Vec<&'static str> = watched.keys().filter(|k| !target_keys.contains(*k)).copied().collect();
+            for k in stale { if let Some(p) = watched.remove(k) { let _ = watcher.unwatch(&p); } }
+            // Ajoute les nouvelles cibles / change de chemin si reconfiguré.
+            for (source, path) in &targets {
+                if watched.get(source) == Some(path) { continue; }
+                if let Some(old) = watched.get(source) { let _ = watcher.unwatch(old); }
+                match watcher.watch(path, notify::RecursiveMode::Recursive) {
+                    Ok(()) => { watched.insert(source, path.clone()); }
+                    Err(e) => crate::elog!("⚠️ watch auto : {source} indisponible ({e}), sondage en secours si possible."),
+                }
+            }
+
+            // Sondage des sources sans signal fs — une empreinte qui change vaut
+            // déclencheur, au même titre qu'un évènement fs. Jamais au tout
+            // premier tour (rien à comparer) : sinon chaque lancement d'app
+            // déclencherait une régénération pour rien.
+            let mut polled = Vec::new();
+            if !watched.contains_key("apple-notes") {
+                if let Some(fp) = connectors::apple_notes::changed_fingerprint() { polled.push(("apple-notes", fp)); }
+            }
+            if let Some(fp) = connectors::google_drive::changed_fingerprint() { polled.push(("google-drive", fp)); }
+            for (source, fp) in polled {
+                match fingerprints.insert(source, fp.clone()) {
+                    Some(prev) if prev != fp => { let _ = tx.send(()); }
+                    _ => {}
+                }
+            }
+
+            // Attend soit un déclencheur (fs ou sondage), soit le prochain tour.
+            if rx.recv_timeout(WATCH_POLL_INTERVAL).is_err() { continue; }
+            // Debounce : une source qui écrit en rafale (session Claude en cours,
+            // sync Drive en plusieurs lots…) → attendre l'accalmie.
             while rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok() {}
-            // Connecteur coupé, pas encore de cerveau, ou contenu démo → on ne touche à rien.
-            if connectors::claude_code::projects_dir().is_none() { continue; }
+            // Pas encore de cerveau, ou contenu démo → on ne touche à rien.
             let Some(data) = ai::llama::app_data_dir() else { continue; };
-            if !data.join("brain.json").exists() || data.join("demo.flag").exists() { continue; }
-            // Garde-fou : une session Claude Code active (y compris CETTE conversation,
-            // qui écrit dans ~/.claude/projects/) peut redéclencher le watcher toutes les
-            // quelques secondes — sans ce plafond, chaque accalmie de 3s relance une
-            // régénération complète (~50 Mo réécrits à chaque fois). Bug remonté par
-            // Liam le 2026-07-21 (app ralentie, 7 régénérations en 4 min).
+            if !has_real_brain(&data) || data.join("demo.flag").exists() { continue; }
+            // Garde-fou : une source active (ex. CETTE session Claude Code, qui
+            // écrit dans ~/.claude/projects/) peut redéclencher toutes les
+            // quelques secondes — sans ce plafond, chaque accalmie relance une
+            // régénération complète (~50 Mo réécrits à chaque fois). Bug remonté
+            // par Liam le 2026-07-21 (app ralentie, 7 régénérations en 4 min).
             const AUTO_REGEN_COOLDOWN_SECS: u64 = 300;
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             let last = LAST_AUTO_REGEN.load(std::sync::atomic::Ordering::Relaxed);
             if now.saturating_sub(last) < AUTO_REGEN_COOLDOWN_SECS { continue; }
-            // Une génération manuelle tourne → skip, le prochain event relancera.
+            // Une génération manuelle tourne → skip, le prochain déclencheur relancera.
             let Ok(_gen) = GEN_LOCK.try_lock() else { continue; };
             LAST_AUTO_REGEN.store(now, std::sync::atomic::Ordering::Relaxed);
+            // run_generation rafraîchit lui-même les caches connecteurs (cf.
+            // refresh_connector_caches) — le déclencheur ne fait que lancer.
             match run_generation(&app) {
                 Ok(_) => { let _ = app.emit("brain-updated", ()); }
                 Err(e) => crate::elog!("⚠️ watch auto : régénération échouée : {e}"),
@@ -4416,6 +4758,114 @@ fn start_mcp_pending_watcher(app: tauri::AppHandle) {
             let _ = app.emit("mcp-proposal-changed", ());
         }
     });
+}
+
+/// Signature bon marché de toutes les sources (id + date de modif de chaque
+/// conversation) — permet au rattrapage de démarrage de ne régénérer QUE si
+/// quelque chose a bougé pendant que l'app était fermée, sans réécrire le cerveau
+/// (ni re-déclencher la sync cloud) à chaque lancement pour rien.
+fn sources_fingerprint(convs: &[Conversation]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut keys: Vec<String> = convs.iter()
+        .map(|c| format!("{}:{}", c.summary.id, c.summary.last_timestamp.as_deref().unwrap_or("")))
+        .collect();
+    keys.sort();
+    let mut h = Sha256::new();
+    h.update(keys.join("\n").as_bytes());
+    format!("{}:{:x}", keys.len(), h.finalize())
+}
+
+/// Rattrapage au démarrage : une note/un fichier ajouté PENDANT que l'app était
+/// fermée ne produit aucun évènement fs et échappe au watcher (qui n'observe que
+/// le temps où l'app tourne) — sans ça il faut un « Générer » manuel. On rafraîchit
+/// les caches connecteurs et, si les sources ont changé depuis la dernière
+/// génération, on régénère une fois. Bon marché : le pipeline cache l'extraction
+/// Gemma par conversation (cf. `ai::pipeline`), donc une régénération sans
+/// nouveauté = 0 appel LLM. Gated sur le fingerprint pour ne pas réécrire le
+/// cerveau — ni faire churner la sync cloud — quand rien n'a bougé.
+fn startup_catchup(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        use tauri::Emitter;
+        let Some(data) = ai::llama::app_data_dir() else { return };
+        // Pas encore de vrai cerveau, ou contenu démo → l'onboarding s'en charge.
+        if !has_real_brain(&data) || data.join("demo.flag").exists() { return; }
+
+        refresh_connector_caches();
+        let fp = sources_fingerprint(&load_all_conversations());
+        let fp_path = data.join("sources.fingerprint");
+        if std::fs::read_to_string(&fp_path).unwrap_or_default() == fp { return; } // rien de neuf hors ligne
+
+        // Une génération manuelle tourne déjà → on la laisse faire.
+        let Ok(_gen) = GEN_LOCK.try_lock() else { return };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        LAST_AUTO_REGEN.store(now, std::sync::atomic::Ordering::Relaxed);
+        match run_generation(&app) {
+            Ok(_) => { let _ = std::fs::write(&fp_path, &fp); let _ = app.emit("brain-updated", ()); }
+            Err(e) => crate::elog!("⚠️ rattrapage démarrage : {e}"),
+        }
+    });
+}
+
+/// Icône barre de menu macOS (tray). Template image (`icon_as_template`) → suit
+/// le thème clair/sombre du système. Menu minimal Afficher / Quitter. Câblée
+/// côté Rust (pas l'API JS) pour exister dès le `setup()`. L'icône est embarquée
+/// au build (`include_bytes!`) plutôt que résolue par chemin au runtime — pas de
+/// dépendance à l'emplacement du bundle, marche en `dev` comme en `build`.
+/// API vérifiée contre docs.rs/tauri/2.11.3 (`show_menu_on_left_click`, renommé
+/// depuis `menu_on_left_click` en v2.2).
+/// Handle du tray, gardé pour le mettre à jour au runtime (indication
+/// « Archiviste au travail » même quand l'app est réduite, cf. `set_archivist_active`).
+static TRAY: std::sync::OnceLock<tauri::tray::TrayIcon> = std::sync::OnceLock::new();
+
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+    use tauri::Manager;
+
+    let show = MenuItem::with_id(app, "show", "Afficher", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quitter", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+
+    let tray = TrayIconBuilder::with_id("main-tray")
+        .tooltip("Lucid")
+        .icon(icon)
+        .icon_as_template(true)
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .build(app)?;
+    let _ = TRAY.set(tray);
+    Ok(())
+}
+
+/// Reflète l'état de l'Archiviste sur l'icône barre de menu — visible même app
+/// réduite (demandé par Liam). Actif : un point « • » à côté de l'icône (macOS)
+/// + tooltip explicite ; repos : tout s'efface. Le tooltip est le repli
+/// cross-plateforme (le titre de tray ne s'affiche que sur macOS).
+#[tauri::command]
+fn set_archivist_active(active: bool) {
+    let Some(tray) = TRAY.get() else { return };
+    let _ = tray.set_tooltip(Some(if active {
+        "Lucid — l'Archiviste range tes pages…"
+    } else {
+        "Lucid"
+    }));
+    if active {
+        let _ = tray.set_title(Some("•"));
+    } else {
+        let _ = tray.set_title(None::<&str>);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4461,6 +4911,12 @@ pub fn run() {
             start_watcher(app.handle().clone());
             start_data_watcher(app.handle().clone());
             start_mcp_pending_watcher(app.handle().clone());
+            // Rattrape les ajouts/modifs faits pendant que l'app était fermée
+            // (le watcher, lui, ne voit que le temps où l'app tourne).
+            startup_catchup(app.handle().clone());
+            // Tray non bloquant : s'il échoue, l'app tourne quand même (jamais
+            // d'échec silencieux — cf. ADR-0015, on log).
+            if let Err(e) = setup_tray(app) { crate::elog!("⚠️ icône barre de menu indisponible : {e}"); }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4514,6 +4970,7 @@ pub fn run() {
             apple_notes_connect,
             apple_notes_sync,
             apple_notes_disconnect,
+            set_archivist_active,
             import_chatgpt,
             local_folder_connect,
             local_folder_list,

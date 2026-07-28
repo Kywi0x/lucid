@@ -554,6 +554,25 @@ fn server_health(token: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Libère le port fixe avant de lancer NOTRE serveur — bug réel trouvé le
+/// 2026-07-25 : `/health` répond 200 avec n'importe quel token (même faux),
+/// donc un `llama-server` orphelin d'une session précédente (dev tuée de
+/// force, cf. le geste `lsof -ti:1420` déjà documenté pour le port front) reste
+/// vivant sur ce port et passe pour "sain" — l'app envoie alors ses vraies
+/// requêtes `/completion` avec SON token à elle, rejetées en 401 par
+/// l'orphelin qui n'accepte que le sien : fallback one-shot silencieux à
+/// CHAQUE appel, donc plus aucun bénéfice du serveur persistant (le vrai
+/// freeze observé, pas un problème machine). Un seul process légitime sur ce
+/// port par design ("un seul serveur pour toute l'app") : on peut le tuer sans
+/// risque avant de prendre sa place. Best-effort, jamais bloquant si
+/// `lsof`/`kill` sont absents (Windows).
+fn free_port(port: u16) {
+    let Ok(out) = std::process::Command::new("lsof").args(["-ti", &format!(":{port}")]).output() else { return };
+    for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        let _ = std::process::Command::new("kill").args(["-9", pid]).status();
+    }
+}
+
 /// Démarre (ou réutilise) le serveur pour CE modèle précis. `None` si le
 /// binaire est absent ou si le démarrage échoue — l'appelant retombe alors sur
 /// le mode one-shot. Renvoie la clé d'API à utiliser pour les requêtes.
@@ -564,8 +583,17 @@ fn ensure_server(binary: &Path, model: &Path) -> Option<String> {
             return Some(s.token.clone());
         }
         // Modèle changé (bascule utilisateur) ou process mort : on repart propre.
+        // ponytail: log minimal pour diagnostiquer un cycle "pause/reprend" pendant
+        // une passe Archiviste — distingue un vrai crash serveur (respawn coûteux,
+        // ~3-4s de rechargement modèle) d'une contention GPU/canvas sans redémarrage.
+        if s.model != model {
+            crate::elog!("ℹ️ llama-server : changement de modèle, redémarrage.");
+        } else {
+            crate::elog!("⚠️ llama-server : health check en échec, process relancé (contention GPU/mémoire ou crash).");
+        }
         *slot = None;
     }
+    free_port(SERVER_PORT);
     let token = random_token();
     let mut cmd = low_priority_command(binary);
     cmd.arg("-m").arg(model)
@@ -583,13 +611,16 @@ fn ensure_server(binary: &Path, model: &Path) -> Option<String> {
     while started.elapsed() < SERVER_STARTUP_TIMEOUT {
         if server_health(&token) {
             *slot = Some(proc);
+            crate::elog!("✅ llama-server prêt en {:.1}s.", started.elapsed().as_secs_f32());
             return Some(token);
         }
-        if let Ok(Some(_)) = proc.child.try_wait() {
+        if let Ok(Some(status)) = proc.child.try_wait() {
+            crate::elog!("⚠️ llama-server mort avant de répondre ({status}).");
             return None; // mort avant même de répondre (modèle/flags invalides)
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    crate::elog!("⚠️ llama-server : timeout de démarrage ({:?}).", SERVER_STARTUP_TIMEOUT);
     None // `proc` droppé ici → Drop tue le process qui n'a jamais répondu
 }
 
