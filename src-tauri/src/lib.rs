@@ -172,6 +172,92 @@ fn save_entity_cache(dir: &std::path::Path, cache: &std::collections::HashMap<St
     }
 }
 
+/// Phase 0 embeddings (ADR-0019) — preuve sur le vrai cerveau. Embed un
+/// échantillon de documents (leur CONTENU réel, pas le titre) et affiche, pour
+/// chacun, son plus proche voisin sémantique + la paire la plus proche et la
+/// plus éloignée du lot. Sert à juger la qualité AVANT de refondre l'Archiviste.
+/// Lancement : `cargo run --example embed` (nécessite le modèle BGE-M3 dans models/).
+pub fn embed_demo() -> Result<String, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    if !ai::llama::embed_model_available() {
+        return Err(format!(
+            "Modèle d'embedding absent. Télécharge BGE-M3 (~600 Mo) :\n  {}\net place-le dans : {}\n(ou pointe LUCID_EMBED_MODEL vers un .gguf).",
+            ai::llama::EMBED_MODEL_URL,
+            dir.parent().map(|p| p.join("models").display().to_string()).unwrap_or_default()
+        ));
+    }
+    let graph = backup::load_brain_cached(&dir)?;
+    let label_of: std::collections::HashMap<&str, &str> = graph.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
+    // Échantillon DIVERS : on pioche des feuilles de dossiers (parents) DIFFÉRENTS
+    // en round-robin, pour ne pas se retrouver avec 14 docs du même thème (sinon
+    // tout est proche et on ne voit pas le contraste). (doc_label, dossier, texte)
+    let mut by_parent: std::collections::BTreeMap<&str, Vec<(&str, String)>> = std::collections::BTreeMap::new();
+    for n in &graph.nodes {
+        if n.kind != "leaf" { continue; }
+        let text = if !n.content.trim().is_empty() { n.content.clone() } else { n.source_text.clone() };
+        if text.trim().chars().count() < 40 { continue; }
+        let parent = n.parent_id.as_deref().and_then(|p| label_of.get(p).copied()).unwrap_or("?");
+        by_parent.entry(parent).or_default().push((n.label.as_str(), text));
+    }
+    // On garde les dossiers ayant AU MOINS 2 docs (sinon aucune paire intra-dossier
+    // à mesurer) et on en prend jusqu'à 3 chacun, en round-robin → un mélange qui
+    // contient de vraies paires « même thème » ET « thèmes différents ».
+    // On garde les 5 dossiers les PLUS peuplés et on prend jusqu'à 4 docs chacun
+    // → de vraies paires « même thème » à mesurer, sur peu de thèmes bien contrastés.
+    let mut docs: Vec<(&str, &str, String)> = Vec::new(); // (label, dossier, texte)
+    let mut buckets: Vec<_> = by_parent.into_iter().filter(|(_, v)| v.len() >= 2).collect();
+    buckets.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    buckets.truncate(5);
+    for (parent, v) in &mut buckets {
+        for (label, text) in v.drain(..).take(4) { docs.push((label, parent, text)); }
+    }
+    if docs.len() < 4 {
+        return Err("Pas assez de dossiers peuplés (≥2 docs) pour la démo.".into());
+    }
+    let texts: Vec<String> = docs.iter().map(|(label, _, text)| format!("{label}\n{text}")).collect();
+    let vecs = ai::llama::embed_texts(&texts)?;
+
+    // Le VRAI indicateur : la similarité moyenne INTRA-dossier (paires de même
+    // thème) doit être NETTEMENT au-dessus de l'INTER-dossier (thèmes différents).
+    // Si oui → les embeddings séparent bien les thèmes, indépendamment du fait
+    // que les scores absolus soient tassés en haut (propre à BGE-M3).
+    let (mut si, mut ci, mut se, mut ce) = (0.0f32, 0u32, 0.0f32, 0u32);
+    for i in 0..vecs.len() {
+        for j in (i + 1)..vecs.len() {
+            let s = ai::llama::cosine(&vecs[i], &vecs[j]);
+            if docs[i].1 == docs[j].1 { si += s; ci += 1; } else { se += s; ce += 1; }
+        }
+    }
+    let avg_intra = if ci > 0 { si / ci as f32 } else { 0.0 };
+    let avg_inter = if ce > 0 { se / ce as f32 } else { 0.0 };
+
+    let mut out = format!(
+        "Embeddings de {} documents (dimension {}).\n\n\
+         ➤ Similarité MOYENNE même thème (intra-dossier) : {:.3}  ({} paires)\n\
+         ➤ Similarité MOYENNE thèmes différents (inter)   : {:.3}  ({} paires)\n\
+         ➤ Écart : {:+.3}  → {}\n\n\
+         Plus proche voisin de chaque doc (✓ = même dossier) :\n\n",
+        vecs.len(), vecs.first().map(|v| v.len()).unwrap_or(0),
+        avg_intra, ci, avg_inter, ce, avg_intra - avg_inter,
+        if avg_intra - avg_inter > 0.03 { "les thèmes se séparent bien ✅" } else { "séparation faible ⚠️" }
+    );
+    let mut same = 0u32;
+    for i in 0..vecs.len() {
+        let mut best = (usize::MAX, -2.0f32);
+        for j in 0..vecs.len() {
+            if i == j { continue; }
+            let s = ai::llama::cosine(&vecs[i], &vecs[j]);
+            if s > best.1 { best = (j, s); }
+        }
+        let hit = docs[i].1 == docs[best.0].1;
+        if hit { same += 1; }
+        out.push_str(&format!("• [{:.12}] {:.28}\n   ↳ [{:.12}] {:.28}  ({:.2}){}\n",
+            docs[i].1, docs[i].0, docs[best.0].1, docs[best.0].0, best.1, if hit { " ✓" } else { "" }));
+    }
+    out.push_str(&format!("\nPlus proche voisin dans le MÊME dossier : {}/{}\n", same, vecs.len()));
+    Ok(out)
+}
+
 /// Point d'entrée de l'Archiviste (prototype) — une passe unique : script
 /// (déplacements sûrs) + Gemma (fusions ambiguës), écrit des propositions,
 /// n'applique jamais rien directement. Utilisé par `examples/archivist.rs`
@@ -204,6 +290,306 @@ fn archivist_was_interrupted() -> bool {
     ai::llama::app_data_dir().is_some_and(|dir| archivist_marker_path(&dir).exists())
 }
 
+/// Rapport de diagnostic Archiviste, à copier/coller pour analyse — **sans aucun
+/// contenu de document** (RGPD). Métriques + distribution des domaines + structure.
+/// `mask` = true : remplace les noms de dossiers (qui peuvent contenir un nom de
+/// client, ex. « Factures Parabola ») par leur DOMAINE majoritaire — à utiliser
+/// dès que les données ne sont pas de la démo (bêta-testeurs, vraies données).
+#[tauri::command]
+fn archivist_diagnostic(mask: bool) -> Result<String, String> {
+    use std::collections::{BTreeMap, HashMap};
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let graph: BrainGraph = backup::load_brain_cached(&dir)?;
+
+    let is_theme = |id: &str| id.starts_with("arch-theme-") || id.starts_with("arch-cat-") || id.starts_with("arch-group-");
+    let is_leaf = |n: &BrainNode| n.kind == "leaf" || n.kind == "note";
+    let total = graph.nodes.iter().filter(|n| is_leaf(n)).count();
+    let sorted = graph.nodes.iter().filter(|n| is_leaf(n) && n.parent_id.as_deref().is_some_and(is_theme)).count();
+    let non_triable = graph.nodes.iter().filter(|n| is_leaf(n) && n.parent_id.as_deref().is_some_and(|p| p.starts_with("arch-non-triable"))).count();
+    let themes = graph.nodes.iter().filter(|n| n.id.starts_with("arch-theme-")).count();
+    let cats = graph.nodes.iter().filter(|n| n.id.starts_with("arch-cat-") || n.id.starts_with("arch-group-")).count();
+
+    let domains: HashMap<String, DomainEntry> = std::fs::read_to_string(domain_cache_path(&dir)).ok()
+        .and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    let mut dom_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for e in domains.values() { *dom_counts.entry(e.domain.clone()).or_default() += 1; }
+
+    let label_of: HashMap<&str, &str> = graph.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
+    let child_count = |id: &str| graph.nodes.iter().filter(|c| c.parent_id.as_deref() == Some(id)).count();
+    // Domaine majoritaire des enfants tagués d'un dossier (pour le mode masqué).
+    let folder_domain = |fid: &str| -> String {
+        let mut c: HashMap<&str, usize> = HashMap::new();
+        for n in &graph.nodes {
+            if n.parent_id.as_deref() == Some(fid) {
+                if let Some(e) = domains.get(&n.id) { *c.entry(e.domain.as_str()).or_default() += 1; }
+            }
+        }
+        c.into_iter().max_by_key(|(_, n)| *n).map(|(d, _)| d.to_string()).unwrap_or_else(|| "—".into())
+    };
+
+    let mut out = String::from("==================== RAPPORT ARCHIVISTE ====================\n\n");
+    out.push_str(&format!(
+        "Documents totaux   : {total}\nRangés en thèmes   : {sorted}\nNon triable        : {non_triable}\nThèmes / catégories: {themes} / {cats}\n\n"
+    ));
+    out.push_str("— Domaines (tags Gemma) —\n");
+    let mut dv: Vec<_> = dom_counts.iter().collect();
+    dv.sort_by(|a, b| b.1.cmp(a.1));
+    for (d, c) in dv { out.push_str(&format!("  {c:>4}  {d}\n")); }
+    out.push_str(&format!("  total taggé : {}\n\n", domains.len()));
+
+    out.push_str("— Structure (nb docs · dossier ← parent) —\n");
+    let mut rows: Vec<(usize, String, String)> = graph.nodes.iter()
+        .filter(|n| n.id.starts_with("arch-"))
+        .map(|n| {
+            let k = child_count(&n.id);
+            let parent = n.parent_id.as_deref().and_then(|p| label_of.get(p).copied()).unwrap_or("RACINE").to_string();
+            (k, n.id.clone(), parent)
+        })
+        .map(|(k, id, parent)| {
+            if mask {
+                let name = if id.starts_with("arch-non-triable") { "Non triable".to_string() } else { format!("[{}]", folder_domain(&id)) };
+                let par = if parent == "RACINE" { "RACINE".to_string() } else { "[parent]".to_string() };
+                (k, name, par)
+            } else {
+                (k, label_of.get(id.as_str()).copied().unwrap_or("?").to_string(), parent)
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.2.cmp(&b.2).then(b.0.cmp(&a.0)));
+    for (k, name, parent) in rows { out.push_str(&format!("  {k:>4}  {name} ← {parent}\n")); }
+
+    out.push_str("\n(aucun contenu de document dans ce rapport — RGPD)\n");
+    if mask { out.push_str("(mode masqué : noms de dossiers remplacés par leur domaine)\n"); }
+    Ok(out)
+}
+
+// ── Cache d'embeddings (incrémental) ─────────────────────────────────────────
+// Sans lui, chaque passe ré-embed tout le cerveau (des centaines de docs → très
+// lent). Clé = id du doc ; on ré-embed seulement si sa signature (updated_at +
+// taille du texte) a changé. Même esprit que le cache d'extraction du pipeline.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct EmbedEntry { sig: String, vec: Vec<f32> }
+
+fn embed_cache_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_embeddings.json") }
+
+fn embed_sig(n: &BrainNode) -> String { format!("{}:{}", n.updated_at.unwrap_or(0), n.source_text.len()) }
+fn embed_text(n: &BrainNode) -> String {
+    let content = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
+    format!("{}\n{}", n.label, content)
+}
+
+/// Embeddings d'un ensemble de nœuds, avec cache disque : ne ré-embed que les
+/// docs neufs/modifiés. Renvoie `id → vecteur` (les docs non embeddables, ex.
+/// moteur indisponible, sont simplement absents de la map).
+fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> std::collections::HashMap<String, Vec<f32>> {
+    let mut cache: std::collections::HashMap<String, EmbedEntry> =
+        std::fs::read_to_string(embed_cache_path(dir)).ok()
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default();
+    // À (ré)embedder : entrée absente, signature changée, ou vecteur vide (échec
+    // précédent). On n'écrit dans le cache qu'APRÈS un embed réussi — sinon un
+    // échec transitoire marquerait le doc « fait » à vide et il ne serait jamais
+    // re-tenté.
+    let mut todo_ids: Vec<String> = Vec::new();
+    let mut todo_sigs: Vec<String> = Vec::new();
+    let mut todo_texts: Vec<String> = Vec::new();
+    for n in nodes {
+        let sig = embed_sig(n);
+        let fresh = cache.get(&n.id).map(|e| e.sig == sig && !e.vec.is_empty()).unwrap_or(false);
+        if !fresh {
+            todo_ids.push(n.id.clone());
+            todo_sigs.push(sig);
+            todo_texts.push(embed_text(n));
+        }
+    }
+    if !todo_texts.is_empty() {
+        match ai::llama::embed_texts(&todo_texts) {
+            Ok(vecs) => {
+                for (i, id) in todo_ids.iter().enumerate() {
+                    if let Some(v) = vecs.get(i) {
+                        cache.insert(id.clone(), EmbedEntry { sig: todo_sigs[i].clone(), vec: v.clone() });
+                    }
+                }
+                if let Ok(json) = serde_json::to_string(&cache) { let _ = std::fs::write(embed_cache_path(dir), json); }
+                crate::elog!("🗂️ embeddings: {} nouveau(x) vecteur(s), {} déjà en cache.", todo_texts.len(), nodes.len().saturating_sub(todo_texts.len()));
+            }
+            Err(e) => crate::elog!("🗂️ embeddings indisponibles ({e})."),
+        }
+    }
+    nodes.iter()
+        .filter_map(|n| cache.get(&n.id).filter(|e| !e.vec.is_empty()).map(|e| (n.id.clone(), e.vec.clone())))
+        .collect()
+}
+
+// Cache des tags de domaine (même esprit que le cache d'embeddings) : un doc
+// n'est reclassé par Gemma que si sa signature change → payé une fois. Sans
+// moteur, on rend simplement ce qui est déjà en cache.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct DomainEntry { sig: String, domain: String }
+
+fn domain_cache_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_domains.json") }
+
+fn domain_tags_cached(dir: &std::path::Path, nodes: &[&BrainNode], engine: Option<&LlamaEngine>) -> std::collections::HashMap<String, String> {
+    let mut cache: std::collections::HashMap<String, DomainEntry> =
+        std::fs::read_to_string(domain_cache_path(dir)).ok()
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default();
+    if let Some(e) = engine {
+        // À (re)tagger : entrée absente ou signature changée.
+        let todo: Vec<(String, String, String)> = nodes.iter()
+            .filter(|n| cache.get(&n.id).map(|d| d.sig != embed_sig(n)).unwrap_or(true))
+            .map(|n| {
+                let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
+                let snippet = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                (n.id.clone(), n.label.clone(), snippet.chars().take(200).collect::<String>())
+            })
+            .collect();
+        if !todo.is_empty() {
+            let sigs: std::collections::HashMap<String, String> =
+                nodes.iter().map(|n| (n.id.clone(), embed_sig(n))).collect();
+            let tags = archivist::ai_domain_tags(e, &todo);
+            for (id, domain) in tags {
+                if let Some(sig) = sigs.get(&id) {
+                    cache.insert(id.clone(), DomainEntry { sig: sig.clone(), domain });
+                }
+            }
+            if let Ok(json) = serde_json::to_string(&cache) { let _ = std::fs::write(domain_cache_path(dir), json); }
+            // Diagnostic : combien de docs ont VRAIMENT reçu un domaine (≠ « Autre ») —
+            // si ~0, le tagging a échoué (réponse Gemma inexploitable) et la garde ne
+            // filtre rien (bug 2026-07-29 : réponse tronquée → 202/202 « Autre »).
+            let classified = cache.values().filter(|d| d.domain != "Autre").count();
+            crate::elog!("🗂️ domaines: {} nouveau(x) tag(s), {} déjà en cache — {}/{} classés (≠ Autre).",
+                todo.len(), nodes.len().saturating_sub(todo.len()), classified, cache.len());
+        }
+    }
+    nodes.iter()
+        .filter_map(|n| cache.get(&n.id).map(|d| (n.id.clone(), d.domain.clone())))
+        .collect()
+}
+
+/// Similarité au centroïde (moyenne des vecteurs d'un groupe). Le centroïde n'a
+/// pas besoin d'être normalisé : `cosine` renormalise.
+fn centroid(vecs: &[&Vec<f32>]) -> Vec<f32> {
+    if vecs.is_empty() { return Vec::new(); }
+    let dim = vecs[0].len();
+    let mut c = vec![0.0f32; dim];
+    for v in vecs { for i in 0..dim.min(v.len()) { c[i] += v[i]; } }
+    for x in &mut c { *x /= vecs.len() as f32; }
+    c
+}
+
+/// Plan de rangement PAR EMBEDDINGS (ADR-0019) — tout est du calcul de vecteurs,
+/// Gemma ne fait que NOMMER (§⑤ du flow). Deux sorties :
+///  - `anchors` : (doc → dossier EXISTANT) par proximité au centroïde du dossier (§②) ;
+///  - `clusters` : nouveaux thèmes formés par clustering du reste (§③), nommés par Gemma.
+struct EmbedPlan {
+    anchors: Vec<(String, String)>,
+    clusters: Vec<archivist::ThemeCluster>,
+}
+
+/// Seuil pour rattacher un document à un dossier EXISTANT (§②). Un peu plus
+/// permissif que la création d'un nouveau thème : on préfère rejoindre l'existant.
+const ANCHOR_SIM_THRESHOLD: f32 = 0.84;
+
+fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &BrainGraph, engine: Option<&LlamaEngine>) -> EmbedPlan {
+    let mut plan = EmbedPlan { anchors: Vec::new(), clusters: Vec::new() };
+    if pool.is_empty() { return plan; }
+
+    // Dossiers thématiques existants (jamais « Non triable » ni dossiers-source)
+    // et leurs enfants (documents déjà rangés) → pour calculer leurs centroïdes.
+    let is_theme = |id: &str| id.starts_with("arch-theme-") || id.starts_with("arch-cat-") || id.starts_with("arch-group-");
+    let folder_children: std::collections::HashMap<&str, Vec<&BrainNode>> = {
+        let mut m: std::collections::HashMap<&str, Vec<&BrainNode>> = std::collections::HashMap::new();
+        for n in &graph.nodes {
+            if let Some(p) = n.parent_id.as_deref() {
+                if is_theme(p) && (n.kind == "leaf" || n.kind == "note") { m.entry(p).or_default().push(n); }
+            }
+        }
+        m
+    };
+
+    // Embed (caché) le pool ET les enfants des dossiers existants, en un seul lot.
+    let by_id: std::collections::HashMap<&str, &BrainNode> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut to_embed: Vec<&BrainNode> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (id, _) in pool { if let Some(n) = by_id.get(id.as_str()) { if seen.insert(n.id.as_str()) { to_embed.push(n); } } }
+    for kids in folder_children.values() { for n in kids { if seen.insert(n.id.as_str()) { to_embed.push(n); } } }
+    let vecs = embed_nodes_cached(dir, &to_embed);
+    if vecs.is_empty() { return plan; } // moteur indispo → repli (rien rangé par embeddings)
+
+    // Tag de domaine (le signal SUJET) pour tout ce qu'on manipule. Sert de GARDE :
+    // on n'ancre/ne regroupe jamais à travers deux domaines, même si l'embedding
+    // les croit proches (forme partagée). Caché → payé une fois par doc.
+    let domains = domain_tags_cached(dir, &to_embed, engine);
+    let domain_of = |id: &str| domains.get(id).map(|s| s.as_str()).unwrap_or("Autre");
+
+    // Centroïde + domaine MAJORITAIRE des enfants de chaque dossier existant.
+    let centroids: Vec<(String, Vec<f32>, String)> = folder_children.iter()
+        .filter_map(|(fid, kids)| {
+            let kv: Vec<&Vec<f32>> = kids.iter().filter_map(|n| vecs.get(&n.id)).collect();
+            if kv.is_empty() { return None; }
+            let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for n in kids { *counts.entry(domain_of(&n.id)).or_default() += 1; }
+            let dom = counts.into_iter().max_by_key(|(_, c)| *c).map(|(d, _)| d.to_string()).unwrap_or_else(|| "Autre".into());
+            Some((fid.to_string(), centroid(&kv), dom))
+        })
+        .collect();
+
+    // §② ANCRAGE : rejoint le dossier existant le plus proche par centroïde, MAIS
+    // uniquement de MÊME DOMAINE — sans ça un journal de trading (proche en forme
+    // d'une proposition immobilière : 0.95) était aspiré dans « Immobilier »
+    // (mesuré le 2026-07-29 : 11/11 docs trading happés). Le domaine coupe net.
+    let mut anchored: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (id, _) in pool {
+        let Some(v) = vecs.get(id) else { continue };
+        let doc_dom = domain_of(id);
+        let mut best: Option<(&str, f32)> = None;
+        for (fid, c, fdom) in &centroids {
+            if fdom != doc_dom { continue; } // garde de domaine
+            let s = ai::llama::cosine(v, c);
+            if best.map(|(_, bs)| s > bs).unwrap_or(true) { best = Some((fid.as_str(), s)); }
+        }
+        if let Some((fid, s)) = best {
+            if s >= ANCHOR_SIM_THRESHOLD {
+                plan.anchors.push((id.clone(), fid.to_string()));
+                anchored.insert(id.clone());
+            }
+        }
+    }
+
+    // §③ CLUSTERING du reste (non ancré), PAR DOMAINE (jamais à travers) → nouveaux
+    // thèmes, nommés par Gemma (§⑤). Le clustering fin (quel client) reste fait par
+    // l'embedding À L'INTÉRIEUR de chaque domaine.
+    let rest: Vec<&(String, String)> = pool.iter().filter(|(id, _)| !anchored.contains(id) && vecs.contains_key(id)).collect();
+    let mut by_domain: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, (id, _)) in rest.iter().enumerate() { by_domain.entry(domain_of(id)).or_default().push(i); }
+    for (_dom, idxs) in &by_domain {
+        if idxs.len() < 3 { continue; }
+        let sub_vecs: Vec<Vec<f32>> = idxs.iter().map(|&i| vecs[&rest[i].0].clone()).collect();
+        for g in archivist::cluster_indices(&sub_vecs) {
+            if g.len() < 3 { continue; }
+            let global: Vec<usize> = g.iter().map(|&li| idxs[li]).collect();
+            // Échantillons = titre + extrait de CONTENU : le nommage peut ainsi
+            // repérer un client/entreprise récurrent (« Parabola ») que le titre
+            // seul (« Invoice-14545AA1-… ») ne révèle jamais.
+            let samples: Vec<String> = global.iter().take(12).map(|&i| {
+                let (id, label) = (&rest[i].0, &rest[i].1);
+                let snippet = by_id.get(id.as_str()).map(|n| {
+                    let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
+                    raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect::<String>()
+                }).unwrap_or_default();
+                if snippet.is_empty() { label.clone() } else { format!("{label} — {snippet}") }
+            }).collect();
+            let Some(label) = engine.and_then(|e| archivist::ai_name_cluster(e, &samples)) else { continue; };
+            let node_ids: Vec<String> = global.iter().map(|&i| rest[i].0.clone()).collect();
+            plan.clusters.push(archivist::ThemeCluster { label, node_ids });
+        }
+    }
+    crate::elog!("🗂️ embed_organize: {} ancré(s) sur l'existant, {} nouveau(x) thème(s) (par domaine).",
+        plan.anchors.len(), plan.clusters.len());
+    plan
+}
+
 /// Comme `run_archivist_scan_once_in`, avec un callback de progression appelé
 /// avant chaque décision Gemma (`current`, `total` groupes de doublons) — c'est
 /// la partie qui domine le temps (un appel = un rechargement complet du modèle,
@@ -222,26 +608,32 @@ fn run_archivist_scan_once_in_progress(
     let mut n = 0usize;
     let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone());
 
-    // Déplacements confiants (destination thématique existante) appliqués
-    // tout de suite. Les déplacements de repli vers le bac "Non triable" sont
-    // MIS DE CÔTÉ (`catchall_leftover`) : avant de les y ranger à plat, le
-    // clustering mécanique a déjà eu sa chance (dans `scan()`) et l'IA locale
-    // en a une seconde juste après (retour de Liam le 2026-07-23 : "il faut
-    // utiliser l'IA locale... au pire un combo des deux").
-    let mut catchall_leftover: Vec<(String, String)> = Vec::new(); // (id, label)
-    for mv in &result.moves {
-        if mv.target_label == archivist::CATCHALL_LABEL {
-            catchall_leftover.push((mv.node_id.clone(), mv.node_label.clone()));
-            continue;
+    // TOUT par embeddings (ADR-0019 — demande de Liam le 2026-07-29 : « l'embedding
+    // doit marcher pour tout, pas que le Non triable »). On abandonne le rangement
+    // thématique MÉCANIQUE (par mot/token, fragile — c'est lui qui mettait « Lyon »
+    // sous « Projets ») : on rassemble TOUS les documents « à ranger » dans UN pool,
+    // et l'ancrage sur l'existant puis le clustering par EMBEDDINGS font tout le
+    // travail. Du mécanique, on ne garde que la fusion des doublons de titre exact
+    // (plus bas). Un document DÉJÀ rangé sous un thème n'est jamais repris → la
+    // stabilité/incrémental est préservée.
+    let label_of: std::collections::HashMap<&str, &str> =
+        graph.nodes.iter().map(|nd| (nd.id.as_str(), nd.label.as_str())).collect();
+    let mut candidate_ids: Vec<String> = Vec::new();
+    for mv in &result.moves { candidate_ids.push(mv.node_id.clone()); }              // rattachements mécaniques → au pool
+    candidate_ids.extend(result.orphans_unresolved_ids.iter().cloned());            // orphelins
+    for c in &result.theme_clusters { candidate_ids.extend(c.node_ids.iter().cloned()); } // ex-clustering mécanique → au pool
+    if let Some(cid) = &result.catchall_id {                                        // backlog du bac « Non triable »
+        for nd in &graph.nodes {
+            if nd.parent_id.as_deref() == Some(cid.as_str()) && (nd.kind == "leaf" || nd.kind == "note") {
+                candidate_ids.push(nd.id.clone());
+            }
         }
-        let id = format!("arch-move-{n}");
-        n += 1;
-        write_pending_proposal(dir, &id, "move", "", "", &mv.node_id, &mv.new_parent_id, &[])?;
-        report.push_str(&format!("→ déplacer « {} » sous « {} »\n", mv.node_label, mv.target_label));
     }
-    catchall_leftover.extend(
-        result.orphans_unresolved_ids.iter().cloned().zip(result.orphans_unresolved.iter().cloned())
-    );
+    let mut in_pool: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ai_pool: Vec<(String, String)> = candidate_ids.into_iter()
+        .filter(|id| in_pool.insert(id.clone()))
+        .map(|id| { let label = label_of.get(id.as_str()).copied().unwrap_or("").to_string(); (id, label) })
+        .collect();
 
     // Applique un cluster de thème (mécanique OU IA, même forme) : crée le
     // conteneur s'il n'existe pas encore et y range ses pages dans LE MÊME
@@ -287,39 +679,93 @@ fn run_archivist_scan_once_in_progress(
         Ok(())
     };
 
-    // Thèmes détectés mécaniquement (mot partagé par 3+ pages, zéro IA).
-    for cluster in &result.theme_clusters {
-        apply_theme_cluster(cluster, &mut n, &mut report)?;
-    }
+    // (Plus de clustering mécanique par mot : tout est dans `ai_pool`, traité par
+    // embeddings ci-dessous. `apply_theme_cluster` reste utilisé pour appliquer les
+    // clusters — quelle que soit leur origine — juste après.)
 
-    // Passe IA (Gemma) sur ce qui reste VRAIMENT non groupable par mot commun
-    // — capte les regroupements de sens que le script ne peut pas voir (même
-    // sujet, aucun mot partagé). Jamais sur ce que le script a déjà su grouper
-    // seul (déjà retiré de `catchall_leftover` en amont, dans `scan()`).
+    // ── Rangement PAR EMBEDDINGS (ADR-0019) : ancrage sur l'existant (§②, par
+    // CENTROÏDE — calcul, plus Gemma) + clustering du reste (§③) → nouveaux thèmes
+    // nommés par Gemma (§⑤). Tout le TRI est déterministe. Repli sur l'ancien flux
+    // Gemma (ancrage + clustering LLM) si le modèle d'embedding est absent (parité).
     let mut ai_clustered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let ai_clusters: Vec<archivist::ThemeCluster> = match &engine {
-        Some(e) => archivist::ai_cluster_leftovers(e, &catchall_leftover, &graph),
-        None => Vec::new(),
+    // Thèmes CRÉÉS ce run (id déterministe = celui d'apply_theme_cluster, label, taille,
+    // échantillon de labels d'enfants) → donnés à la consolidation dans LA MÊME passe,
+    // pour ne plus exiger un 2e lancement manuel (demande de Liam le 2026-07-29).
+    let mut created_themes: Vec<(String, String, usize, Vec<String>)> = Vec::new();
+    let theme_sample = |ids: &[String]| ids.iter().take(5)
+        .filter_map(|id| graph.nodes.iter().find(|n| &n.id == id).map(|n| n.label.clone()))
+        .collect::<Vec<_>>();
+    let capture_theme = |created: &mut Vec<(String, String, usize, Vec<String>)>, c: &archivist::ThemeCluster| {
+        created.push((format!("arch-theme-{}", c.label.to_lowercase()), c.label.clone(), c.node_ids.len(), theme_sample(&c.node_ids)));
     };
-    for cluster in &ai_clusters {
-        for id in &cluster.node_ids {
-            ai_clustered.insert(id.clone());
+    crate::elog!("🗂️ archiviste: engine={}, embed={}, ai_pool={} candidats (catchall_id={:?})",
+        engine.is_some(), ai::llama::embed_model_available(), ai_pool.len(), result.catchall_id);
+
+    if ai::llama::embed_model_available() {
+        let plan = embed_organize(dir, &ai_pool, &graph, engine.as_ref());
+        let mut anchored: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (doc, folder) in &plan.anchors {
+            let mv = format!("arch-move-{n}"); n += 1;
+            write_pending_proposal(dir, &mv, "move", "", "", doc, folder, &[])?;
+            anchored.insert(doc.clone());
         }
-        apply_theme_cluster(cluster, &mut n, &mut report)?;
-    }
-    if !ai_clusters.is_empty() {
-        report.push_str(&format!(
-            "→ IA : {} regroupement(s) sémantique(s) supplémentaire(s) (aucun mot de titre partagé)\n",
-            ai_clusters.len()
-        ));
+        if !plan.anchors.is_empty() {
+            report.push_str(&format!("→ {} page(s) rangée(s) dans des dossiers existants (par similarité)\n", plan.anchors.len()));
+        }
+        for cluster in &plan.clusters {
+            for id in &cluster.node_ids { ai_clustered.insert(id.clone()); }
+            apply_theme_cluster(cluster, &mut n, &mut report)?;
+            capture_theme(&mut created_themes, cluster);
+        }
+        if !plan.clusters.is_empty() {
+            report.push_str(&format!("→ {} nouveau(x) thème(s) créé(s) par embeddings\n", plan.clusters.len()));
+        }
+        ai_pool.retain(|(id, _)| !anchored.contains(id));
+    } else if let Some(e) = &engine {
+        // Repli sans embeddings : ancrage + clustering via Gemma (ancien comportement).
+        let snippet_of = |id: &str| -> String {
+            graph.nodes.iter().find(|nd| nd.id == id).map(|nd| {
+                let raw = if !nd.content.trim().is_empty() { nd.content.as_str() } else { nd.source_text.as_str() };
+                raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>()
+            }).unwrap_or_default()
+        };
+        let folder_sample = |id: &str| graph.nodes.iter()
+            .filter(|nd| nd.parent_id.as_deref() == Some(id))
+            .take(5).map(|nd| nd.label.clone()).collect::<Vec<_>>();
+        let existing_folders: Vec<(String, String, Vec<String>)> = graph.nodes.iter()
+            .filter(|nd| nd.id.starts_with("arch-theme-") || nd.id.starts_with("arch-cat-") || nd.id.starts_with("arch-group-"))
+            .map(|nd| (nd.id.clone(), nd.label.clone(), folder_sample(&nd.id)))
+            .collect();
+        if !existing_folders.is_empty() && !ai_pool.is_empty() {
+            let pages: Vec<(String, String, String)> = ai_pool.iter()
+                .map(|(id, label)| (id.clone(), label.clone(), snippet_of(id))).collect();
+            let assigns = archivist::ai_assign_to_folders(e, &pages, &existing_folders);
+            let mut anchored: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (page, folder) in &assigns {
+                let mv = format!("arch-move-{n}"); n += 1;
+                write_pending_proposal(dir, &mv, "move", "", "", page, folder, &[])?;
+                anchored.insert(page.clone());
+            }
+            if !assigns.is_empty() {
+                ai_pool.retain(|(id, _)| !anchored.contains(id));
+                report.push_str(&format!("→ {} page(s) rangée(s) dans des dossiers existants\n", assigns.len()));
+            }
+        }
+        for cluster in &archivist::ai_cluster_leftovers(e, &ai_pool, &graph) {
+            for id in &cluster.node_ids { ai_clustered.insert(id.clone()); }
+            apply_theme_cluster(cluster, &mut n, &mut report)?;
+            capture_theme(&mut created_themes, cluster);
+        }
     }
 
     // Bac "Non triable" : ce qui reste après le tri mécanique ET la passe IA.
     // Crée le bac s'il n'existe pas encore, ou route vers son id réel
     // (`result.catchall_id`, peut différer de la constante — dossier créé
     // manuellement ou par une version antérieure) sinon.
-    let still_leftover: Vec<(String, String)> = catchall_leftover.into_iter()
+    // Ce qui n'a été ni ancré (retiré de `ai_pool`) ni regroupé par embeddings.
+    let still_leftover: Vec<(String, String)> = ai_pool.iter()
         .filter(|(id, _)| !ai_clustered.contains(id))
+        .cloned()
         .collect();
     if !still_leftover.is_empty() {
         let target_id = match &result.catchall_id {
@@ -345,45 +791,72 @@ fn run_archivist_scan_once_in_progress(
         ));
     }
 
-    // Super-groupement : chapeauter les dossiers-thèmes proches sous un parent
-    // explicite (root › « Facturation » › { Devis, Facture, Estimation }),
-    // demandé par Liam le 2026-07-28. Passe sémantique (Gemma) sur les LIBELLÉS
-    // des thèmes — deux thèmes d'un même domaine ne partagent aucun mot commun,
-    // seul le sens les rapproche. Ne considère que les thèmes à plat sous la
-    // racine (ceux créés ce passage — id déterministe — plus ceux déjà présents,
-    // hors thèmes déjà rangés sous un parent). Le circuit de résolution applique
-    // le "create parent" avant les "move" de thèmes (dépendance new_parent_id).
-    if let Some(e) = &engine {
-        let mut themes: Vec<(String, String)> = Vec::new();
+    // Consolidation : le clustering par lots crée des thèmes qui se recouvrent
+    // (« Immobilier » ×3, « Administratif » ×2…). Une passe Gemma les organise en
+    // ARBORESCENCE multi-niveaux (profondeur jugée par l'IA — Liam, 2026-07-28) :
+    // root › « Immobilier » › « Ventes » › { thèmes }. Chaque segment de chemin
+    // devient un conteneur `arch-cat-<slug cumulé>` (id déterministe → idempotent,
+    // pas de doublon entre runs). Le circuit de résolution applique « create » d'un
+    // parent avant le « create »/« move » de ses enfants (dépendance parent_id).
+    if let (Some(e), Some(root_id)) = (&engine, root_id.as_ref()) {
+        // Candidats = tous les regroupements thématiques Archiviste au niveau racine
+        // (thèmes plats + groupes/catégories déjà créés) + les clusters de CE run,
+        // avec leur taille (nb de pages) pour aider l'IA à juger. Jamais les
+        // dossiers-source (p:*) ni le bac « Non triable ».
+        let label_of: std::collections::HashMap<&str, &str> = graph.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
+        let child_count = |id: &str| graph.nodes.iter().filter(|nd| nd.parent_id.as_deref() == Some(id)).count();
+        // Échantillon du CONTENU d'un dossier (labels d'enfants) : donné à l'IA de
+        // consolidation pour qu'elle range sur le SENS RÉEL et pas sur un nom
+        // ambigu (« Carte » = cartes d'identité, pas géographie — bug remonté par
+        // Liam le 2026-07-28).
+        let child_sample = |id: &str| graph.nodes.iter()
+            .filter(|nd| nd.parent_id.as_deref() == Some(id))
+            .take(5).map(|nd| nd.label.clone()).collect::<Vec<_>>();
+        let mut themes: Vec<(String, String, usize, Vec<String>)> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for c in result.theme_clusters.iter().chain(ai_clusters.iter()) {
-            let id = format!("arch-theme-{}", c.label.to_lowercase());
-            if seen.insert(id.clone()) { themes.push((id, c.label.clone())); }
-        }
+        let _ = &label_of; // (réservé si on réintègre un échantillon par node_ids)
+        // Thèmes DÉJÀ présents au niveau racine (runs précédents).
         for node in &graph.nodes {
-            if node.id.starts_with("arch-theme-")
-                && node.parent_id.as_deref() == root_id.as_deref()
-                && seen.insert(node.id.clone())
-            {
-                themes.push((node.id.clone(), node.label.clone()));
+            let is_theme = node.id.starts_with("arch-theme-") || node.id.starts_with("arch-group-") || node.id.starts_with("arch-cat-");
+            if is_theme && node.parent_id.as_deref() == Some(root_id.as_str()) && seen.insert(node.id.clone()) {
+                themes.push((node.id.clone(), node.label.clone(), child_count(&node.id), child_sample(&node.id)));
             }
         }
-        for grp in archivist::ai_group_themes(e, &themes) {
-            let slug = grp.parent_label.to_lowercase().replace(' ', "-");
-            let group_id = format!("arch-group-{slug}");
-            if let Some(root_id) = &root_id {
-                if !graph.nodes.iter().any(|c| c.id == group_id) {
-                    write_pending_proposal(dir, &group_id, "create", root_id, &grp.parent_label, "", "", &[])?;
-                }
+        // + les thèmes CRÉÉS ce run (encore des propositions, absents de graph.nodes) :
+        // ainsi la consolidation chapeaute DÈS CETTE PASSE, plus besoin d'un 2e run
+        // manuel. Le circuit de résolution applique create(thème) puis create(cat) puis
+        // move(thème→cat) dans le même lot (dépendances gérées par re-boucle).
+        for (id, label, size, sample) in &created_themes {
+            if seen.insert(id.clone()) {
+                themes.push((id.clone(), label.clone(), *size, sample.clone()));
             }
+        }
+
+        let slugify = |s: &str| s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>().split('-').filter(|x| !x.is_empty()).collect::<Vec<_>>().join("-");
+        let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for grp in archivist::ai_group_themes(e, &themes) {
+            // Crée la chaîne de conteneurs du chemin, du plus général au plus précis.
+            let mut cumulative = String::new();
+            let mut parent = root_id.clone();
+            for segment in &grp.path {
+                cumulative = if cumulative.is_empty() { slugify(segment) } else { format!("{cumulative}-{}", slugify(segment)) };
+                let cat_id = format!("arch-cat-{cumulative}");
+                let exists = graph.nodes.iter().any(|c| c.id == cat_id);
+                if !exists && created.insert(cat_id.clone()) {
+                    write_pending_proposal(dir, &cat_id, "create", &parent, segment, "", "", &[])?;
+                }
+                parent = cat_id;
+            }
+            // Range les thèmes sous le dernier segment (sauf ceux déjà dedans).
             for theme_id in &grp.theme_ids {
+                if graph.nodes.iter().any(|nd| nd.id == *theme_id && nd.parent_id.as_deref() == Some(parent.as_str())) { continue; }
                 let id = format!("arch-move-{n}");
                 n += 1;
-                write_pending_proposal(dir, &id, "move", "", "", theme_id, &group_id, &[])?;
+                write_pending_proposal(dir, &id, "move", "", "", theme_id, &parent, &[])?;
             }
-            report.push_str(&format!(
-                "→ regrouper {} thème(s) sous « {} »\n", grp.theme_ids.len(), grp.parent_label
-            ));
+            report.push_str(&format!("→ regrouper {} dossier(s) sous « {} »\n", grp.theme_ids.len(), grp.path.join(" / ")));
         }
     }
 
@@ -532,64 +1005,13 @@ mod archivist_orchestration_tests {
         .unwrap()
     }
 
-    /// Régression du bug remonté par Liam le 2026-07-23 : un cluster de thème
-    /// ("Facture", mot partagé par 3+ pages du bac "Non triable") matchait
-    /// n'importe quel nœud existant portant le même libellé PAR COÏNCIDENCE,
-    /// où qu'il soit dans le cerveau — une note perso sans rapport nommée
-    /// "Facture" absorbait alors toutes les pages du cluster. Doit maintenant
-    /// ignorer cette note et proposer un tout nouveau conteneur (id déterministe
-    /// `arch-theme-<slug>`), jamais deviné par correspondance de texte.
-    #[test]
-    fn theme_cluster_ignore_un_noeud_existant_qui_partage_juste_le_libelle() {
-        let dir = std::env::temp_dir().join("lucid_test_archivist_theme_collision");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let graph = BrainGraph {
-            nodes: vec![
-                serde_json::from_value(serde_json::json!({
-                    "id": "root", "label": "Lucid", "kind": "root", "weight": 5
-                }))
-                .unwrap(),
-                note(archivist::CATCHALL_ID, "root", archivist::CATCHALL_LABEL),
-                note("f1", archivist::CATCHALL_ID, "Facture Janvier"),
-                note("f2", archivist::CATCHALL_ID, "Facture Février"),
-                note("f3", archivist::CATCHALL_ID, "Facture Mars"),
-                // Un vrai dossier thématique existant (pas un orphelin sous la
-                // racine, sinon le script la range lui-même dans le bac avant
-                // même d'atteindre la logique de cluster qu'on veut isoler ici).
-                serde_json::from_value(serde_json::json!({
-                    "id": "cat-compta", "label": "Comptabilité", "kind": "container",
-                    "weight": 1, "parent_id": "root"
-                }))
-                .unwrap(),
-                // Note personnelle sans aucun rapport, qui porte par hasard le
-                // même libellé que le thème qui va être détecté.
-                note("note-perso-facture", "cat-compta", "Facture"),
-            ],
-            edges: vec![],
-            markdown: String::new(),
-            report: String::new(),
-            generated_at: "t".into(),
-        };
-        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph).unwrap()).unwrap();
-
-        run_archivist_scan_once_in(&dir).unwrap();
-
-        let proposals = load_proposals_in(&dir);
-        assert!(
-            proposals.iter().all(|p| p.new_parent_id != "note-perso-facture" && p.target_id != "note-perso-facture"),
-            "une page de facture a été proposée vers la note existante sans rapport : {:?}",
-            proposals.iter().map(|p| (&p.action, &p.target_id, &p.new_parent_id)).collect::<Vec<_>>()
-        );
-        assert!(
-            proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-facture"),
-            "attendu la création du thème « Facture » sous un id déterministe propre à l'Archiviste : {:?}",
-            proposals.iter().map(|p| &p.id).collect::<Vec<_>>()
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // NOTE (2026-07-29, ADR-0019) : les anciens tests du clustering thématique
+    // MÉCANIQUE (par mot partagé) ont été retirés — ce rangement est désormais fait
+    // par EMBEDDINGS (voir `archivist::cluster_indices`, testé unitairement sans
+    // moteur). Les tests E2E d'orchestration ne peuvent plus vérifier le
+    // regroupement sans lancer un vrai serveur d'embedding, donc on ne garde ici
+    // que le contrat testable SANS moteur : un document à ranger n'est jamais perdu
+    // → il finit dans le bac « Non triable » (repli), cf. le test ci-dessous.
 
     /// Régression du bug remonté par Liam le 2026-07-23 : après un reset +
     /// premier scan (donc AUCUN bac "Non triable" encore présent), un seul
@@ -645,119 +1067,6 @@ mod archivist_orchestration_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Régression du bug remonté par Liam le 2026-07-23 : sur un cerveau frais
-    /// (aucun bac "Non triable" existant), des factures/devis en vrac
-    /// atterrissaient TOUS à plat dans le bac, sans être groupés par thème —
-    /// le clustering ne regardait que les enfants DÉJÀ DANS le bac, qui
-    /// n'existaient pas encore dans ce même passage. Doit maintenant grouper
-    /// directement les factures dans un thème « Facture » et les devis dans un
-    /// thème « Devis », le bac plat ne recevant que ce qui ne se groupe pas.
-    #[test]
-    fn groupe_les_orphelins_par_theme_des_le_premier_passage_sans_bac_existant() {
-        let dir = std::env::temp_dir().join("lucid_test_archivist_cluster_same_pass");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let graph = BrainGraph {
-            nodes: vec![
-                serde_json::from_value(serde_json::json!({
-                    "id": "root", "label": "Lucid", "kind": "root", "weight": 3
-                }))
-                .unwrap(),
-                note("f1", "root", "Facture Janvier"),
-                note("f2", "root", "Facture Février"),
-                note("f3", "root", "Facture Mars"),
-                note("d1", "root", "Devis Toiture"),
-                note("d2", "root", "Devis Cuisine"),
-                note("d3", "root", "Devis Terrasse"),
-                // Un vrai isolé, sans mot partagé avec personne d'autre : lui
-                // seul doit finir dans le bac plat.
-                note("iso", "root", "Note diverse xyz"),
-            ],
-            edges: vec![],
-            markdown: String::new(),
-            report: String::new(),
-            generated_at: "t".into(),
-        };
-        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph).unwrap()).unwrap();
-
-        run_archivist_scan_once_in(&dir).unwrap();
-
-        let proposals = load_proposals_in(&dir);
-        let moved_to = |id: &str| -> Option<String> {
-            proposals.iter().find(|p| p.action == "move" && p.target_id == id).map(|p| p.new_parent_id.clone())
-        };
-
-        for id in ["f1", "f2", "f3"] {
-            assert_eq!(moved_to(id).as_deref(), Some("arch-theme-facture"),
-                "« {id} » doit rejoindre directement le thème « Facture », pas le bac plat : {:?}", moved_to(id));
-        }
-        for id in ["d1", "d2", "d3"] {
-            assert_eq!(moved_to(id).as_deref(), Some("arch-theme-devis"),
-                "« {id} » doit rejoindre directement le thème « Devis », pas le bac plat : {:?}", moved_to(id));
-        }
-        assert_eq!(moved_to("iso").as_deref(), Some(archivist::CATCHALL_ID),
-            "un isolé sans thème doit quand même finir dans le bac plat");
-
-        assert!(proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-facture"));
-        assert!(proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-devis"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Régression du bug remonté par Liam le 2026-07-23 : dès qu'un bac "Non
-    /// triable" existe déjà (donc à partir du DEUXIÈME passage), de nouveaux
-    /// orphelins qui partagent pourtant un mot ("INVOICE") repartaient par un
-    /// chemin qui contournait entièrement le clustering — ils atterrissaient
-    /// à plat dans le bac au lieu de se grouper. Doit maintenant clusterer
-    /// pareil, que le bac existe déjà ou non.
-    #[test]
-    fn clusterise_les_nouveaux_orphelins_meme_quand_le_bac_existe_deja() {
-        let dir = std::env::temp_dir().join("lucid_test_archivist_cluster_bac_existant");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut nodes = vec![
-            serde_json::from_value(serde_json::json!({
-                "id": "root", "label": "Lucid", "kind": "root", "weight": 3
-            }))
-            .unwrap(),
-            // Le bac existe déjà, vide (créé par un passage précédent).
-            note(archivist::CATCHALL_ID, "root", archivist::CATCHALL_LABEL),
-        ];
-        // 20 fichiers qui partagent le mot "INVOICE", nouvellement scannés —
-        // pas encore rangés nulle part (direct enfants de la racine).
-        for i in 0..20 {
-            nodes.push(note(&format!("inv{i}"), "root", &format!("INVOICE-{i:04}-XZ")));
-        }
-        let graph = BrainGraph {
-            nodes,
-            edges: vec![],
-            markdown: String::new(),
-            report: String::new(),
-            generated_at: "t".into(),
-        };
-        std::fs::write(dir.join("brain.json"), serde_json::to_string(&graph).unwrap()).unwrap();
-
-        run_archivist_scan_once_in(&dir).unwrap();
-
-        let proposals = load_proposals_in(&dir);
-        assert!(
-            proposals.iter().any(|p| p.action == "create" && p.id == "arch-theme-invoice"),
-            "un thème « Invoice » aurait dû être créé : {:?}",
-            proposals.iter().map(|p| (&p.action, &p.id)).collect::<Vec<_>>()
-        );
-        let moved_to_invoice_theme = proposals.iter()
-            .filter(|p| p.action == "move" && p.new_parent_id == "arch-theme-invoice")
-            .count();
-        assert_eq!(moved_to_invoice_theme, 20, "les 20 factures doivent rejoindre le thème, pas le bac plat");
-        let moved_to_flat_catchall = proposals.iter()
-            .filter(|p| p.action == "move" && p.new_parent_id == archivist::CATCHALL_ID)
-            .count();
-        assert_eq!(moved_to_flat_catchall, 0, "rien ne devrait rester à plat dans le bac ici");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// Une seule passe de l'Archiviste à la fois (même logique que `GEN_LOCK` pour
@@ -3006,9 +3315,22 @@ fn set_node_parent_on(graph: &mut BrainGraph, node_id: &str, parent_id: &str) ->
             .filter_map(|n| n.parent_id.as_deref().map(|p| (n.id.as_str(), p)))
             .collect();
         let mut cur = Some(parent_id);
+        // `seen` borne la remontée : le garde d'origine supposait le graphe
+        // stocké acyclique. Or un lot de "move" peut créer un cycle en mémoire
+        // (A→B puis B→A), écrit ensuite dans brain.json ; une remontée ultérieure
+        // qui croise ce cycle bouclait alors À L'INFINI sur le thread principal —
+        // app gelée sur le spinner à CHAQUE lancement (bug 2026-07-29, pile :
+        // resolve_all_pending_in → set_node_parent_on → HashMap::get à 100% CPU).
+        // Si on repasse par un nœud déjà vu, le cycle est PRÉEXISTANT (pas causé
+        // par ce déplacement) : on refuse → l'appelant met la proposition en
+        // quarantaine (cf. resolve_all_pending_in) et l'app démarre.
+        let mut seen = std::collections::HashSet::new();
         while let Some(c) = cur {
             if c == node_id {
                 return Err("Déplacement impossible : créerait une boucle.".into());
+            }
+            if !seen.insert(c) {
+                return Err("Graphe incohérent : cycle de parenté préexistant.".into());
             }
             cur = parent_of.get(c).copied();
         }
@@ -3023,6 +3345,34 @@ fn set_node_parent_on(graph: &mut BrainGraph, node_id: &str, parent_id: &str) ->
         source: parent_id.to_string(), target: node_id.to_string(), kind: "contains".into(), relation: "contains".into(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod set_parent_tests {
+    use super::*;
+
+    fn node(id: &str, parent: Option<&str>) -> BrainNode {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "label": id, "kind": "container", "weight": 0,
+            "summary": "", "keywords": [], "decisions": [], "patterns": [],
+            "community": 0, "parent_id": parent, "synthesized_at": null, "content": ""
+        })).unwrap()
+    }
+
+    /// Régression 2026-07-29 : un cycle de parenté PRÉEXISTANT dans le graphe
+    /// (a→b→a) faisait boucler la remontée anti-cycle à l'infini → thread
+    /// principal gelé, app bloquée sur le spinner. Doit renvoyer une erreur, pas
+    /// tourner sans fin (le test lui-même timeout si la boucle n'est pas bornée).
+    #[test]
+    fn cycle_preexistant_renvoie_erreur_sans_boucler() {
+        let mut graph = BrainGraph {
+            nodes: vec![node("root", None), node("a", Some("b")), node("b", Some("a")), node("x", Some("root"))],
+            edges: vec![], markdown: String::new(), report: String::new(), generated_at: String::new(),
+        };
+        // Déplacer x sous a : la remontée depuis a traverse le cycle a↔b.
+        let r = set_node_parent_on(&mut graph, "x", "a");
+        assert!(r.is_err(), "un cycle préexistant doit être refusé, pas boucler : {r:?}");
+    }
 }
 
 /// Ajoute un pont conceptuel entre deux nœuds existants (arête `link`, distincte
@@ -4606,8 +4956,10 @@ fn start_data_watcher(app: tauri::AppHandle) {
             return;
         }
         while rx.recv().is_ok() {
-            // Debounce : une génération/restauration écrit en rafale → attendre l'accalmie.
-            while rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok() {}
+            // Debounce par sleep (pas un while-drain qui spinnerait à 100% CPU sous
+            // une rafale d'écritures, cf. le fix de `start_watcher` le 2026-07-29).
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            while rx.try_recv().is_ok() {}
             let _ = app.emit("user-data-changed", ());
         }
     });
@@ -4701,9 +5053,15 @@ fn start_watcher(app: tauri::AppHandle) {
 
             // Attend soit un déclencheur (fs ou sondage), soit le prochain tour.
             if rx.recv_timeout(WATCH_POLL_INTERVAL).is_err() { continue; }
-            // Debounce : une source qui écrit en rafale (session Claude en cours,
-            // sync Drive en plusieurs lots…) → attendre l'accalmie.
-            while rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok() {}
+            // Debounce : une source qui écrit en RAFALE (session Claude Code en
+            // cours, sync Drive en plusieurs lots…) → laisser l'accalmie. On DORT
+            // un délai fixe puis on vide le canal d'un coup (non-bloquant) : un
+            // `while recv_timeout().is_ok()` bouclait à 100% CPU tant que les
+            // évènements affluaient sans jamais 3 s de silence (bug révélé le
+            // 2026-07-29 quand une session Claude Code écrivait en continu dans
+            // ~/.claude/projects — le watcher spinnait à fond).
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            while rx.try_recv().is_ok() {}
             // Pas encore de cerveau, ou contenu démo → on ne touche à rien.
             let Some(data) = ai::llama::app_data_dir() else { continue; };
             if !has_real_brain(&data) || data.join("demo.flag").exists() { continue; }
@@ -5001,7 +5359,8 @@ pub fn run() {
             crash_test,
             ai_info,
             run_archivist,
-            archivist_was_interrupted
+            archivist_was_interrupted,
+            archivist_diagnostic
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

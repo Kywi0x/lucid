@@ -16,7 +16,13 @@ const APP_DIR: &str = "com.lucidflow.lucid";
 const LEGACY_APP_DIR: &str = "fr.ideeri.brainlink";
 /// Taille de la fenêtre de contexte passée à llama (`-c`). Exposée à l'UI via
 /// `ai_info` pour afficher la capacité et avertir si un prompt la dépasse.
-pub const CONTEXT_TOKENS: u32 = 8192;
+/// 16384 (et non 8192) : l'Archiviste envoie des prompts de tri qui grandissent
+/// avec le « Non triable » — 65 pages enrichies d'un extrait de contenu font
+/// déjà ~8300 tokens (ids/CSV très denses, ~2,4 char/token mesuré), ce qui
+/// dépassait 8192 → llama-server répondait 400 et le tri ne se faisait jamais
+/// (bug remonté par Liam le 2026-07-28). 16k laisse voir tout le lot d'un coup
+/// (meilleur clustering) ; Gemma 3/4 supporte bien plus, coût KV cache modéste.
+pub const CONTEXT_TOKENS: u32 = 16384;
 /// Catalogue GPT4All officiel — URLs vérifiées et maintenues par l'équipe GPT4All.
 const CATALOG_URL: &str =
     "https://raw.githubusercontent.com/nomic-ai/gpt4all/main/gpt4all-chat/metadata/models3.json";
@@ -628,6 +634,176 @@ fn ensure_server(binary: &Path, model: &Path) -> Option<String> {
 /// (sinon un process GPU-actif traînerait après avoir quitté Lucid).
 pub fn shutdown_server() {
     *server_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *embed_server_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+// ── Embeddings (rangement déterministe, ADR-0019) ────────────────────────────
+// Un 2ᵉ `llama-server` persistant, en mode `--embedding`, avec un modèle DÉDIÉ
+// (BGE-M3) sur un port distinct du serveur de génération (Gemma). Il ne génère
+// pas de texte : il rend un VECTEUR par document (position sur la « carte du
+// sens »). Déterministe → pas d'hallucination. Sert le clustering de l'Archiviste.
+
+/// URL du modèle d'embedding par défaut (BGE-M3, multilingue FR/EN, ctx 8192).
+/// Quantifié Q8 (~600 Mo) — priorité qualité (ADR-0019). Overridable par env.
+pub const EMBED_MODEL_URL: &str =
+    "https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q8_0.gguf";
+pub const EMBED_MODEL_FILE: &str = "bge-m3-Q8_0.gguf";
+const EMBED_PORT: u16 = 8722;
+/// Un embedding ne « voit » que sa fenêtre — on tronque le texte (un CSV peut
+/// faire des Mo) SOUS les 8192 tokens du batch. À ~2,4 char/token, 8192 tokens
+/// ≈ 19 600 chars ; on prend 15 000 (marge de sécurité) — largement assez pour
+/// capter le sujet d'un document.
+const EMBED_MAX_CHARS: usize = 15_000;
+
+static EMBED_SERVER: OnceLock<Mutex<Option<ServerProc>>> = OnceLock::new();
+fn embed_server_slot() -> &'static Mutex<Option<ServerProc>> {
+    EMBED_SERVER.get_or_init(|| Mutex::new(None))
+}
+
+/// Health check générique (le serveur de génération utilise `server_health`,
+/// figé sur son port — celui-ci prend le port en paramètre pour le 2ᵉ serveur).
+fn health_on(port: u16, token: &str) -> bool {
+    reqwest::blocking::Client::new()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .bearer_auth(token)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Chemin du modèle d'embedding : override env `LUCID_EMBED_MODEL`, sinon le
+/// fichier attendu dans `models/`. `None` si absent (→ à télécharger).
+pub fn resolve_embed_model() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("LUCID_EMBED_MODEL") {
+        let p = PathBuf::from(p);
+        if p.is_file() { return Some(p); }
+    }
+    let candidate = shared_data_dir()?.join("models").join(EMBED_MODEL_FILE);
+    candidate.is_file().then_some(candidate)
+}
+
+pub fn embed_model_available() -> bool { resolve_embed_model().is_some() }
+
+/// Démarre (ou réutilise) le serveur d'embedding. `None` si binaire ou modèle
+/// absent, ou démarrage échoué. Renvoie la clé d'API.
+fn ensure_embed_server() -> Option<String> {
+    let binary = resolve_server_binary()?;
+    let model = resolve_embed_model()?;
+    let mut slot = embed_server_slot().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = slot.as_ref() {
+        if s.model == model && health_on(EMBED_PORT, &s.token) {
+            return Some(s.token.clone());
+        }
+        *slot = None;
+    }
+    free_port(EMBED_PORT);
+    let token = random_token();
+    let mut cmd = low_priority_command(&binary);
+    cmd.arg("-m").arg(&model)
+        .args(["-ngl", "99"])
+        .args(["-t", &worker_threads().to_string()])
+        .args(["-c", "8192"])
+        // En mode embedding, tout l'input est traité en UN batch : sans relever
+        // `-b`/`-ub` (défaut 512), tout document > 512 tokens échoue en 500
+        // ("input too large to process", trouvé le 2026-07-29). On aligne le
+        // batch sur le contexte pour accepter des docs jusqu'à 8192 tokens.
+        .args(["-b", "8192"])
+        .args(["-ub", "8192"])
+        .arg("--embedding")
+        .args(["--pooling", "mean"])
+        .args(["--embd-normalize", "2"]) // L2 → cosinus = simple produit scalaire
+        .args(["--host", "127.0.0.1"])
+        .args(["--port", &EMBED_PORT.to_string()])
+        .args(["--api-key", &token])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut proc = cmd.spawn().ok().map(|child| ServerProc { child, model: model.clone(), token: token.clone() })?;
+    let started = Instant::now();
+    while started.elapsed() < SERVER_STARTUP_TIMEOUT {
+        if health_on(EMBED_PORT, &token) {
+            *slot = Some(proc);
+            crate::elog!("✅ llama-server (embedding) prêt en {:.1}s.", started.elapsed().as_secs_f32());
+            return Some(token);
+        }
+        if let Ok(Some(status)) = proc.child.try_wait() {
+            crate::elog!("⚠️ llama-server (embedding) mort avant de répondre ({status}).");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    crate::elog!("⚠️ llama-server (embedding) : timeout de démarrage.");
+    None
+}
+
+/// Vecteur d'embedding d'UN texte via l'endpoint OpenAI-compat `/v1/embeddings`
+/// (format de réponse stable entre versions de llama.cpp). Texte tronqué à la
+/// fenêtre du modèle.
+fn embed_one(token: &str, text: &str) -> Result<Vec<f32>, String> {
+    // Retry adaptatif : le nombre de tokens par caractère varie énormément (un
+    // CSV dense fait ~1 token/char, un texte FR ~0,4). Impossible de deviner une
+    // troncature sûre en chars. On part de EMBED_MAX_CHARS et, si le serveur
+    // répond « input too large », on retronque de moitié jusqu'à passer — un
+    // embedding n'a de toute façon besoin que du début pour capter le sujet.
+    let client = reqwest::blocking::Client::new();
+    let mut limit = EMBED_MAX_CHARS;
+    loop {
+        let truncated: String = text.chars().take(limit).collect();
+        let body = serde_json::json!({ "input": truncated });
+        let resp = client
+            .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
+            .bearer_auth(token)
+            .json(&body)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .map_err(|e| format!("serveur d'embedding injoignable : {e}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+            let arr = json.get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|d| d.first())
+                .and_then(|e| e.get("embedding"))
+                .and_then(|v| v.as_array())
+                .ok_or("réponse d'embedding inattendue")?;
+            return Ok(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect());
+        }
+        // Input trop grand pour le batch → retronque et réessaie.
+        if status.as_u16() == 500 && limit > 1000 {
+            limit /= 2;
+            continue;
+        }
+        return Err(format!("serveur d'embedding a répondu {status}"));
+    }
+}
+
+/// Embeddings d'une liste de textes (un appel par texte — le serveur persistant
+/// garde le modèle chargé, donc chaque appel est rapide ; on optimisera en batch
+/// si besoin). Renvoie une erreur claire si le moteur n'est pas prêt.
+pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() { return Ok(Vec::new()); }
+    let token = ensure_embed_server()
+        .ok_or("Moteur d'embedding indisponible (modèle BGE-M3 absent ou serveur non démarré).")?;
+    let mut out = Vec::with_capacity(texts.len());
+    for t in texts {
+        out.push(embed_one(&token, t)?);
+    }
+    Ok(out)
+}
+
+/// Similarité cosinus entre deux vecteurs (∈ [-1, 1] ; ~1 = même sens). Les
+/// vecteurs sont déjà L2-normalisés par le serveur (`--embd-normalize 2`), donc
+/// c'est un simple produit scalaire — mais on renormalise par sécurité.
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 { return 0.0; }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 fn complete_via_server(token: &str, prompt: &str, max_tokens: u32) -> Result<String, String> {

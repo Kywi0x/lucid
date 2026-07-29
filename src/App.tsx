@@ -451,14 +451,13 @@ function App() {
       readBrainGraph().then((g) => { if (g) setGraph(g); });
       connectorsStatus().then(setConnectors);
       void syncNow();
-      // Auto-classement à chaud : `brain-updated` n'est émis QUE par une régé
-      // AUTO (watcher fs / rattrapage démarrage), jamais par « Générer » manuel
-      // (qui lance déjà l'Archiviste). Donc un fichier/connecteur ajouté a fait
-      // apparaître de nouvelles pages non rangées → l'Archiviste les file en
-      // silence. Il est incrémental (ne touche pas à l'existant) et self-gate
-      // (aucune proposition s'il n'y a rien à ranger). Pas de boucle : ses
-      // propositions sont préfixées « arch- » et ne réémettent pas brain-updated.
-      if (!archivingRef.current) void runArchivistNow({ silent: true });
+      // NB : PAS d'auto-classement Archiviste ici. Retiré le 2026-07-29 — cause
+      // d'un emballement CPU : une source active (ex. la session Claude Code qui
+      // écrit en continu dans ~/.claude/projects) déclenche des régé fréquentes,
+      // chacune émet `brain-updated`, et relancer l'Archiviste (désormais LOURD :
+      // il embed tout le cerveau) à chaque fois saturait la machine. L'Archiviste
+      // reste déclenché explicitement (fin de scan, bouton). À ré-introduire plus
+      // tard avec un vrai débounce/cooldown, jamais sur chaque `brain-updated`.
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);

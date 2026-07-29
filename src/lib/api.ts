@@ -267,6 +267,13 @@ export function resetEnvironment(): Promise<void> {
   return invoke("reset_environment");
 }
 
+/** Rapport de diagnostic Archiviste (métriques + domaines + structure), SANS
+ *  contenu de document. `mask` = true : noms de dossiers remplacés par leur
+ *  domaine (RGPD — pour partager un résultat sur de vraies données). */
+export function archivistDiagnostic(mask: boolean): Promise<string> {
+  return invoke("archivist_diagnostic", { mask });
+}
+
 /** Mode de l'Archiviste : false (défaut) = écrit directement, true = chaque
  *  action passe par les bulles fantômes (validation manuelle). */
 export function mcpManualValidationEnabled(): Promise<boolean> {

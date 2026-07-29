@@ -59,6 +59,7 @@ import {
   setTelemetry,
   sentryActive,
   crashTest,
+  archivistDiagnostic,
   type ModelInfo,
 } from "@/lib/api";
 import { supabase, BACKUP_BUCKET } from "@/lib/supabase";
@@ -1249,6 +1250,36 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
             </span>
           </span>
         </label>
+      </div>
+
+      {/* Diagnostic Archiviste — visible aussi en beta (hors gate DEV) : les bêta-
+          testeurs peuvent copier un rapport RGPD-safe (aucun contenu de document,
+          noms anonymisés) pour envoyer un retour analysable. */}
+      <div className="mt-6 rounded-xl border border-[var(--color-border)] p-3">
+        <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+          Diagnostic (retour bêta)
+        </p>
+        <p className="mb-2 text-[11px] leading-relaxed text-[var(--color-muted)]">
+          Copie un résumé du rangement (compteurs, thèmes, domaines) — <strong>sans aucun
+          contenu de tes documents</strong>, noms de dossiers anonymisés. À coller dans ton retour.
+        </p>
+        <button
+          onClick={async () => {
+            setBusy("diag"); setMsg(null);
+            try {
+              const report = await archivistDiagnostic(true); // masqué = RGPD-safe
+              const ok = await copyText(report);
+              setMsg(ok ? "Diagnostic copié ✓ — colle-le dans ton message." : "Copie impossible.");
+            } catch (e) {
+              setMsg(String((e as Error).message ?? e));
+            } finally { setBusy(null); }
+          }}
+          disabled={busy !== null}
+          className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] disabled:opacity-40"
+        >
+          {busy === "diag" ? <Loader2 className="size-4 animate-spin" /> : null}
+          Copier un diagnostic (anonymisé)
+        </button>
       </div>
 
       {import.meta.env.DEV && (
