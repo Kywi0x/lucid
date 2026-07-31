@@ -11,6 +11,11 @@
       "resources/win-poppler/": "poppler/",
       "resources/win-tesseract/": "tesseract/",
       "resources/win-tessdata/": "tessdata/"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./installer-hooks.nsh"
+      }
     }
   }
 }

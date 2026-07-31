@@ -627,12 +627,40 @@ fn server_health(token: &str) -> bool {
 /// CHAQUE appel, donc plus aucun bénéfice du serveur persistant (le vrai
 /// freeze observé, pas un problème machine). Un seul process légitime sur ce
 /// port par design ("un seul serveur pour toute l'app") : on peut le tuer sans
-/// risque avant de prendre sa place. Best-effort, jamais bloquant si
-/// `lsof`/`kill` sont absents (Windows).
+/// risque avant de prendre sa place. Best-effort, jamais bloquant.
+#[cfg(not(windows))]
 fn free_port(port: u16) {
     let Ok(out) = std::process::Command::new("lsof").args(["-ti", &format!(":{port}")]).output() else { return };
     for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
         let _ = std::process::Command::new("kill").args(["-9", pid]).status();
+    }
+}
+
+/// Équivalent Windows (parité ADR-0015 — la version `lsof`/`kill` ne libérait
+/// rien du tout sur Windows, où le problème est POURTANT pire : les process
+/// enfants ne meurent pas avec leur parent, donc un `llama-server` orphelin
+/// squatte le port à coup sûr après une fermeture brutale, et notre serveur
+/// n'arrive plus à s'y lier → repli one-shot silencieux à chaque appel).
+///
+/// `netstat -ano` plutôt que `taskkill /IM llama-server.exe` : les deux serveurs
+/// (génération et embedding) portent le MÊME nom d'image, tuer par nom
+/// descendrait celui qu'on vient de démarrer. On cible donc par port.
+#[cfg(windows)]
+fn free_port(port: u16) {
+    let me = std::process::id().to_string();
+    let Ok(out) = std::process::Command::new("netstat").args(["-ano", "-p", "tcp"]).output() else { return };
+    let needle = format!(":{port}");
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 { continue; }
+        // cols[1] = adresse LOCALE. Nos propres connexions client vers ce port ont
+        // une adresse locale éphémère : elles ne matchent pas, on ne se suicide
+        // donc jamais (le garde `pid == me` reste par sécurité). L'état
+        // (« LISTENING ») n'est pas testé : sa traduction dépend de la locale.
+        if !cols[1].ends_with(&needle) { continue; }
+        let pid = cols[cols.len() - 1];
+        if pid == me || pid.parse::<u32>().is_err() { continue; }
+        let _ = std::process::Command::new("taskkill").args(["/F", "/PID", pid]).status();
     }
 }
 
