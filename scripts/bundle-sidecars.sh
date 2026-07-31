@@ -16,6 +16,9 @@ BIN_DIR="src-tauri/binaries"
 LIB_DIR="src-tauri/resources/libs"
 TESS_DIR="src-tauri/resources/tessdata"
 LLAMA_STATIC="$HOME/Library/Application Support/com.lucidflow.lucid/llama.cpp/build-static/bin/llama-completion"
+# llama-server vit à côté de llama-completion (même build) : sert le serveur
+# persistant ET les embeddings (cf. resolve_server_binary). Bundlé en sidecar.
+LLAMA_SERVER_STATIC="$(dirname "$LLAMA_STATIC")/llama-server"
 
 rm -rf "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
 mkdir -p "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
@@ -23,17 +26,21 @@ mkdir -p "$BIN_DIR" "$LIB_DIR" "$TESS_DIR"
 # tauri-build (build.rs) valide l'existence de TOUS les externalBin dès qu'on
 # compile le crate. On crée des placeholders vides pour satisfaire cette
 # vérification ; les vrais binaires les écrasent aux étapes suivantes.
-for b in llama-completion pdftotext pdftoppm tesseract; do
+for b in llama-completion llama-server pdftotext pdftoppm tesseract; do
   : > "$BIN_DIR/$b-$TRIPLE"
 done
 
 echo "── 1/4 llama-completion"
-# Local : build statique (self-contained, pas de dylib). CI : release officielle
-# llama.cpp (dynamique → ses dylibs seront embarqués par dylibbundler ci-dessous).
+# Local : build statique (self-contained, pas de dylib) — SEULEMENT si les DEUX
+# binaires (completion + server) y sont. Sinon (ex. build statique partiel, ou
+# CMakeCache périmé après le renommage du dossier app), on bascule sur la release
+# officielle llama.cpp comme le fait la CI (dynamique → dylibs embarqués par
+# dylibbundler ci-dessous) : versions cohérentes entre les deux binaires.
 LLAMA_DYLIBS=""; LLAMA_SRC=""
-if [ -f "$LLAMA_STATIC" ]; then
-  echo "   → build statique local"
+if [ -f "$LLAMA_STATIC" ] && [ -f "$LLAMA_SERVER_STATIC" ]; then
+  echo "   → build statique local (completion + server)"
   cp "$LLAMA_STATIC" "$BIN_DIR/llama-completion-$TRIPLE"
+  cp "$LLAMA_SERVER_STATIC" "$BIN_DIR/llama-server-$TRIPLE"
 else
   echo "   → download release officielle (macos-arm64, .tar.gz)"
   # Auth GitHub API si dispo (évite le rate-limit anonyme sur les runners partagés).
@@ -48,6 +55,10 @@ else
   cli=$(find "$tmp" -name llama-cli -type f | head -1)
   [ -n "$cli" ] || { echo "❌ llama-cli introuvable dans l'archive"; exit 1; }
   cp "$cli" "$BIN_DIR/llama-completion-$TRIPLE"
+  # llama-server est dans la même archive (mêmes dylibs @rpath).
+  srv=$(find "$tmp" -name llama-server -type f | head -1)
+  [ -n "$srv" ] || { echo "❌ llama-server introuvable dans l'archive"; exit 1; }
+  cp "$srv" "$BIN_DIR/llama-server-$TRIPLE"
   LLAMA_DYLIBS="llama-completion"      # → à passer dans dylibbundler
   LLAMA_SRC=$(dirname "$cli")          # dossier des dylibs @rpath (libllama, libggml…)
 fi
@@ -75,10 +86,12 @@ done
 # llama téléchargé (dynamique) : ses dylibs @rpath sont dans l'archive → -s LLAMA_SRC.
 # (build statique local : LLAMA_DYLIBS vide, rien à faire.)
 if [ -n "$LLAMA_DYLIBS" ]; then
-  echo "   dylibbundler: llama-completion"
-  dylibbundler -of -b -x "$BIN_DIR/llama-completion-$TRIPLE" \
-    -d "$LIB_DIR/" -p "@executable_path/../Resources/libs/" \
-    -s /opt/homebrew/lib -s "$LLAMA_SRC" < /dev/null > /dev/null
+  for lb in llama-completion llama-server; do
+    echo "   dylibbundler: $lb"
+    dylibbundler -of -b -x "$BIN_DIR/$lb-$TRIPLE" \
+      -d "$LIB_DIR/" -p "@executable_path/../Resources/libs/" \
+      -s /opt/homebrew/lib -s "$LLAMA_SRC" < /dev/null > /dev/null
+  done
 fi
 
 echo "── 4/4 bit exécutable + re-signature ad-hoc (dylibbundler invalide les signatures)"

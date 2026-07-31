@@ -6,7 +6,7 @@
 //! dossiers standards de l'utilisateur (Bureau/Documents/Téléchargements —
 //! ceux qui existent) sont ajoutés automatiquement ; l'utilisateur peut en
 //! ajouter d'autres ou en retirer. Sync explicite → extraction markdown (via
-//! `crate::file_to_markdown`) mise en cache ; incrémental par mtime. Les
+//! `crate::file_to_source_text`) mise en cache ; incrémental par mtime. Les
 //! fichiers illisibles sont listés dans le rapport — jamais d'échec silencieux
 //! (ADR-0015). `dirs` (déjà une dépendance) résout Bureau/Documents/Téléchargements
 //! de façon identique sur Mac et Windows — aucun code spécifique par OS ici.
@@ -180,7 +180,7 @@ fn folder_name(root_str: &str) -> String {
 }
 
 fn file_to_conversation(root_str: &str, rel: &str, abs: &Path) -> Result<Conversation, String> {
-    let text = crate::file_to_markdown(abs)?;
+    let text = crate::file_to_source_text(abs)?;
     let (sub_path, title) = super::obsidian::rel_to_parts(rel);
     let folder = folder_name(root_str);
     // Préfixé par le nom du dossier racine : deux dossiers différents peuvent

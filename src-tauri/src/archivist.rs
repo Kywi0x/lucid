@@ -111,6 +111,13 @@ pub const CATCHALL_LABEL: &str = "Non triable";
 /// run précédent) ne le recrée pas — idempotent par construction.
 pub const CATCHALL_ID: &str = "arch-non-triable";
 
+/// Sources « à trier » (politique de structure, ADR-0020) : leur contenu est du
+/// vrac à ranger thématiquement, PAS une arbo à respecter. Leurs feuilles sont
+/// donc traitées comme candidates par l'Archiviste, où qu'elles soient placées.
+/// - `local-folder` : dumps Bureau/Documents/Téléchargements.
+/// - `apple-notes` : app de notes, pas de vraie hiérarchie (décision Liam 2026-07-30).
+const SORTABLE_CONNECTORS: &[&str] = &["local-folder", "apple-notes"];
+
 /// `true` si le bac "Non triable" n'existe pas encore dans ce graphe — à
 /// l'orchestrateur (lib.rs) de le créer avant le prochain passage.
 /// Peu importe le `kind` : une proposition "create" produit toujours un nœud
@@ -165,15 +172,17 @@ pub fn scan(graph: &BrainGraph) -> ScanResult {
         .filter_map(|n| n.parent_id.as_deref().map(|p| (n.id.as_str(), p)))
         .collect();
 
-    // Dossiers de scan brut : conteneurs sous la racine avec au moins une
-    // feuille locale quelque part en dessous.
+    // Dossiers de scan « à trier » : conteneurs sous la racine avec au moins une
+    // feuille d'une SOURCE À TRIER en dessous (local-folder, apple-notes… cf.
+    // SORTABLE_CONNECTORS / ADR-0020). Leur contenu est du vrac → candidat au
+    // rangement thématique ; le conteneur lui-même n'est jamais une cible.
     let scan_root_ids: HashSet<&str> = graph
         .nodes
         .iter()
         .filter(|c| c.kind == "container" && c.parent_id.as_deref() == root_id.as_deref())
         .filter(|c| {
             graph.nodes.iter().any(|n| {
-                n.connector.as_deref() == Some("local-folder")
+                n.connector.as_deref().is_some_and(|conn| SORTABLE_CONNECTORS.contains(&conn))
                     && ancestor_chain(&n.id, &parent_of).contains(&c.id.as_str())
             })
         })
@@ -395,6 +404,84 @@ fn cluster_catchall(graph: &BrainGraph, parent_id: Option<&str>, extra_ids: &Has
         for id in &fresh {
             assigned.insert(id.clone());
         }
+        out.push(ThemeCluster { label: title_case(&tok), node_ids: fresh });
+    }
+    out
+}
+
+/// 2ᵉ filet pour le contenu COURT (notes) que les embeddings ne savent pas
+/// clusterer (texte trop court → cohésion peu fiable, cf. session 2026-07-30 :
+/// 100 % des notes Apple tombaient en « Non triable »). Regroupe par ENTITÉ
+/// distinctive partagée (nom propre / mot rare) plutôt que par cohésion sémantique.
+///
+/// Garde-fous anti « Lyon → Projets » (l'échec de l'ancien clustering par mot) :
+/// 1. **Rareté (IDF)** — le terme doit être rare dans TOUT le corpus (`RARE_MAX`) :
+///    un mot fréquent (« facture », « projet », « design », « export ») ne regroupe JAMAIS.
+/// 2. **Nom propre** — présent avec une majuscule dans au moins un titre.
+/// 3. **`is_meaningful_word`** — ni hash hexadécimal, ni nombre.
+/// 4. **`MIN_CLUSTER`** (3) — au moins 3 pages.
+///
+/// Le label du thème = l'entité (title-case) → produit directement « Papiris ».
+/// Pur (pas d'I/O, pas de LLM) → testable, déterministe, rapide (ne tourne que
+/// sur les restes). ponytail: pas de garde de domaine ici (les 4 garde-fous
+/// ci-dessus suffisent sur du titre court) — à ajouter si des faux positifs
+/// inter-domaines apparaissent en usage réel.
+pub fn cluster_by_entity(graph: &BrainGraph, leftovers: &[(String, String)]) -> Vec<ThemeCluster> {
+    if leftovers.len() < MIN_CLUSTER {
+        return Vec::new();
+    }
+    // Fréquence documentaire de chaque token sur TOUT le corpus (base de l'IDF).
+    let mut corpus_df: HashMap<String, usize> = HashMap::new();
+    for nd in &graph.nodes {
+        for t in tokens(&nd.label) {
+            *corpus_df.entry(t).or_default() += 1;
+        }
+    }
+    // Un terme « distinctif » apparaît dans au plus RARE_MAX docs du corpus.
+    // ponytail: cap absolu simple ; passer en proportion du corpus si un gros
+    // cerveau fait remonter le seuil naturel des vrais clients au-dessus de 6.
+    const RARE_MAX: usize = 6;
+
+    // Indice de NOM PROPRE : capitalisé dans la MAJORITÉ (≥ 60 %) de ses
+    // occurrences dans TOUT le corpus. Un vrai nom propre (« Papiris ») est quasi
+    // toujours en majuscule ; un mot courant (« prix », « site », « plan »)
+    // apparaît autant en minuscule → écarté, même s'il est rare par hasard.
+    // (Correctif du faux positif « Prix », session 2026-07-30.)
+    let mut tok_total: HashMap<String, usize> = HashMap::new();
+    let mut tok_cap: HashMap<String, usize> = HashMap::new();
+    for nd in &graph.nodes {
+        for raw in nd.label.split(|c: char| !c.is_alphanumeric()) {
+            if raw.chars().count() <= 2 { continue; }
+            *tok_total.entry(raw.to_lowercase()).or_default() += 1;
+            if raw.chars().next().is_some_and(|c| c.is_uppercase()) {
+                *tok_cap.entry(raw.to_lowercase()).or_default() += 1;
+            }
+        }
+    }
+    let is_proper = |t: &str| {
+        let total = tok_total.get(t).copied().unwrap_or(0);
+        total > 0 && tok_cap.get(t).copied().unwrap_or(0) * 5 >= total * 3 // ≥ 60 %
+    };
+
+    // token distinctif → ids des restes qui le portent.
+    let mut by_token: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, label) in leftovers {
+        for t in tokens(label) {
+            if CLUSTER_STOPWORDS.contains(&t.as_str()) || !is_meaningful_word(&t) { continue; }
+            if !is_proper(&t) { continue; }                                         // nom propre (majoritairement capitalisé)
+            if corpus_df.get(&t).copied().unwrap_or(0) > RARE_MAX { continue; }      // rareté (IDF)
+            by_token.entry(t).or_default().push(id.clone());
+        }
+    }
+
+    // Plus gros groupes d'abord ; chaque id rejoint au plus un groupe.
+    let mut cands: Vec<(String, Vec<String>)> = by_token.into_iter().collect();
+    cands.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+    let mut assigned: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for (tok, ids) in cands {
+        let fresh: Vec<String> = ids.into_iter().filter(|id| assigned.insert(id.clone())).collect();
+        if fresh.len() < MIN_CLUSTER { continue; }
         out.push(ThemeCluster { label: title_case(&tok), node_ids: fresh });
     }
     out
@@ -1268,6 +1355,34 @@ mod tests {
         let mut n = node(id, label, "leaf", Some(parent));
         n.connector = Some("local-folder".into());
         n
+    }
+
+    #[test]
+    fn cluster_by_entity_groupe_entite_rare_pas_mot_frequent() {
+        let mut nodes = Vec::new();
+        // "Facture" fréquent dans le corpus (7 docs) → générique, doit être écarté.
+        for i in 0..7 { nodes.push(node(&format!("f{i}"), &format!("Facture {i}"), "note", None)); }
+        // 3 notes courtes partageant l'entité RARE "Papiris" (nom propre).
+        nodes.push(node("p1", "Papiris design", "note", None));
+        nodes.push(node("p2", "KPI Papiris", "note", None));
+        nodes.push(node("p3", "Papiris (Design)", "note", None));
+        // 3 notes partageant le mot FRÉQUENT "Facture" → ne doit PAS grouper (rareté).
+        nodes.push(node("g1", "Facture eau", "note", None));
+        nodes.push(node("g2", "Facture gaz", "note", None));
+        nodes.push(node("g3", "Facture edf", "note", None));
+        // 3 notes partageant le mot COURANT "prix" en casse mixte (1 Maj / 2 min)
+        // → rare mais PAS un nom propre → doit être écarté (correctif faux positif).
+        nodes.push(node("x1", "Prix maison", "note", None));
+        nodes.push(node("x2", "prix communes", "note", None));
+        nodes.push(node("x3", "le prix", "note", None));
+        let g = graph(nodes);
+        let leftovers: Vec<(String, String)> = ["p1", "p2", "p3", "g1", "g2", "g3", "x1", "x2", "x3"].iter()
+            .map(|id| (id.to_string(), g.nodes.iter().find(|n| n.id == *id).unwrap().label.clone()))
+            .collect();
+        let clusters = super::cluster_by_entity(&g, &leftovers);
+        assert_eq!(clusters.len(), 1, "seule l'entité rare Papiris doit grouper (ni Facture ni prix)");
+        assert_eq!(clusters[0].label, "Papiris");
+        assert_eq!(clusters[0].node_ids.len(), 3);
     }
 
     #[test]

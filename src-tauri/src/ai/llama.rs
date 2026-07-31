@@ -277,13 +277,22 @@ pub fn quiet_command(bin: impl AsRef<std::ffi::OsStr>) -> Command {
 /// sémantique), plusieurs minutes en tout ; sans ça, ce calcul intensif affame
 /// les autres threads de l'app — dont le rendu du canvas, qui se met à ramer/
 /// geler pendant que "L'archiviste travaille…" (retour de Liam le 2026-07-23).
-/// `nice` (POSIX, toujours présent) sur Mac/Linux. Pas d'équivalent simple sans
-/// dépendance sur Windows — dégradé gracieusement là-bas (parité : jamais un
-/// échec silencieux, juste un peu plus de contention, jamais pire qu'avant).
+/// `nice` (POSIX, toujours présent) sur Mac/Linux. Sur Windows, l'équivalent
+/// zéro-dépendance : un *priority class flag* dans `creation_flags` (le même
+/// canal que `CREATE_NO_WINDOW`) — `BELOW_NORMAL_PRIORITY_CLASS` fait que
+/// l'ordonnanceur cède le CPU aux apps de premier plan de l'user pendant qu'une
+/// passe de l'Archiviste tourne (retour Liam 2026-07-30 : sur Windows la machine
+/// ralentissait ses autres tâches — la branche Windows était un no-op, elle ne
+/// baissait rien). Parité tenue : plus jamais "pire qu'avant".
 fn low_priority_command(bin: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(target_os = "windows")]
     {
-        quiet_command(bin)
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        let mut cmd = Command::new(bin);
+        cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+        cmd
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -326,13 +335,33 @@ fn total_ram_gb() -> f32 {
     })
 }
 
-/// ID du modèle recommandé selon la RAM : le plus grand qui tient confortablement.
+/// Réserve RAM avant de choisir le modèle de génération : le serveur de
+/// génération ET le serveur d'embedding (BGE-M3) tournent EN MÊME TEMPS, plus
+/// l'app/WebView2. Sans cette marge, sur une machine 8 Go la RAM saturait à 98 %
+/// (test Windows de Liam, 2026-07-30). ~2,5 Go = BGE-M3 chargé (~1 Go de working
+/// set) + overhead app.
+const COMPANION_RESERVE_GB: f32 = 2.5;
+
+/// Modèles de génération à tenter, du plus performant (le plus gros qui tient en
+/// RAM après réserve) au moins performant — chaîne de secours du bootstrap : si
+/// un téléchargement échoue, on descend au suivant. Toujours au moins un élément
+/// (le plus petit du catalogue) même si rien ne tient confortablement — mieux
+/// vaut tenter le plus léger que ne rien proposer.
+pub fn recommended_chain(catalog: &[ModelDef]) -> Vec<String> {
+    let budget = total_ram_gb() - COMPANION_RESERVE_GB;
+    let mut fit: Vec<&ModelDef> = catalog.iter().filter(|m| m.min_ram_gb <= budget).collect();
+    // Plus gros d'abord (proxy de qualité), départage stable par id.
+    fit.sort_by(|a, b| b.size_gb.partial_cmp(&a.size_gb).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
+    let mut ids: Vec<String> = fit.iter().map(|m| m.id.clone()).collect();
+    if ids.is_empty() {
+        if let Some(m) = catalog.first() { ids.push(m.id.clone()); } // rien ne tient → le plus petit
+    }
+    ids
+}
+
+/// ID du modèle recommandé : la tête de la chaîne (le plus performant qui tient).
 pub fn recommended_id(catalog: &[ModelDef]) -> Option<String> {
-    let ram = total_ram_gb();
-    catalog.iter()
-        .filter(|m| m.min_ram_gb <= ram)
-        .last()
-        .map(|m| m.id.clone())
+    recommended_chain(catalog).into_iter().next()
 }
 
 /// Lit le modèle actif depuis `model_config.json` (inclut l'URL complète).
@@ -396,11 +425,10 @@ pub struct DownloadProgress {
     pub percent: u8,
 }
 
-/// Télécharge le modèle actif (URL depuis le catalogue en cache, CDN GPT4All).
-pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
-    let m = active_model_stored()
-        .ok_or("Aucun modèle sélectionné. Choisis un modèle d'abord.")?;
-    let dest = shared_data_dir().ok_or("Dossier de données introuvable.")?.join("models").join(&m.file);
+/// Télécharge une URL vers `dest` en émettant "download-progress" (idempotent :
+/// no-op si le fichier est déjà là). Core partagé par le modèle de génération et
+/// le modèle d'embedding — même boucle, même barre de progression côté UI.
+fn download_file(app: &tauri::AppHandle, url: &str, dest: &Path) -> Result<(), String> {
     if dest.is_file() { return Ok(()); }
     std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
 
@@ -410,12 +438,12 @@ pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    let mut resp = client.get(&m.url)
+    let mut resp = client.get(url)
         .send()
         .map_err(|e| format!("Téléchargement échoué : {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("Erreur {} pour {}", resp.status(), m.url));
+        return Err(format!("Erreur {} pour {url}", resp.status()));
     }
 
     let total = resp.content_length().unwrap_or(0);
@@ -443,7 +471,22 @@ pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
         }
     }
     drop(file);
-    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())
+    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
+}
+
+/// Télécharge le modèle actif (URL depuis le catalogue en cache, CDN GPT4All).
+pub fn download_model(app: &tauri::AppHandle) -> Result<(), String> {
+    let m = active_model_stored()
+        .ok_or("Aucun modèle sélectionné. Choisis un modèle d'abord.")?;
+    let dest = shared_data_dir().ok_or("Dossier de données introuvable.")?.join("models").join(&m.file);
+    download_file(app, &m.url, &dest)
+}
+
+/// Télécharge le modèle d'embedding BGE-M3 (HuggingFace). Jamais proposé au
+/// choix : un seul modèle d'embedding, tiré automatiquement au bootstrap.
+pub fn download_embed_model(app: &tauri::AppHandle) -> Result<(), String> {
+    let dest = shared_data_dir().ok_or("Dossier de données introuvable.")?.join("models").join(EMBED_MODEL_FILE);
+    download_file(app, EMBED_MODEL_URL, &dest)
 }
 
 // ── Installation depuis un fichier local ──────────────────────────────────────
@@ -495,6 +538,20 @@ pub fn install_from_path(app: &tauri::AppHandle, src: &std::path::Path) -> Resul
 // juste moins performant qu'avec le serveur).
 const SERVER_PORT: u16 = 8721; // ponytail: port fixe, un seul serveur pour toute l'app — pas de découverte dynamique tant qu'un seul modèle actif à la fois suffit.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fichiers stderr des serveurs (dossier machine) — un crash au démarrage
+/// (SIGABRT, flag/modèle incompatible, Metal…) partait dans /dev/null et était
+/// TOTALEMENT invisible ; on le capture pour le Diagnostic (retour bêta 2026-07-30).
+pub const GEN_SERVER_LOG: &str = "llama-server.log";
+pub const EMBED_SERVER_LOG: &str = "llama-embed.log";
+
+/// stderr d'un llama-server → `<data>/<name>` (tronqué à chaque démarrage), au
+/// lieu de /dev/null. Retombe sur null si le fichier n'est pas créable.
+fn server_stderr(name: &str) -> std::process::Stdio {
+    shared_data_dir()
+        .and_then(|d| std::fs::File::create(d.join(name)).ok())
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(std::process::Stdio::null)
+}
 
 struct ServerProc {
     child: std::process::Child,
@@ -610,7 +667,7 @@ fn ensure_server(binary: &Path, model: &Path) -> Option<String> {
         .args(["--port", &SERVER_PORT.to_string()])
         .args(["--api-key", &token]) // sans ça : CORS ouvert + pas d'auth (avertissement llama-server)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(server_stderr(GEN_SERVER_LOG));
     let child = cmd.spawn().ok()?;
     let mut proc = ServerProc { child, model: model.to_path_buf(), token: token.clone() };
     let started = Instant::now();
@@ -685,6 +742,16 @@ pub fn resolve_embed_model() -> Option<PathBuf> {
 
 pub fn embed_model_available() -> bool { resolve_embed_model().is_some() }
 
+// ── Statut de la stack (pour le panneau Diagnostic, D) ──────────────────────
+/// Binaire de génération (`llama-completion`) résolu ?
+pub fn completion_binary_available() -> bool { resolve_binary().is_some() }
+/// Binaire serveur (`llama-server`) résolu ? Requis pour serveur persistant + embeddings.
+pub fn server_binary_available() -> bool { resolve_server_binary().is_some() }
+/// Modèle de génération actif présent sur le disque ?
+pub fn generation_model_available() -> bool { resolve_model().is_some() }
+/// RAM totale détectée (Go) — exposée pour le diagnostic.
+pub fn detected_ram_gb() -> f32 { total_ram_gb() }
+
 /// Démarre (ou réutilise) le serveur d'embedding. `None` si binaire ou modèle
 /// absent, ou démarrage échoué. Renvoie la clé d'API.
 fn ensure_embed_server() -> Option<String> {
@@ -717,7 +784,7 @@ fn ensure_embed_server() -> Option<String> {
         .args(["--port", &EMBED_PORT.to_string()])
         .args(["--api-key", &token])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(server_stderr(EMBED_SERVER_LOG));
     let mut proc = cmd.spawn().ok().map(|child| ServerProc { child, model: model.clone(), token: token.clone() })?;
     let started = Instant::now();
     while started.elapsed() < SERVER_STARTUP_TIMEOUT {
@@ -777,16 +844,34 @@ fn embed_one(token: &str, text: &str) -> Result<Vec<f32>, String> {
     }
 }
 
-/// Embeddings d'une liste de textes (un appel par texte — le serveur persistant
-/// garde le modèle chargé, donc chaque appel est rapide ; on optimisera en batch
-/// si besoin). Renvoie une erreur claire si le moteur n'est pas prêt.
+/// Requêtes d'embedding en vol simultanément. `llama-server` sert plusieurs
+/// slots en parallèle (4 visibles dans `llama-embed.log`) : les envoyer une par
+/// une en attendant chaque réponse laissait les autres slots inoccupés pendant
+/// tout l'indexage initial (231 documents en série, ~3 min — le run à froid que
+/// Liam rejoue à chaque test, 2026-07-31). On ne change NI le modèle NI le
+/// texte envoyé : les vecteurs sont identiques, seul l'ordonnancement change.
+const EMBED_PARALLEL: usize = 4;
+
+/// Embeddings d'une liste de textes, par vagues de `EMBED_PARALLEL` requêtes
+/// concurrentes. L'ordre de sortie suit l'ordre d'entrée (l'appelant associe par
+/// index). Renvoie une erreur claire si le moteur n'est pas prêt.
 pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() { return Ok(Vec::new()); }
     let token = ensure_embed_server()
         .ok_or("Moteur d'embedding indisponible (modèle BGE-M3 absent ou serveur non démarré).")?;
     let mut out = Vec::with_capacity(texts.len());
-    for t in texts {
-        out.push(embed_one(&token, t)?);
+    for chunk in texts.chunks(EMBED_PARALLEL) {
+        let results: Vec<Result<Vec<f32>, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk.iter()
+                .map(|t| s.spawn(|| embed_one(&token, t)))
+                .collect();
+            handles.into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("thread d'embedding interrompu".into())))
+                .collect()
+        });
+        // `?` après la vague, pas pendant : les threads sont déjà joints, on ne
+        // laisse jamais une requête en vol derrière soi.
+        for r in results { out.push(r?); }
     }
     Ok(out)
 }

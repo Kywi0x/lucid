@@ -50,6 +50,10 @@ Expand-Archive $zip -DestinationPath $out
 $cli = Get-ChildItem -Recurse -Path $out -Filter "llama-cli.exe" | Select-Object -First 1
 if (-not $cli) { throw "llama-cli.exe introuvable dans l'archive llama.cpp." }
 Copy-Item $cli.FullName "$BinDir/llama-completion-$Triple.exe"
+# llama-server.exe (même archive, mêmes DLL) : serveur persistant + embeddings.
+$srv = Get-ChildItem -Recurse -Path $out -Filter "llama-server.exe" | Select-Object -First 1
+if (-not $srv) { throw "llama-server.exe introuvable dans l'archive llama.cpp." }
+Copy-Item $srv.FullName "$BinDir/llama-server-$Triple.exe"
 # DLL runtime (ggml*, llama…) à poser à côté de l'exe via resources (glob *.dll).
 Get-ChildItem -Path $cli.DirectoryName -Filter "*.dll" | ForEach-Object {
     Copy-Item $_.FullName (Join-Path $LibDir $_.Name)

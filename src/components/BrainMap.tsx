@@ -549,10 +549,16 @@ export function BrainMap({
   };
 
   // Refit caméra au chargement / à chaque régénération.
+  // Re-fit (recentrage) UNIQUEMENT sur un changement explicite de `revealKey`
+  // (1er chargement, génération manuelle, restauration, ouverture d'un space) —
+  // PAS sur `maxR` : quand le cerveau grossit en fond (auto-régé d'une session
+  // Claude Code active, sync connecteur…), `maxR` change et re-fittait la vue
+  // sous l'utilisateur → recentrage/micro-freeze désagréable et périodique
+  // (retour Liam 2026-07-30). Un refresh de fond préserve désormais le pan/zoom.
   useEffect(() => {
     dragOffsets.current.clear();
     needsFit.current = true;
-  }, [revealKey, maxR]);
+  }, [revealKey]);
 
   // Détecte les nœuds fraîchement apparus (proposition MCP, import, note…) et
   // programme leur « pop » en cascade depuis leur parent. Ignoré au premier

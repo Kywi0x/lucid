@@ -20,8 +20,12 @@ macro_rules! elog {
 
 /// Écriture best-effort dans `<dossier machine>/lucid.log` — jamais bloquant,
 /// jamais de panique si le dossier est absent ou le fichier verrouillé.
-/// ponytail: pas de rotation ; à ajouter si le fichier devient gênant en taille
-/// (aucun signe que ce soit le cas avec ~35 sites d'appel, tous best-effort).
+/// Plafond de taille : une boucle de log (bug `arch-merge` du 2026-07-28 :
+/// 14,3 M de lignes = 1,37 Go sur le disque de Liam) ne doit plus pouvoir
+/// remplir le disque. Au-delà du plafond on repart à zéro — un log de
+/// diagnostic, pas une archive.
+const LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
 pub fn log_to_file(msg: &str) {
     use std::io::Write as _;
     let Some(dir) = ai::llama::shared_data_dir() else { return };
@@ -29,7 +33,14 @@ pub fn log_to_file(msg: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("lucid.log")) {
+    let path = dir.join("lucid.log");
+    let too_big = std::fs::metadata(&path).map(|m| m.len() > LOG_MAX_BYTES).unwrap_or(false);
+    let opened = if too_big {
+        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path)
+    } else {
+        std::fs::OpenOptions::new().create(true).append(true).open(&path)
+    };
+    if let Ok(mut f) = opened {
         let _ = writeln!(f, "[{secs}] {msg}");
     }
 }
@@ -372,7 +383,20 @@ struct EmbedEntry { sig: String, vec: Vec<f32> }
 
 fn embed_cache_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_embeddings.json") }
 
-fn embed_sig(n: &BrainNode) -> String { format!("{}:{}", n.updated_at.unwrap_or(0), n.source_text.len()) }
+/// Signature = empreinte du TEXTE réellement embeddé, jamais `updated_at`.
+/// L'estampille bouge dès qu'un CHAMP du nœud change — or l'Archiviste
+/// DÉPLACE les documents qu'il range (`parent_id` → nouvelle estampille) :
+/// keyer dessus invalidait tout le cache à chaque passe, donc ré-embeddait et
+/// re-taggait les ~230 documents à chaque fois (~6 min de GPU à fond pour une
+/// seule note neuve, plus la surchauffe — diagnostiqué le 2026-07-31 sur les
+/// logs de Liam : « 231 nouveau(x) vecteur(s), 0 déjà en cache » à CHAQUE run).
+/// Sur le texte, un déplacement ne change rien : le cache tient.
+fn embed_sig(n: &BrainNode) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(embed_text(n).as_bytes());
+    format!("{:x}", h.finalize())
+}
 fn embed_text(n: &BrainNode) -> String {
     let content = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
     format!("{}\n{}", n.label, content)
@@ -403,6 +427,7 @@ fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> std::colle
         }
     }
     if !todo_texts.is_empty() {
+        let started = std::time::Instant::now();
         match ai::llama::embed_texts(&todo_texts) {
             Ok(vecs) => {
                 for (i, id) in todo_ids.iter().enumerate() {
@@ -411,7 +436,12 @@ fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> std::colle
                     }
                 }
                 if let Ok(json) = serde_json::to_string(&cache) { let _ = std::fs::write(embed_cache_path(dir), json); }
-                crate::elog!("🗂️ embeddings: {} nouveau(x) vecteur(s), {} déjà en cache.", todo_texts.len(), nodes.len().saturating_sub(todo_texts.len()));
+                // Débit affiché : le run à froid est rejoué à chaque test de Liam,
+                // il faut pouvoir comparer deux versions sans chronomètre à la main.
+                let secs = started.elapsed().as_secs_f32();
+                crate::elog!("🗂️ embeddings: {} nouveau(x) vecteur(s) en {:.0}s ({:.2}s/doc), {} déjà en cache.",
+                    todo_texts.len(), secs, secs / todo_texts.len() as f32,
+                    nodes.len().saturating_sub(todo_texts.len()));
             }
             Err(e) => crate::elog!("🗂️ embeddings indisponibles ({e})."),
         }
@@ -465,6 +495,117 @@ fn domain_tags_cached(dir: &std::path::Path, nodes: &[&BrainNode], engine: Optio
     nodes.iter()
         .filter_map(|n| cache.get(&n.id).map(|d| (n.id.clone(), d.domain.clone())))
         .collect()
+}
+
+// ── Cache des NOMS de thèmes (stabilité entre deux passes) ───────────────────
+// Gemma nomme librement, et par échantillonnage (temp 0.2) : deux passes sur le
+// MÊME groupe de documents rendaient deux noms différents. Comme l'id du dossier
+// est dérivé du nom (`arch-theme-<label>`), un renommage ne renomme pas — il crée
+// un dossier JUMEAU à côté de l'ancien (« Données Communales France » ET « Données
+// Géographiques Communes » pour les mêmes fichiers, remonté par Liam le
+// 2026-07-31 : « le tri se fait pareil mais le nom des catégories change »).
+// On mémorise donc le nom par COMPOSITION du groupe : même ensemble de documents
+// → même nom, sans appel Gemma. Un groupe qui gagne ou perd quelques documents
+// reste reconnu par recouvrement, sinon le moindre ajout relancerait le nommage.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ClusterName { members: Vec<String>, name: String }
+
+fn cluster_names_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("archivist_cluster_names.json")
+}
+
+fn load_cluster_names(dir: &std::path::Path) -> Vec<ClusterName> {
+    std::fs::read_to_string(cluster_names_path(dir)).ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default()
+}
+
+/// Recouvrement minimal (Jaccard) pour considérer que c'est LE MÊME groupe qu'à
+/// la passe précédente. 0.6 = le groupe peut gagner/perdre ~1 document sur 3 et
+/// garder son nom ; en dessous, c'est un autre groupe et il mérite son nom.
+const CLUSTER_RENAME_OVERLAP: f32 = 0.6;
+
+fn recall_cluster_name(cache: &[ClusterName], members: &[String]) -> Option<String> {
+    let set: std::collections::HashSet<&str> = members.iter().map(String::as_str).collect();
+    let mut best: Option<(f32, &str)> = None;
+    for entry in cache {
+        let prev: std::collections::HashSet<&str> = entry.members.iter().map(String::as_str).collect();
+        let inter = set.intersection(&prev).count() as f32;
+        let union = set.union(&prev).count() as f32;
+        if union == 0.0 { continue; }
+        let j = inter / union;
+        if j >= CLUSTER_RENAME_OVERLAP && best.map(|(bj, _)| j > bj).unwrap_or(true) {
+            best = Some((j, entry.name.as_str()));
+        }
+    }
+    best.map(|(_, name)| name.to_string())
+}
+
+/// Enregistre (ou rafraîchit) la composition associée à un nom — le groupe
+/// mémorisé suit ainsi les documents qui s'y ajoutent au fil des passes.
+fn remember_cluster_name(cache: &mut Vec<ClusterName>, members: &[String], name: &str) {
+    cache.retain(|e| e.name != name);
+    cache.push(ClusterName { members: members.to_vec(), name: name.to_string() });
+}
+
+// ── Cache des décisions de fusion ────────────────────────────────────────────
+// `decide_group` = un appel Gemma par groupe de titres en doublon, à CHAQUE
+// passe. Tant que Liam n'a pas accepté les fusions proposées, les doublons
+// restent dans le cerveau, le scan les retrouve et Gemma re-décide exactement la
+// même chose — ~20 appels de plus par passe, indéfiniment (le ventilateur qu'il
+// entend après chaque run). Un groupe est identifié par SES pages : mêmes pages
+// → même décision, déjà prise. `ParseFailed` n'est jamais mémorisé (ce n'est pas
+// une décision, c'est un échec : il faut le retenter).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct MergeDecision { members: Vec<String>, survivor: String, dropped: Vec<String>, reason: String }
+
+fn merge_decisions_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("archivist_merge_decisions.json")
+}
+
+fn load_merge_decisions(dir: &std::path::Path) -> std::collections::HashMap<String, MergeDecision> {
+    std::fs::read_to_string(merge_decisions_path(dir)).ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default()
+}
+
+fn group_key(node_ids: &[String]) -> String {
+    let mut ids: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids.join("|")
+}
+
+/// `decide_group` avec mémoire. `survivor` vide = « garder séparées » (mémorisé
+/// aussi : une non-fusion re-jugée à chaque passe coûte autant qu'une fusion).
+fn decide_group_cached(
+    engine: &LlamaEngine,
+    group: &archivist::DuplicateGroup,
+    graph: &BrainGraph,
+    cache: &mut std::collections::HashMap<String, MergeDecision>,
+) -> archivist::GroupOutcome {
+    let key = group_key(&group.node_ids);
+    if let Some(d) = cache.get(&key) {
+        return if d.survivor.is_empty() {
+            archivist::GroupOutcome::KeepSeparate { reason: d.reason.clone() }
+        } else {
+            archivist::GroupOutcome::Merge(archivist::GroupDecision {
+                survivor_id: d.survivor.clone(),
+                dropped_ids: d.dropped.clone(),
+                reason: d.reason.clone(),
+            })
+        };
+    }
+    let outcome = archivist::decide_group(engine, group, graph);
+    match &outcome {
+        archivist::GroupOutcome::Merge(d) => { cache.insert(key, MergeDecision {
+            members: group.node_ids.clone(), survivor: d.survivor_id.clone(),
+            dropped: d.dropped_ids.clone(), reason: d.reason.clone() }); }
+        archivist::GroupOutcome::KeepSeparate { reason } => { cache.insert(key, MergeDecision {
+            members: group.node_ids.clone(), survivor: String::new(),
+            dropped: Vec::new(), reason: reason.clone() }); }
+        archivist::GroupOutcome::ParseFailed { .. } => {} // pas une décision → à retenter
+    }
+    outcome
 }
 
 /// Similarité au centroïde (moyenne des vecteurs d'un groupe). Le centroïde n'a
@@ -561,6 +702,8 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     // thèmes, nommés par Gemma (§⑤). Le clustering fin (quel client) reste fait par
     // l'embedding À L'INTÉRIEUR de chaque domaine.
     let rest: Vec<&(String, String)> = pool.iter().filter(|(id, _)| !anchored.contains(id) && vecs.contains_key(id)).collect();
+    let mut name_cache = load_cluster_names(dir);
+    let mut reused = 0usize;
     let mut by_domain: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
     for (i, (id, _)) in rest.iter().enumerate() { by_domain.entry(domain_of(id)).or_default().push(i); }
     for (_dom, idxs) in &by_domain {
@@ -569,24 +712,36 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
         for g in archivist::cluster_indices(&sub_vecs) {
             if g.len() < 3 { continue; }
             let global: Vec<usize> = g.iter().map(|&li| idxs[li]).collect();
-            // Échantillons = titre + extrait de CONTENU : le nommage peut ainsi
-            // repérer un client/entreprise récurrent (« Parabola ») que le titre
-            // seul (« Invoice-14545AA1-… ») ne révèle jamais.
-            let samples: Vec<String> = global.iter().take(12).map(|&i| {
-                let (id, label) = (&rest[i].0, &rest[i].1);
-                let snippet = by_id.get(id.as_str()).map(|n| {
-                    let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
-                    raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect::<String>()
-                }).unwrap_or_default();
-                if snippet.is_empty() { label.clone() } else { format!("{label} — {snippet}") }
-            }).collect();
-            let Some(label) = engine.and_then(|e| archivist::ai_name_cluster(e, &samples)) else { continue; };
             let node_ids: Vec<String> = global.iter().map(|&i| rest[i].0.clone()).collect();
+            // Déjà nommé à une passe précédente ? On reprend le nom tel quel —
+            // pas d'appel Gemma, donc pas de dossier jumeau.
+            let label = match recall_cluster_name(&name_cache, &node_ids) {
+                Some(known) => { reused += 1; known }
+                None => {
+                    // Échantillons = titre + extrait de CONTENU : le nommage peut ainsi
+                    // repérer un client/entreprise récurrent (« Parabola ») que le titre
+                    // seul (« Invoice-14545AA1-… ») ne révèle jamais.
+                    let samples: Vec<String> = global.iter().take(12).map(|&i| {
+                        let (id, label) = (&rest[i].0, &rest[i].1);
+                        let snippet = by_id.get(id.as_str()).map(|n| {
+                            let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
+                            raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect::<String>()
+                        }).unwrap_or_default();
+                        if snippet.is_empty() { label.clone() } else { format!("{label} — {snippet}") }
+                    }).collect();
+                    let Some(fresh) = engine.and_then(|e| archivist::ai_name_cluster(e, &samples)) else { continue; };
+                    fresh
+                }
+            };
+            remember_cluster_name(&mut name_cache, &node_ids, &label);
             plan.clusters.push(archivist::ThemeCluster { label, node_ids });
         }
     }
-    crate::elog!("🗂️ embed_organize: {} ancré(s) sur l'existant, {} nouveau(x) thème(s) (par domaine).",
-        plan.anchors.len(), plan.clusters.len());
+    if let Ok(json) = serde_json::to_string(&name_cache) {
+        let _ = std::fs::write(cluster_names_path(dir), json);
+    }
+    crate::elog!("🗂️ embed_organize: {} ancré(s) sur l'existant, {} thème(s) (dont {} noms repris du cache).",
+        plan.anchors.len(), plan.clusters.len(), reused);
     plan
 }
 
@@ -758,6 +913,23 @@ fn run_archivist_scan_once_in_progress(
         }
     }
 
+    // 2ᵉ filet — regroupement par ENTITÉ distinctive sur les restes que les
+    // embeddings n'ont pas su clusterer (notes courtes : titre parlant mais
+    // contenu trop court pour une cohésion fiable, cf. session 2026-07-30).
+    // Rareté (IDF) + nom propre + MIN 3 → produit ex. « Papiris » sans refaire
+    // le « Lyon → Projets » de l'ancien clustering par mot.
+    {
+        let leftover_now: Vec<(String, String)> = ai_pool.iter()
+            .filter(|(id, _)| !ai_clustered.contains(id))
+            .cloned()
+            .collect();
+        for cluster in archivist::cluster_by_entity(&graph, &leftover_now) {
+            for id in &cluster.node_ids { ai_clustered.insert(id.clone()); }
+            apply_theme_cluster(&cluster, &mut n, &mut report)?;
+            capture_theme(&mut created_themes, &cluster);
+        }
+    }
+
     // Bac "Non triable" : ce qui reste après le tri mécanique ET la passe IA.
     // Crée le bac s'il n'existe pas encore, ou route vers son id réel
     // (`result.catchall_id`, peut différer de la constante — dossier créé
@@ -861,10 +1033,11 @@ fn run_archivist_scan_once_in_progress(
     }
 
     let total_groups = result.groups.len();
+    let mut merge_cache = load_merge_decisions(dir);
     for (gi, group) in result.groups.iter().enumerate() {
         on_progress(gi + 1, total_groups);
         match &engine {
-            Some(e) => match archivist::decide_group(e, group, &graph) {
+            Some(e) => match decide_group_cached(e, group, &graph, &mut merge_cache) {
                 archivist::GroupOutcome::Merge(d) => {
                     let mut ids = vec![d.survivor_id.clone()];
                     ids.extend(d.dropped_ids.clone());
@@ -896,6 +1069,9 @@ fn run_archivist_scan_once_in_progress(
                 group.label, group.node_ids.len()
             )),
         }
+    }
+    if let Ok(json) = serde_json::to_string(&merge_cache) {
+        let _ = std::fs::write(merge_decisions_path(dir), json);
     }
 
     // ─── Couche entités : relie les documents à leurs sociétés/clients ──────────
@@ -1003,6 +1179,53 @@ mod archivist_orchestration_tests {
             "id": id, "label": label, "kind": "note", "weight": 1, "parent_id": parent
         }))
         .unwrap()
+    }
+
+    /// Régression du 2026-07-31 : Gemma renommait le même groupe à chaque passe,
+    /// et comme l'id du dossier vient du nom, ça créait un dossier jumeau au lieu
+    /// de réutiliser l'existant. Le nom doit tenir tant que le groupe est
+    /// reconnaissable, et changer seulement quand c'est un autre groupe.
+    #[test]
+    fn le_nom_dun_theme_tient_entre_deux_passes_meme_si_le_groupe_bouge_un_peu() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut cache = Vec::new();
+        let groupe = ids(&["a", "b", "c", "d", "e"]);
+        remember_cluster_name(&mut cache, &groupe, "Factures Parabola");
+
+        assert_eq!(recall_cluster_name(&cache, &groupe).as_deref(), Some("Factures Parabola"),
+            "groupe identique → même nom, aucun appel Gemma");
+        // Une facture de plus, une retirée : toujours le même dossier.
+        assert_eq!(recall_cluster_name(&cache, &ids(&["a", "b", "c", "d", "f"])).as_deref(),
+            Some("Factures Parabola"), "le groupe a bougé d'un document, pas d'identité");
+        // Groupe sans rapport : il doit être nommé pour lui-même.
+        assert_eq!(recall_cluster_name(&cache, &ids(&["x", "y", "z"])), None,
+            "un autre groupe ne doit jamais hériter d'un nom existant");
+
+        // Le groupe suit ses documents : après renommage de la composition, un
+        // ancien membre isolé ne rappelle plus le nom.
+        remember_cluster_name(&mut cache, &ids(&["a", "b", "c", "d", "f"]), "Factures Parabola");
+        assert_eq!(cache.len(), 1, "un nom = une seule entrée, pas d'accumulation");
+    }
+
+    /// Régression du 2026-07-31 : `embed_sig` keyé sur `updated_at` invalidait
+    /// TOUT le cache à chaque passe, parce que l'Archiviste déplace les docs
+    /// qu'il range (nouveau parent → nouvelle estampille). Résultat : ~230
+    /// embeddings + ~230 tags Gemma refaits à chaque run, ~6 min de GPU pour
+    /// une seule note neuve. La signature doit suivre le TEXTE, rien d'autre.
+    #[test]
+    fn la_signature_dembedding_survit_a_un_deplacement_mais_pas_a_un_changement_de_texte() {
+        let mut n = note("doc-1", "arch-non-triable", "Devis toiture");
+        n.source_text = "Devis pour la réfection de la toiture.".into();
+        let before = embed_sig(&n);
+
+        // L'Archiviste le range ailleurs et le graphe le ré-estampille.
+        n.parent_id = Some("arch-theme-travaux".into());
+        n.updated_at = Some(n.updated_at.unwrap_or(0) + 9_999);
+        assert_eq!(embed_sig(&n), before, "un déplacement ne doit pas invalider le vecteur");
+
+        // Le contenu change réellement → le vecteur doit être refait.
+        n.source_text.push_str(" Montant révisé : 12 000 €.");
+        assert_ne!(embed_sig(&n), before, "un texte modifié doit invalider le vecteur");
     }
 
     // NOTE (2026-07-29, ADR-0019) : les anciens tests du clustering thématique
@@ -1121,6 +1344,55 @@ async fn download_model(app: tauri::AppHandle, model_id: String) -> Result<(), S
     tauri::async_runtime::spawn_blocking(move || ai::llama::download_model(&app))
         .await
         .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Bootstrap IA au 1er lancement : télécharge AUTOMATIQUEMENT le modèle de
+/// génération recommandé (chaîne de secours par RAM décroissante si un DL
+/// échoue) puis le modèle d'embedding — zéro choix utilisateur (le choix manuel
+/// reste dans les Réglages). Émet "bootstrap-step" { step, total, label } avant
+/// chaque phase ; la barre de progression suit "download-progress".
+#[tauri::command]
+async fn ai_bootstrap(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || bootstrap_blocking(&app))
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+fn bootstrap_blocking(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::Emitter;
+    let catalog = ai::llama::load_catalog();
+    let chain = ai::llama::recommended_chain(&catalog);
+    if chain.is_empty() {
+        return Err("Catalogue de modèles indisponible (connexion requise au 1er lancement).".into());
+    }
+    let name_of = |id: &str| catalog.iter().find(|m| m.id == id).map(|m| m.name.clone()).unwrap_or_else(|| id.to_string());
+
+    // 1. Modèle de génération : on descend la chaîne jusqu'à un DL réussi.
+    let mut gen_ok = false;
+    let mut last_err = String::new();
+    for id in &chain {
+        let _ = app.emit("bootstrap-step", serde_json::json!({
+            "step": 1, "total": 2, "label": format!("Modèle IA — {}", name_of(id)),
+        }));
+        if let Err(e) = ai::llama::select_model(id) { last_err = e; continue; }
+        match ai::llama::download_model(app) {
+            Ok(()) => { gen_ok = true; break; }
+            Err(e) => { crate::elog!("⬇️ bootstrap: échec DL {id} ({e}), essai suivant."); last_err = e; }
+        }
+    }
+    if !gen_ok {
+        return Err(format!("Aucun modèle IA n'a pu être téléchargé : {last_err}"));
+    }
+
+    // 2. Modèle d'embedding : best-effort. Un échec ici NE bloque PAS l'app —
+    //    l'Archiviste retombe sur le chemin Gemma (parité), le Diagnostic le signale.
+    let _ = app.emit("bootstrap-step", serde_json::json!({
+        "step": 2, "total": 2, "label": "Moteur de rangement (embeddings)",
+    }));
+    if let Err(e) = ai::llama::download_embed_model(app) {
+        crate::elog!("⬇️ bootstrap: modèle d'embedding non téléchargé ({e}) — rangement en mode Gemma.");
+    }
+    Ok(())
 }
 
 /// Fallback : installe un fichier .gguf local déjà téléchargé.
@@ -1417,6 +1689,54 @@ fn ai_info() -> AiInfo {
     AiInfo {
         model: ai::llama::active_model_stored().map(|m| m.name).unwrap_or_else(|| "—".into()),
         context_tokens: ai::llama::CONTEXT_TOKENS,
+    }
+}
+
+/// Diagnostic de la stack IA pour le retour bêta : quels binaires/modèles sont
+/// présents + la fin de `lucid.log` (démarrages/échecs `llama-server`, bootstrap,
+/// embeddings). RGPD-safe : les logs sont des COMPTEURS et messages d'infra, sans
+/// contenu de document (les libellés ne sont jamais loggés, cf. sites `elog!`).
+#[derive(serde::Serialize)]
+struct AiDiagnostics {
+    os: String,
+    total_ram_gb: f32,
+    completion_binary: bool,
+    server_binary: bool,
+    gen_model: Option<String>,
+    gen_model_present: bool,
+    embed_model_present: bool,
+    log_tail: String,
+    /// stderr du dernier démarrage du serveur de génération (raison d'un crash).
+    gen_server_log: String,
+    /// stderr du dernier démarrage du serveur d'embedding.
+    embed_server_log: String,
+}
+
+/// Dernières `n` lignes d'un fichier du dossier machine (vide si absent).
+fn tail_data_file(name: &str, n: usize) -> String {
+    ai::llama::shared_data_dir()
+        .map(|d| d.join(name))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| {
+            let lines: Vec<&str> = s.lines().collect();
+            lines[lines.len().saturating_sub(n)..].join("\n")
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn ai_diagnostics() -> AiDiagnostics {
+    AiDiagnostics {
+        os: std::env::consts::OS.to_string(),
+        total_ram_gb: ai::llama::detected_ram_gb(),
+        completion_binary: ai::llama::completion_binary_available(),
+        server_binary: ai::llama::server_binary_available(),
+        gen_model: ai::llama::active_model_stored().map(|m| m.name),
+        gen_model_present: ai::llama::generation_model_available(),
+        embed_model_present: ai::llama::embed_model_available(),
+        log_tail: tail_data_file("lucid.log", 60),
+        gen_server_log: tail_data_file(ai::llama::GEN_SERVER_LOG, 40),
+        embed_server_log: tail_data_file(ai::llama::EMBED_SERVER_LOG, 40),
     }
 }
 
@@ -1857,7 +2177,7 @@ fn insert_note_node_on(graph: &mut BrainGraph, id: String, parent_id: String, la
 /// Convertit un fichier local en markdown (PDF, DOC/DOCX/RTF, PPTX, XLSX, TXT/MD, CSV).
 /// Partagé entre `import_file` et le connecteur « dossier local ».
 /// Erreur = message honnête et actionnable (ADR-0015), jamais d'échec silencieux.
-pub(crate) fn file_to_markdown(p: &std::path::Path) -> Result<String, String> {
+pub(crate) fn file_to_source_text(p: &std::path::Path) -> Result<String, String> {
     let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Fichier").to_string();
     let ext = p.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
     let content = match ext.as_str() {
@@ -1891,7 +2211,7 @@ pub(crate) fn file_to_markdown(p: &std::path::Path) -> Result<String, String> {
 fn import_file(path: String, parent_id: String) -> Result<BrainNode, String> {
     let p = std::path::Path::new(&path);
     let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Fichier importé").to_string();
-    let content = file_to_markdown(p)?;
+    let content = file_to_source_text(p)?;
     // Garde le chemin d'origine : « Ouvrir l'original » l'ouvrira avec l'app
     // par défaut (PowerPoint, Aperçu…) — le markdown reste la version cerveau.
     insert_note_node(parent_id, label, content, Some(("local-file", path)))
@@ -3133,7 +3453,7 @@ mod import_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("faux.xlsx");
         std::fs::write(&path, b"pas un classeur excel").unwrap();
-        let err = super::file_to_markdown(&path).unwrap_err();
+        let err = super::file_to_source_text(&path).unwrap_err();
         assert!(err.contains("Excel"), "message d'erreur attendu, reçu : {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4980,12 +5300,10 @@ fn fs_watch_targets() -> Vec<(&'static str, std::path::PathBuf)> {
     if let Some(d) = connectors::claude_code::projects_dir() { out.push(("claude-code", d)); }
     for f in connectors::local_folder::folders() { out.push(("local-folder", std::path::PathBuf::from(f))); }
     if let Some(v) = connectors::obsidian::vault_path() { out.push(("obsidian", std::path::PathBuf::from(v))); }
-    // Le dossier, pas le fichier : Notes.app écrit surtout dans `-wal` (mode WAL
-    // SQLite), pas dans `NoteStore.sqlite` lui-même — un watch sur le seul
-    // fichier principal manquerait la plupart des écritures réelles.
-    if let Some(dir) = connectors::apple_notes::notestore_path().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
-        if dir.exists() { out.push(("apple-notes", dir)); }
-    }
+    // PAS de watch fs sur `NoteStore.sqlite` : Notes.app écrit dans `-wal` à
+    // chaque ouverture de l'app, sync iCloud ou checkpoint SQLite, sans qu'une
+    // seule note ait changé. Notes Apple passe uniquement par le sondage
+    // (`changed_fingerprint`, plus bas), qui compare les notes réelles.
     out
 }
 
@@ -4994,23 +5312,107 @@ fn fs_watch_targets() -> Vec<(&'static str, std::path::PathBuf)> {
 /// connecteur a son propre format de fichiers pertinents.
 fn fs_event_relevant(p: &std::path::Path) -> bool {
     if p.extension().is_some_and(|e| e == "jsonl" || e == "md") { return true; }
-    if connectors::local_folder::EXTENSIONS.iter().any(|ext| p.extension().is_some_and(|e| e == *ext)) { return true; }
-    p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("NoteStore.sqlite"))
+    connectors::local_folder::EXTENSIONS.iter().any(|ext| p.extension().is_some_and(|e| e == *ext))
+}
+
+/// Le changement porte-t-il sur un contenu DOCUMENT (fichier à ranger) plutôt
+/// qu'une conversation Claude Code ? Sert à ne réveiller l'Archiviste que sur du
+/// vrai contenu à organiser — jamais sur une session Claude Code (`.jsonl` : le
+/// seul format de conversation, et la cause de l'emballement du 2026-07-29 quand
+/// on relançait l'Archiviste à chaque écriture de session). Obsidian (.md), les
+/// fichiers locaux (pdf/docx…) et Notes Apple (NoteStore) sont des documents.
+fn fs_event_is_document(p: &std::path::Path) -> bool {
+    fs_event_relevant(p) && !p.extension().is_some_and(|e| e == "jsonl")
+}
+
+// ── Inbox : flux passif des fichiers récemment détectés ─────────────────────
+// Visibilité pure (ajouté/modifié/supprimé) — PAS une étape de validation. En
+// mémoire (ring buffer, reset au redémarrage) : suffisant pour "qu'est-ce qui
+// vient de bouger", pas besoin de persistance.
+#[derive(Clone, serde::Serialize)]
+struct InboxEntry {
+    name: String,   // nom de fichier (affiché) — le chemin complet reste local (clic pour ouvrir)
+    path: String,   // chemin absolu — usage LOCAL uniquement (ouvrir le fichier), jamais exporté
+    kind: String,   // "added" | "modified" | "deleted" (dernier événement)
+    source: String, // "local" | "obsidian" | "apple-notes" | "claude-code"
+    at: u64,        // epoch secondes (dernier événement)
+    count: u32,     // nombre d'événements sur ce fichier (dédup → bulle ×N)
+}
+const INBOX_CAP: usize = 60;
+
+fn inbox() -> &'static std::sync::Mutex<std::collections::VecDeque<InboxEntry>> {
+    static I: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<InboxEntry>>> = std::sync::OnceLock::new();
+    I.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn inbox_record(path: &std::path::Path, kind: &str) {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { return };
+    if name.is_empty() { return; }
+    let has_ext = |e: &str| path.extension().is_some_and(|x| x == e);
+    let source = if has_ext("jsonl") { "claude-code" }
+        else if has_ext("md") { "obsidian" }
+        else { "local" };
+    inbox_push(name, path.to_string_lossy().to_string(), source, kind);
+}
+
+/// Variante sans fichier sur le disque : une source qui n'expose pas de chemin
+/// (Notes Apple, détectée par sondage). Le `path` reste vide — le front ne
+/// propose alors pas « ouvrir le fichier ».
+fn inbox_record_named(name: &str, source: &str, kind: &str) {
+    if name.trim().is_empty() { return; }
+    inbox_push(name.to_string(), String::new(), source, kind);
+}
+
+fn inbox_push(name: String, path_str: String, source: &str, kind: &str) {
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // Dédup par chemin quand il y en a un, par nom sinon (sources sans fichier).
+    let dedup_key = if path_str.is_empty() { name.clone() } else { path_str.clone() };
+    let mut q = inbox().lock().unwrap_or_else(|p| p.into_inner());
+    // Dédup par fichier : une seule ligne par chemin (dernière activité), avec un
+    // compteur ×N repris de l'entrée précédente — une session Claude Code qui
+    // réécrit en continu devient "×47" au lieu d'une rafale.
+    let key_of = |e: &InboxEntry| if e.path.is_empty() { e.name.clone() } else { e.path.clone() };
+    let prev_count = q.iter().find(|e| key_of(e) == dedup_key).map(|e| e.count).unwrap_or(0);
+    q.retain(|e| key_of(e) != dedup_key);
+    q.push_front(InboxEntry { name, path: path_str, kind: kind.into(), source: source.into(), at, count: prev_count + 1 });
+    q.truncate(INBOX_CAP);
+}
+
+/// Flux des fichiers récemment détectés (plus récent d'abord).
+#[tauri::command]
+fn inbox_recent() -> Vec<InboxEntry> {
+    inbox().lock().map(|q| q.iter().cloned().collect()).unwrap_or_default()
 }
 
 /// Entre deux tours : resynchronise les chemins fs surveillés (Réglages a pu
 /// changer) ET sonde les sources sans signal fs (Drive, Notes Apple en
-/// secours si `NoteStore.sqlite` n'est pas surveillable — cf. `notestore_path`).
+/// signal fs : Notes Apple, Google Drive).
 const WATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn start_watcher(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         use notify::Watcher;
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        // Le bool = "un contenu DOCUMENT a changé" (→ réveille l'Archiviste).
+        // false = seulement une source non-document (session Claude Code) : on
+        // régénère mais on ne range pas.
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
         let tx_events = tx.clone();
         let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(ev) = res {
-                if ev.paths.iter().any(|p| fs_event_relevant(p)) { let _ = tx_events.send(()); }
+                if ev.paths.iter().any(|p| fs_event_relevant(p)) {
+                    // Inbox (visibilité) : enregistre chaque fichier pertinent avec son type d'événement.
+                    let kind = match ev.kind {
+                        notify::EventKind::Create(_) => Some("added"),
+                        notify::EventKind::Modify(_) => Some("modified"),
+                        notify::EventKind::Remove(_) => Some("deleted"),
+                        _ => None,
+                    };
+                    if let Some(k) = kind {
+                        for p in ev.paths.iter().filter(|p| fs_event_relevant(p)) { inbox_record(p, k); }
+                    }
+                    let is_doc = ev.paths.iter().any(|p| fs_event_is_document(p));
+                    let _ = tx_events.send(is_doc);
+                }
             }
         }) {
             Ok(w) => w,
@@ -5018,6 +5420,7 @@ fn start_watcher(app: tauri::AppHandle) {
         };
         let mut watched: std::collections::HashMap<&'static str, std::path::PathBuf> = std::collections::HashMap::new();
         let mut fingerprints: std::collections::HashMap<&'static str, String> = std::collections::HashMap::new();
+        let mut last_poll: Option<std::time::Instant> = None;
 
         loop {
             let targets = fs_watch_targets();
@@ -5039,20 +5442,43 @@ fn start_watcher(app: tauri::AppHandle) {
             // déclencheur, au même titre qu'un évènement fs. Jamais au tout
             // premier tour (rien à comparer) : sinon chaque lancement d'app
             // déclencherait une régénération pour rien.
-            let mut polled = Vec::new();
-            if !watched.contains_key("apple-notes") {
-                if let Some(fp) = connectors::apple_notes::changed_fingerprint() { polled.push(("apple-notes", fp)); }
-            }
-            if let Some(fp) = connectors::google_drive::changed_fingerprint() { polled.push(("google-drive", fp)); }
-            for (source, fp) in polled {
-                match fingerprints.insert(source, fp.clone()) {
-                    Some(prev) if prev != fp => { let _ = tx.send(()); }
-                    _ => {}
+            //
+            // CADENCÉ à WATCH_POLL_INTERVAL, pas une fois par tour de boucle : un
+            // tour a lieu à CHAQUE évènement fs (une session Claude Code écrit en
+            // continu → toutes les quelques secondes), et sonder revient à lister
+            // tout Drive par le réseau + toute la bibliothèque Notes par osascript.
+            // Sans ce garde, ces deux appels lourds partaient à la fréquence des
+            // écritures de fichiers, pas toutes les 5 min (2026-07-31).
+            let due = last_poll.is_none_or(|t: std::time::Instant| t.elapsed() >= WATCH_POLL_INTERVAL);
+            if due {
+                last_poll = Some(std::time::Instant::now());
+                let mut polled = Vec::new();
+                // Notes Apple : TOUJOURS par sondage (cf. `fs_watch_targets`) — le
+                // `-wal` du NoteStore n'est pas une note. `label` = titre de la note
+                // la plus récemment modifiée, pour l'Inbox.
+                if let Some((fp, title)) = connectors::apple_notes::changed_fingerprint() {
+                    polled.push(("apple-notes", fp, Some(title)));
+                }
+                if let Some(fp) = connectors::google_drive::changed_fingerprint() { polled.push(("google-drive", fp, None)); }
+                for (source, fp, label) in polled {
+                    match fingerprints.insert(source, fp.clone()) {
+                        // Drive & Notes Apple = sources DOCUMENT → réveillent l'Archiviste.
+                        Some(prev) if prev != fp => {
+                            if let Some(title) = label { inbox_record_named(&title, source, "modified"); }
+                            let _ = tx.send(true);
+                        }
+                        _ => {}
+                    }
                 }
             }
 
             // Attend soit un déclencheur (fs ou sondage), soit le prochain tour.
-            if rx.recv_timeout(WATCH_POLL_INTERVAL).is_err() { continue; }
+            // `doc_touched` : au moins un des déclencheurs de cette rafale portait
+            // sur un contenu document (→ Archiviste), pas seulement Claude Code.
+            let mut doc_touched = match rx.recv_timeout(WATCH_POLL_INTERVAL) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
             // Debounce : une source qui écrit en RAFALE (session Claude Code en
             // cours, sync Drive en plusieurs lots…) → laisser l'accalmie. On DORT
             // un délai fixe puis on vide le canal d'un coup (non-bloquant) : un
@@ -5061,7 +5487,10 @@ fn start_watcher(app: tauri::AppHandle) {
             // 2026-07-29 quand une session Claude Code écrivait en continu dans
             // ~/.claude/projects — le watcher spinnait à fond).
             std::thread::sleep(std::time::Duration::from_secs(3));
-            while rx.try_recv().is_ok() {}
+            while let Ok(b) = rx.try_recv() { doc_touched = doc_touched || b; }
+            // Inbox : rafraîchir le flux PROMPTEMENT (indépendant du cooldown de
+            // régé 5 min) — un fichier détecté apparaît dans l'Inbox en ~3 s.
+            { use tauri::Emitter; let _ = app.emit("inbox-updated", ()); }
             // Pas encore de cerveau, ou contenu démo → on ne touche à rien.
             let Some(data) = ai::llama::app_data_dir() else { continue; };
             if !has_real_brain(&data) || data.join("demo.flag").exists() { continue; }
@@ -5080,7 +5509,16 @@ fn start_watcher(app: tauri::AppHandle) {
             // run_generation rafraîchit lui-même les caches connecteurs (cf.
             // refresh_connector_caches) — le déclencheur ne fait que lancer.
             match run_generation(&app) {
-                Ok(_) => { let _ = app.emit("brain-updated", ()); }
+                Ok(_) => {
+                    let _ = app.emit("brain-updated", ());
+                    // Déclencheur Archiviste ÉVÉNEMENTIEL (jamais un timer) : seulement
+                    // si un contenu DOCUMENT a changé (local/Drive/Obsidian/Notes) —
+                    // jamais sur une session Claude Code (conversations), qui était la
+                    // cause de l'emballement du 2026-07-29. Déjà rate-limité : l'auto-
+                    // régé est plafonnée à 1×/5 min (AUTO_REGEN_COOLDOWN_SECS), donc
+                    // l'Archiviste tourne au plus 1×/5 min, uniquement sur du vrai neuf.
+                    if doc_touched { let _ = app.emit("archiviste-auto", ()); }
+                }
                 Err(e) => crate::elog!("⚠️ watch auto : régénération échouée : {e}"),
             }
         }
@@ -5299,6 +5737,7 @@ pub fn run() {
             export_node_md,
             ai_setup_needed,
             download_model,
+            ai_bootstrap,
             install_model_file,
             list_models,
             set_active_model,
@@ -5358,6 +5797,8 @@ pub fn run() {
             sentry_active,
             crash_test,
             ai_info,
+            ai_diagnostics,
+            inbox_recent,
             run_archivist,
             archivist_was_interrupted,
             archivist_diagnostic

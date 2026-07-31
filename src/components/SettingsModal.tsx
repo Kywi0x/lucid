@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { syncNow, useSyncStatus, SYNC_FILE } from "@/lib/sync";
 import {
   Plug,
@@ -49,6 +50,7 @@ import {
   claudeCodeReconnect,
   listModels,
   setActiveModel,
+  downloadModel,
   mcpManualValidationEnabled,
   setMcpManualValidation,
   runArchivist,
@@ -60,6 +62,7 @@ import {
   sentryActive,
   crashTest,
   archivistDiagnostic,
+  aiDiagnostics,
   type ModelInfo,
 } from "@/lib/api";
 import { supabase, BACKUP_BUCKET } from "@/lib/supabase";
@@ -464,7 +467,7 @@ function ConnectorsSection({
 }: {
   connectors: ConnectorStatus[];
   onRefresh: () => void;
-  onSyncDone: () => void;
+  onSyncDone: (hadNew: boolean) => void;
 }) {
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [msgs, setMsgs] = useState<Record<string, string>>({});
@@ -513,7 +516,7 @@ function ConnectorsSection({
       const [newFiles, total] = await googleDriveSync();
       msg("google-drive", newFiles > 0 ? `${newFiles} nouveaux sur ${total}` : `${total} fichiers en cache`);
       onRefresh();
-      if (total > 0) onSyncDone();
+      if (total > 0) onSyncDone(newFiles > 0);
     } catch (e) { msg("google-drive", `Erreur : ${e}`); }
     finally { set("google-drive", false); }
   }
@@ -599,7 +602,7 @@ function ConnectorsSection({
       msg("local-folder", (r.new > 0 ? `${r.new} nouveaux sur ${r.total}` : `${r.total} fichiers indexés`) + skipped);
       if (r.skipped.length) console.warn("Dossiers locaux — fichiers ignorés :", r.skipped);
       onRefresh();
-      if (r.total > 0) onSyncDone();
+      if (r.total > 0) onSyncDone(r.new > 0);
     } catch (e) { msg("local-folder", `Erreur : ${e}`); }
     finally { set("local-folder", false); }
   }
@@ -631,7 +634,7 @@ function ConnectorsSection({
       const n = await appleNotesSync();
       msg("apple-notes", `${n} note${n > 1 ? "s" : ""} synchronisée${n > 1 ? "s" : ""}`);
       onRefresh();
-      onSyncDone();
+      onSyncDone(n > 0);
     } catch (e) { msg("apple-notes", `Erreur : ${e}`); }
     finally { set("apple-notes", false); }
   }
@@ -862,63 +865,73 @@ function SpacesSection({
 
 function ModelSection() {
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [switching, setSwitching] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [dlPercent, setDlPercent] = useState<number | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
-  useEffect(() => { listModels().then(setModels); }, []);
+  const refresh = useCallback(() => listModels().then(setModels), []);
+  useEffect(() => { refresh(); }, [refresh]);
 
-  async function handleSwitch(id: string) {
-    setSwitching(true);
+  // Sélection d'un modèle : s'il n'est pas téléchargé, on le télécharge DIRECTEMENT
+  // (avec barre de progression), sans repasser par le bootstrap — sinon le
+  // bootstrap réinstallerait le modèle recommandé et écraserait ce choix.
+  async function handlePick(m: ModelInfo) {
+    if ((m.active && m.downloaded) || busyId) return;
+    setErr(null); setBusyId(m.id);
     try {
-      await setActiveModel(id);
-      setModels((prev) => prev.map((m) => ({ ...m, active: m.id === id })));
-    } finally { setSwitching(false); }
+      if (!m.downloaded) {
+        setDlPercent(0);
+        const un = await listen<{ percent: number }>("download-progress", (e) => setDlPercent(e.payload.percent));
+        try { await downloadModel(m.id); } finally { un(); setDlPercent(null); }
+      } else {
+        await setActiveModel(m.id);
+      }
+      await refresh();
+    } catch (e) { setErr(String(e)); }
+    finally { setBusyId(null); }
   }
 
   return (
     <div className="h-full overflow-y-auto px-5 py-4">
       <p className="mb-3 text-xs leading-relaxed text-[var(--color-muted)]">
-        Le modèle tourne entièrement sur ta machine. Le changement est immédiat,
-        la prochaine génération l'utilise.
+        Le modèle tourne entièrement sur ta machine. Un modèle non téléchargé
+        s'installe au clic ; le changement s'applique à la prochaine génération.
       </p>
       <div className="flex flex-col gap-1">
-        {models.map((m) => (
-          <button
-            key={m.id}
-            onClick={() => !m.active && !switching && handleSwitch(m.id)}
-            disabled={switching}
-            className={cn(
-              "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors disabled:opacity-60",
-              m.active
-                ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
-            )}
-          >
-            <span className="flex-1 font-medium">{m.name}</span>
-            <span className="shrink-0 font-mono text-[10px] opacity-70">{m.size_gb} Go</span>
-            {m.recommended && !m.active && (
-              <span className="shrink-0 rounded-full border border-[var(--color-warn)]/40 px-1.5 py-0.5 text-[9px] text-[var(--color-warn)]">
-                Recommandé
-              </span>
-            )}
-            {!m.downloaded && (
-              <span className="shrink-0 font-mono text-[9px] uppercase tracking-wide text-[var(--color-warn)]">à télécharger</span>
-            )}
-          </button>
-        ))}
+        {models.map((m) => {
+          const isBusy = busyId === m.id;
+          return (
+            <button
+              key={m.id}
+              onClick={() => handlePick(m)}
+              disabled={busyId !== null}
+              className={cn(
+                "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors disabled:opacity-60",
+                m.active
+                  ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                  : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
+              )}
+            >
+              {isBusy && <Loader2 className="size-3.5 shrink-0 animate-spin" />}
+              <span className="flex-1 font-medium">{m.name}</span>
+              {isBusy && dlPercent !== null ? (
+                <span className="shrink-0 font-mono text-[10px] text-[var(--color-accent)]">{dlPercent}%</span>
+              ) : (
+                <span className="shrink-0 font-mono text-[10px] opacity-70">{m.size_gb} Go</span>
+              )}
+              {m.recommended && !m.active && !isBusy && (
+                <span className="shrink-0 rounded-full border border-[var(--color-warn)]/40 px-1.5 py-0.5 text-[9px] text-[var(--color-warn)]">
+                  Recommandé
+                </span>
+              )}
+              {!m.downloaded && !isBusy && (
+                <span className="shrink-0 font-mono text-[9px] uppercase tracking-wide text-[var(--color-warn)]">à télécharger</span>
+              )}
+            </button>
+          );
+        })}
       </div>
-      {models.some((m) => m.active && !m.downloaded) && (
-        <div className="mt-2 flex items-center gap-2">
-          <p className="flex-1 text-[10px] text-[var(--color-warn)]">
-            Modèle non téléchargé — les features IA sont désactivées.
-          </p>
-          <button
-            onClick={() => { localStorage.removeItem("lucid.ai.skipped"); location.reload(); }}
-            className="shrink-0 rounded-lg bg-[var(--color-accent)] px-2.5 py-1 text-[10px] font-medium text-white hover:opacity-90"
-          >
-            Installer maintenant
-          </button>
-        </div>
-      )}
+      {err && <p className="mt-2 text-[10px] text-[var(--color-err)]">{err}</p>}
     </div>
   );
 }
@@ -950,7 +963,7 @@ function ConnectionsSection({
 }: {
   connectors: ConnectorStatus[];
   onRefresh: () => void;
-  onSyncDone: () => void;
+  onSyncDone: (hadNew: boolean) => void;
 }) {
   const [tab, setTab] = useState<ConnTab>("connectors");
   const connected = connectors.filter((c) => c.connected).length;
@@ -1280,6 +1293,42 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
           {busy === "diag" ? <Loader2 className="size-4 animate-spin" /> : null}
           Copier un diagnostic (anonymisé)
         </button>
+
+        {/* Diagnostic stack IA : binaires/modèles présents + fin de lucid.log
+            (démarrages/échecs llama-server, bootstrap, embeddings). Sert la
+            boucle de test Windows : l'user colle ce bloc en cas de souci. */}
+        <button
+          onClick={async () => {
+            setBusy("ai-diag"); setMsg(null);
+            try {
+              const d = await aiDiagnostics();
+              const yn = (b: boolean) => (b ? "✅" : "❌");
+              const report = [
+                "=== Diagnostic IA Lucid ===",
+                `OS: ${d.os} · RAM: ${d.total_ram_gb.toFixed(1)} Go`,
+                `Binaire llama-completion: ${yn(d.completion_binary)}`,
+                `Binaire llama-server (serveur + embeddings): ${yn(d.server_binary)}`,
+                `Modèle génération: ${d.gen_model ?? "—"} (présent: ${yn(d.gen_model_present)})`,
+                `Modèle embedding (BGE-M3): ${yn(d.embed_model_present)}`,
+                "--- llama-server (génération) stderr ---",
+                d.gen_server_log || "(vide — serveur jamais démarré)",
+                "--- llama-server (embedding) stderr ---",
+                d.embed_server_log || "(vide — serveur jamais démarré)",
+                "--- lucid.log (60 dernières lignes) ---",
+                d.log_tail || "(log vide)",
+              ].join("\n");
+              const ok = await copyText(report);
+              setMsg(ok ? "Diagnostic IA copié ✓ — colle-le dans ton message." : "Copie impossible.");
+            } catch (e) {
+              setMsg(String((e as Error).message ?? e));
+            } finally { setBusy(null); }
+          }}
+          disabled={busy !== null}
+          className="mt-1.5 flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-text)] hover:bg-[var(--color-surface-2)] disabled:opacity-40"
+        >
+          {busy === "ai-diag" ? <Loader2 className="size-4 animate-spin" /> : null}
+          Copier le diagnostic IA (binaires, modèles, logs)
+        </button>
       </div>
 
       {import.meta.env.DEV && (
@@ -1481,7 +1530,7 @@ interface Props {
   connectors: ConnectorStatus[];
   spaces: Space[];
   onRefresh: () => void;
-  onSyncDone: () => void;
+  onSyncDone: (hadNew: boolean) => void;
   onClose: () => void;
   onSpaceCreate: (name: string) => void;
   onSpaceRename: (id: string, name: string) => void;

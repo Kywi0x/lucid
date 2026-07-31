@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Network,
   FolderTree,
-  FileText,
   RefreshCw,
   Search,
   Settings,
@@ -26,7 +25,6 @@ import { UpdateBanner } from "@/components/UpdateBanner";
 import { BetaBadge } from "@/components/BetaBadge";
 import {
   GenerateEmpty,
-  MarkdownView,
 } from "@/components/BrainView";
 import { NodeDetail } from "@/components/NodeDetail";
 import { NodePicker } from "@/components/NodePicker";
@@ -74,6 +72,7 @@ import { fetchSharedWithMe, ensurePersonalMcpSpace, type SharedWithMe } from "@/
 import { supabase } from "@/lib/supabase";
 import type { McpProposal, SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
+import { InboxPanel } from "@/components/InboxPanel";
 import type {
   BrainGraph,
   BrainNode,
@@ -81,7 +80,7 @@ import type {
 } from "@/lib/types";
 import { cn, relativeDate } from "@/lib/utils";
 
-type View = "map" | "folder" | "brain";
+type View = "map" | "folder";
 
 function filterGraphBySpace(graph: BrainGraph, nodeIds: string[]): BrainGraph {
   const idSet = new Set(nodeIds);
@@ -291,6 +290,19 @@ function App() {
     }
   }
 
+  /** Résumé d'UNE ligne du rapport de l'Archiviste. Le rapport complet contient
+   *  une phrase de justification Gemma par décision — sur un vrai cerveau ça fait
+   *  plusieurs Ko, et le toast couvrait tout l'écran (retour Liam, 2026-07-31).
+   *  Le détail part en console (`console.info`), il n'est pas perdu. */
+  function archivistSummary(report: string): string {
+    const actions = report.split("\n").filter((l) => l.trimStart().startsWith("→"));
+    if (!actions.length) return "Archiviste — rien à ranger.";
+    const merges = actions.filter((l) => l.includes("fusionner")).length;
+    const parts = [`${actions.length - merges} rangement${actions.length - merges > 1 ? "s" : ""}`];
+    if (merges) parts.push(`${merges} fusion${merges > 1 ? "s" : ""}`);
+    return `Archiviste — ${parts.filter((p) => !p.startsWith("0 ")).join(", ")} à valider.`;
+  }
+
   /** Une passe de l'Archiviste. Ses propositions se résolvent via le même
    *  circuit que le MCP (poll `mcp-proposal-changed` plus bas) — pas besoin
    *  d'attendre ça ici. En revanche la commande elle-même (script + Gemma sur
@@ -318,7 +330,8 @@ function App() {
       const report = await runArchivist();
       const rest = MIN_VISIBLE_MS - (Date.now() - started);
       if (rest > 0) await new Promise((r) => setTimeout(r, rest));
-      if (!opts?.silent) showToast(report.trim(), 6000);
+      console.info("archiviste — rapport complet :\n" + report);
+      if (!opts?.silent) showToast(archivistSummary(report), 6000);
     } catch (e) {
       const msg = String(e instanceof Error ? e.message : e);
       if (opts?.silent) console.warn("archiviste:", msg);
@@ -414,11 +427,10 @@ function App() {
   }, [scanning, scanProgress, generating, progress, archiving, archiveProgress]);
 
   useEffect(() => {
-    // L'IA locale est optionnelle : si l'user a passé le setup, on n'affiche
-    // plus l'écran de téléchargement (installable plus tard via les Réglages).
-    aiSetupNeeded().then((n) =>
-      setNeedsSetup(n && localStorage.getItem("lucid.ai.skipped") !== "1"),
-    );
+    // L'IA locale est OBLIGATOIRE : si le modèle de génération manque, on affiche
+    // l'écran de préparation (DL auto, décision Liam 2026-07-30). Le choix du
+    // modèle se fait ensuite dans les Réglages, pas ici.
+    aiSetupNeeded().then(setNeedsSetup);
     readBrainGraph().then((g) => {
       if (g) { setGraph(g); setRevealKey((k) => k + 1); }
       setBooted(true); // graphe initial chargé (ou absent) → évite le flash de GenerateEmpty
@@ -458,6 +470,19 @@ function App() {
       // il embed tout le cerveau) à chaque fois saturait la machine. L'Archiviste
       // reste déclenché explicitement (fin de scan, bouton). À ré-introduire plus
       // tard avec un vrai débounce/cooldown, jamais sur chaque `brain-updated`.
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // Déclencheur Archiviste ÉVÉNEMENTIEL : le watcher backend a détecté un
+  // NOUVEAU contenu DOCUMENT (fichier local/Drive/Obsidian/Notes ajouté ou
+  // modifié) et régénéré → on range une fois. Jamais sur Claude Code, jamais sur
+  // un timer (l'émission est déjà plafonnée à 1×/5 min côté Rust). Skip si une
+  // passe tourne déjà (le lock Rust refuserait de toute façon).
+  useEffect(() => {
+    const unlisten = listen("archiviste-auto", () => {
+      if (archivingRef.current) return;
+      void runArchivistNow({ silent: true });
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
@@ -723,20 +748,14 @@ function App() {
             supabase?.from("mcp_proposals").delete().in("id", resolvedIds).then(() => {}, () => {});
             const n = resolvedIds.length;
             void notify("Archiviste", `${n} page${n > 1 ? "s" : ""} mise${n > 1 ? "s" : ""} à jour dans ton cerveau.`);
-            // Une IA (MCP) vient d'écrire — l'Archiviste repasse derrière pour
-            // ranger/fusionner (ex. si elle a mal placé une page). Jamais après
-            // une résolution qui ne contient QUE ses propres propositions
-            // (préfixe "arch-" sur l'id de LA PROPOSITION elle-même — `p`, pas
-            // `resolvedIds` : ce dernier liste les pages AFFECTÉES (target_id
-            // d'un déplacement, id du survivant d'une fusion), jamais préfixées
-            // "arch-" même quand la proposition vient de l'Archiviste. Le
-            // vérifier sur `resolvedIds` faisait boucler l'Archiviste sur
-            // lui-même indéfiniment dès qu'il déplaçait/fusionnait quoi que ce
-            // soit — donc à peu près toujours — bug remonté par Liam le
-            // 2026-07-26 : "1/1 qui stagne, ça s'arrête et recommence").
-            if (p.some((prop) => !prop.id.startsWith("arch-"))) {
-              void runArchivistNow({ silent: true });
-            }
+            // NB : on NE relance PLUS l'Archiviste derrière une écriture MCP
+            // (décision Liam 2026-07-30). Le MCP (Claude Desktop) place ses
+            // documents avec un vrai raisonnement — bien mieux que l'Archiviste
+            // local (heuristique + Gemma 4B) ; repasser derrière risquait de
+            // DÉFAIRE son rangement, ET c'était la source d'une boucle (ce poll
+            // 30 s re-déclenchait une passe complète → freeze UI périodique).
+            // L'Archiviste ne se déclenche désormais que sur du contenu ingéré
+            // par un CONNECTEUR (scan local/Drive/Obsidian…) ou le bouton manuel.
           }
           // Suivi des propositions encore en attente malgré cette tentative.
           const resolvedSet = new Set(resolvedIds);
@@ -1109,15 +1128,21 @@ function App() {
 
   if (needsSetup) {
     return (
-      <SetupScreen
-        onDone={() => setNeedsSetup(false)}
-        onSkip={() => { localStorage.setItem("lucid.ai.skipped", "1"); setNeedsSetup(false); }}
-      />
+      <SetupScreen onDone={() => setNeedsSetup(false)} />
     );
   }
 
   return (
     <div className="relative h-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
+
+      {/* Inbox — flux passif des fichiers récents (placement provisoire, à aligner sur la maquette).
+          Clic → ouvre la page Lucid du fichier (selectNode + focus canvas). */}
+      {booted && graph && !demoMode && (
+        <InboxPanel
+          graph={graph}
+          onOpenNode={(n) => { selectNode(n); setFocus({ id: n.id, k: Date.now() }); }}
+        />
+      )}
 
       {!booted ? null : !graph && !generating && !scanning ? (
         <GenerateEmpty
@@ -1174,9 +1199,6 @@ function App() {
               selectedId={selectedNode?.id ?? null}
               query={query}
             />
-          )}
-          {view === "brain" && graph && (
-            <MarkdownView markdown={graph.markdown} onRegenerate={handleGenerate} />
           )}
 
           {/* ── Dock de widgets (bord gauche) ── */}
@@ -1426,9 +1448,6 @@ function App() {
               <ViewBtn active={view === "folder"} onClick={() => setView("folder")}>
                 <FolderTree className="size-4" /> Dossiers
               </ViewBtn>
-              <ViewBtn active={view === "brain"}  onClick={() => setView("brain")}>
-                <FileText   className="size-4" /> brain.md
-              </ViewBtn>
 
               {/* Recherche ⌘K */}
               <div className="ml-1 flex items-center pl-3 border-l border-[var(--color-border)]">
@@ -1576,7 +1595,7 @@ function App() {
               connectors={connectors}
               spaces={spaces}
               onRefresh={() => connectorsStatus().then(setConnectors)}
-              onSyncDone={() => handleGenerate({ skipSync: true })}
+              onSyncDone={(hadNew) => { void handleGenerate({ skipSync: true }).then(() => { if (hadNew) void runArchivistNow({ silent: true }); }); }}
               onClose={() => setSettingsOpen(false)}
               onSpaceCreate={handleSpaceCreate}
               onSpaceRename={handleSpaceRename}
@@ -1630,7 +1649,7 @@ function App() {
           connectors={connectors}
           spaces={spaces}
           onRefresh={() => connectorsStatus().then(setConnectors)}
-          onSyncDone={() => handleGenerate({ skipSync: true })}
+          onSyncDone={(hadNew) => { void handleGenerate({ skipSync: true }).then(() => { if (hadNew) void runArchivistNow({ silent: true }); }); }}
           onClose={() => { setSettingsOpen(false); connectorsStatus().then(setConnectors); }}
           onSpaceCreate={handleSpaceCreate}
           onSpaceRename={handleSpaceRename}

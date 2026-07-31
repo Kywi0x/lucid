@@ -179,31 +179,25 @@ pub fn load_by_id(id: &str) -> Option<Conversation> {
     load_conversations().into_iter().find(|c| c.summary.id == id)
 }
 
-/// Fichier où Notes.app persiste tout (WAL actif en pratique, cf. `-wal` à
-/// côté) — jamais lu directement (cf. l'en-tête du module), seulement surveillé
-/// comme SIGNAL : sa date de modif change dès qu'une note bouge, ce qui donne
-/// un vrai déclencheur fs pour le watch auto au lieu d'un sondage à l'aveugle.
-/// Peut être derrière l'autorisation "Accès complet au disque" selon la
-/// version de macOS — dans ce cas `notify` échoue proprement à l'ouverture et
-/// l'appelant retombe sur `changed_fingerprint` (sondage), jamais un échec
-/// silencieux (ADR-0015).
-#[cfg(target_os = "macos")]
-pub fn notestore_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?
-        .join("Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"))
-}
-#[cfg(not(target_os = "macos"))]
-pub fn notestore_path() -> Option<PathBuf> { None }
+// `notestore_path` retiré le 2026-07-31 : surveiller `NoteStore.sqlite` (et son
+// `-wal`) comme signal fs ne marche pas — Notes.app y écrit à chaque ouverture,
+// sync iCloud ou checkpoint SQLite, sans qu'aucune note n'ait changé. Détection
+// par `changed_fingerprint` uniquement.
 
-/// Empreinte bon marché (nombre de notes + date de modif la plus récente) —
-/// filet de sondage périodique si `notestore_path` n'est pas surveillable
-/// (permission refusée). Coût identique à `sync()` (une bibliothèque de notes
-/// reste petite), mais ne réécrit rien : juste de quoi détecter un changement.
-pub fn changed_fingerprint() -> Option<String> {
+/// Empreinte bon marché (nombre de notes + date de modif la plus récente) et
+/// TITRE de la note la plus récemment modifiée. Seul moyen fiable de détecter
+/// un changement de notes : `NoteStore.sqlite-wal` bouge à chaque ouverture de
+/// Notes.app, sync iCloud ou checkpoint SQLite — ce n'est pas une note, et le
+/// surveiller faisait apparaître « NoteStore.sqlite-wal » dans l'Inbox tout en
+/// réveillant l'Archiviste pour rien (remonté par Liam le 2026-07-31).
+/// Coût identique à `sync()` (une bibliothèque de notes reste petite), mais ne
+/// réécrit rien.
+pub fn changed_fingerprint() -> Option<(String, String)> {
     if !is_connected() { return None; }
     let notes = fetch_notes().ok()?;
-    let max_mod = notes.iter().map(|n| n.mod_date.as_str()).max().unwrap_or("").to_string();
-    Some(format!("{}:{}", notes.len(), max_mod))
+    let newest = notes.iter().max_by(|a, b| a.mod_date.cmp(&b.mod_date))?;
+    let title = if newest.name.trim().is_empty() { "Sans titre" } else { newest.name.trim() };
+    Some((format!("{}:{}", notes.len(), newest.mod_date), title.to_string()))
 }
 
 #[cfg(test)]

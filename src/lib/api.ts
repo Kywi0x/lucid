@@ -168,6 +168,13 @@ export function downloadModel(modelId: string): Promise<void> {
   return invoke("download_model", { modelId });
 }
 
+/** Bootstrap IA au 1er lancement : DL automatique du modèle recommandé (avec
+ *  chaîne de secours) + du modèle d'embedding, sans choix utilisateur. Émet
+ *  "bootstrap-step" { step, total, label } et "download-progress". */
+export function aiBootstrap(): Promise<void> {
+  return invoke("ai_bootstrap");
+}
+
 /** Fallback : copie un .gguf local déjà téléchargé (émet "install-progress" en %). */
 export function installModelFile(srcPath: string, modelId: string): Promise<void> {
   return invoke("install_model_file", { srcPath, modelId });
@@ -199,6 +206,38 @@ export interface AiInfo {
 /** Modèle IA actif + sa fenêtre de contexte (affiché dans les assistants). */
 export function aiInfo(): Promise<AiInfo> {
   return invoke("ai_info");
+}
+
+export interface AiDiagnostics {
+  os: string;
+  total_ram_gb: number;
+  completion_binary: boolean;
+  server_binary: boolean;
+  gen_model: string | null;
+  gen_model_present: boolean;
+  embed_model_present: boolean;
+  log_tail: string;
+  gen_server_log: string;
+  embed_server_log: string;
+}
+
+/** Statut de la stack IA + fin de lucid.log (retour bêta, RGPD-safe). */
+export function aiDiagnostics(): Promise<AiDiagnostics> {
+  return invoke("ai_diagnostics");
+}
+
+export interface InboxEntry {
+  name: string;
+  path: string;
+  kind: "added" | "modified" | "deleted";
+  source: string;
+  at: number;
+  count: number;
+}
+
+/** Flux passif des fichiers récemment détectés (ajouté/modifié/supprimé). */
+export function inboxRecent(): Promise<InboxEntry[]> {
+  return invoke("inbox_recent");
 }
 
 /** Change le modèle actif (si non téléchargé, aiSetupNeeded() passera à true). */
