@@ -654,11 +654,16 @@ pub fn pptx_to_markdown(path: &std::path::Path) -> Option<String> {
 /// Résout un binaire externe : sidecar du bundle d'abord (app packagée,
 /// binaire à côté de l'exécutable), puis Homebrew, puis le PATH.
 fn which_bin(name: &str) -> Option<String> {
-    // Sidecar embarqué : UNIQUEMENT en release (app packagée). En dev, Tauri
-    // copie dans target/debug/ une version relocalisée pour le bundle (dylibs →
-    // ../Resources/libs, absent hors bundle) → elle se lance mais sort du vide.
-    // On la saute donc en debug pour utiliser Homebrew/PATH qui, lui, marche.
-    #[cfg(not(debug_assertions))]
+    // Sidecar embarqué, en dev COMME en release : `build.rs` pose désormais
+    // `target/Resources` → `src-tauri/resources`, donc les dylibs cherchées en
+    // `@executable_path/../Resources/libs/` se résolvent aussi hors bundle. Avant
+    // ça, ce bloc était sauté en debug et on retombait sur Homebrew : le poppler
+    // testé en dev n'était pas celui livré aux utilisateurs (demande Liam,
+    // 2026-08-03 : « ma version locale doit être = aux packages »).
+    //
+    // Conséquence assumée : un sidecar cassé ne se rattrape plus par Homebrew en
+    // dev — c'est le but, l'échec devient visible sur la machine de dev plutôt que
+    // chez l'utilisateur.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);

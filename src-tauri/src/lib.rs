@@ -365,6 +365,43 @@ fn archivist_diagnostic(mask: bool) -> Result<String, String> {
          \x20                   domaine avec des numéros différents sont bien deux\n\
          \x20                   dossiers distincts, pas un doublon d'affichage.\n\n",
     );
+    // Environnement : un rapport venu d'une autre machine est illisible sans lui.
+    // Le sidecar Windows est CPU-only (`bundle-sidecars.ps1` prend l'archive
+    // `bin-win-cpu-x64`), donc plusieurs fois plus lent qu'un build Metal — sans
+    // cette section, une passe de 40 minutes passerait pour un blocage.
+    out.push_str(&format!(
+        "— Environnement —\nOS / arch                     : {} / {}\nRAM détectée                  : {:.0} Go\nbinaire llama-completion      : {}\nbinaire llama-server          : {}\nmodèle de génération          : {}\nmodèle d'embedding            : {}\n\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        ai::llama::detected_ram_gb(),
+        ai::llama::completion_binary_available(),
+        ai::llama::server_binary_available(),
+        ai::llama::generation_model_available(),
+        ai::llama::embed_model_available(),
+    ));
+
+    // Extraction : sur un corpus qu'on n'a pas sous les yeux, « 300 en Non triable »
+    // est indéchiffrable sans savoir combien de fichiers ont produit du texte.
+    // Regroupé PAR RAISON — jamais un nom de fichier, même en mode local (la
+    // raison seule suffit au diagnostic, et le bloc reste partageable tel quel).
+    if let Some(sync) = connectors::local_folder::last_sync() {
+        out.push_str("— Extraction (dernier scan des dossiers) —\n");
+        out.push_str(&format!("Fichiers indexés  : {}\nExtraits ce scan  : {}\nIllisibles        : {}\n",
+            sync.total, sync.new, sync.skipped.len()));
+        if !sync.skipped.is_empty() {
+            let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+            for line in &sync.skipped {
+                // Chaque entrée est « <chemin> — <raison> » : on ne garde que la raison.
+                let reason = line.split(" — ").nth(1).unwrap_or("raison inconnue");
+                *by_reason.entry(reason).or_default() += 1;
+            }
+            let mut rows: Vec<_> = by_reason.into_iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            for (reason, n) in rows { out.push_str(&format!("  {n:>4}  {reason}\n")); }
+        }
+        out.push('\n');
+    }
+
     // Réglages EN TÊTE : sans eux, impossible de savoir à quelle configuration
     // correspond un rapport quand on en compare plusieurs (demande Liam, 2026-08-03).
     let last_pass: Option<PassMetrics> = std::fs::read_to_string(pass_metrics_path(&dir)).ok()
@@ -415,6 +452,9 @@ fn archivist_diagnostic(mask: bool) -> Result<String, String> {
         out.push_str(&format!("Plus gros cluster              : {}\n", m.largest_cluster));
         out.push_str(&format!("Envoyés en « Non triable »     : {}\n", m.non_triable_this_pass));
         out.push_str(&format!("Noms repris du cache           : {}\n", m.names_reused));
+        out.push_str(&format!("Durée de la passe              : {} s\n", m.duration_secs));
+        out.push_str(&format!("Appels au modèle              : {}\n", m.llm_calls));
+        out.push_str(&format!("Vecteurs calculés / en cache   : {} / {}\n", m.embeddings_new, m.embeddings_cached));
         if m.cohesion.is_empty() {
             out.push_str("Similarité interne des clusters : (aucun cluster)\n");
         } else {
@@ -595,7 +635,10 @@ fn embed_text(n: &BrainNode) -> String {
 /// Embeddings d'un ensemble de nœuds, avec cache disque : ne ré-embed que les
 /// docs neufs/modifiés. Renvoie `id → vecteur` (les docs non embeddables, ex.
 /// moteur indisponible, sont simplement absents de la map).
-fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> std::collections::HashMap<String, Vec<f32>> {
+/// Renvoie `(id → vecteur, nombre de vecteurs CALCULÉS pendant cet appel)`. Le
+/// second terme remonte au rapport : sur une machine lente, il dit si le temps est
+/// parti dans l'embedding ou ailleurs.
+fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> (std::collections::HashMap<String, Vec<f32>>, usize) {
     let mut cache: std::collections::HashMap<String, EmbedEntry> =
         std::fs::read_to_string(embed_cache_path(dir)).ok()
             .and_then(|r| serde_json::from_str(&r).ok())
@@ -636,9 +679,10 @@ fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> std::colle
             Err(e) => crate::elog!("🗂️ embeddings indisponibles ({e})."),
         }
     }
-    nodes.iter()
+    let out = nodes.iter()
         .filter_map(|n| cache.get(&n.id).filter(|e| !e.vec.is_empty()).map(|e| (n.id.clone(), e.vec.clone())))
-        .collect()
+        .collect();
+    (out, todo_ids.len())
 }
 
 // Cache des tags de domaine (même esprit que le cache d'embeddings) : un doc
@@ -873,6 +917,9 @@ struct EmbedPlan {
     cohesion: Vec<f32>,
     /// Clusters dont le nom vient du cache (donc aucun appel de nommage).
     names_reused: usize,
+    /// Vecteurs calculés / réutilisés pendant cette passe.
+    embeddings_new: usize,
+    embeddings_cached: usize,
 }
 
 /// Seuil pour rattacher un document à un dossier EXISTANT (§②). Un peu plus
@@ -954,6 +1001,17 @@ struct PassMetrics {
     /// Documents envoyés en « Non triable » PAR CETTE PASSE (≠ total du bac).
     non_triable_this_pass: usize,
     names_reused: usize,
+    /// Coût de la passe — indispensable pour interpréter un run sur une machine
+    /// dont on n'a pas la main (le sidecar Windows est CPU-only, donc plusieurs
+    /// fois plus lent qu'un build Metal).
+    #[serde(default)]
+    duration_secs: u64,
+    #[serde(default)]
+    llm_calls: usize,
+    #[serde(default)]
+    embeddings_new: usize,
+    #[serde(default)]
+    embeddings_cached: usize,
 }
 
 fn pass_metrics_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_last_pass.json") }
@@ -962,6 +1020,7 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     let mut plan = EmbedPlan {
         anchors: Vec::new(), clusters: Vec::new(), domain_failures: 0,
         cohesion: Vec::new(), names_reused: 0,
+        embeddings_new: 0, embeddings_cached: 0,
     };
     if pool.is_empty() { return plan; }
 
@@ -984,7 +1043,9 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (id, _) in pool { if let Some(n) = by_id.get(id.as_str()) { if seen.insert(n.id.as_str()) { to_embed.push(n); } } }
     for kids in folder_children.values() { for n in kids { if seen.insert(n.id.as_str()) { to_embed.push(n); } } }
-    let vecs = embed_nodes_cached(dir, &to_embed);
+    let (vecs, embedded_now) = embed_nodes_cached(dir, &to_embed);
+    plan.embeddings_new = embedded_now;
+    plan.embeddings_cached = to_embed.len().saturating_sub(embedded_now);
     if vecs.is_empty() { return plan; } // moteur indispo → repli (rien rangé par embeddings)
 
     // Tag de domaine (le signal SUJET) pour tout ce qu'on manipule. Sert de GARDE :
@@ -1130,6 +1191,8 @@ fn run_archivist_scan_once_in_progress(
     // Relevé d'avant-passe : le compteur du moteur est cumulatif depuis le
     // lancement, seul le delta concerne CETTE passe.
     let failed_calls_before = ai::llama::failed_calls();
+    let total_calls_before = ai::llama::total_calls();
+    let pass_started = std::time::Instant::now();
     let mut domain_failures = 0usize;
 
     let mut report = String::new();
@@ -1237,6 +1300,8 @@ fn run_archivist_scan_once_in_progress(
         metrics.largest_cluster = plan.clusters.iter().map(|c| c.node_ids.len()).max().unwrap_or(0);
         metrics.cohesion = plan.cohesion.clone();
         metrics.names_reused = plan.names_reused;
+        metrics.embeddings_new = plan.embeddings_new;
+        metrics.embeddings_cached = plan.embeddings_cached;
         let mut anchored: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (doc, folder) in &plan.anchors {
             let mv = format!("arch-move-{n}"); n += 1;
@@ -1600,6 +1665,8 @@ fn run_archivist_scan_once_in_progress(
     // Métriques persistées : le rapport de diagnostic lit le cerveau, pas une
     // passe — sans ce fichier ces chiffres seraient invisibles après coup, donc
     // impossibles à comparer d'une configuration à l'autre.
+    metrics.duration_secs = pass_started.elapsed().as_secs();
+    metrics.llm_calls = ai::llama::total_calls().saturating_sub(total_calls_before);
     if let Ok(json) = serde_json::to_string_pretty(&metrics) {
         let _ = std::fs::write(pass_metrics_path(dir), json);
     }

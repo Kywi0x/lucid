@@ -592,9 +592,11 @@ fn resolve_server_binary() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         if p.is_file() { return Some(p); }
     }
-    // App packagée : sidecar à côté de `llama-completion` (même dossier) —
-    // pas encore bundlé aujourd'hui (chantier séparé : scripts CI + vérif
-    // parité Windows avant tout passage en prod).
+    // Sidecar à côté de `llama-completion` (même dossier). Bundlé sur les DEUX
+    // plateformes : `tauri.macos.conf.json` / `tauri.windows.conf.json` le
+    // déclarent en `externalBin`, et `scripts/bundle-sidecars.{sh,ps1}` le tirent
+    // de la release officielle llama.cpp. Tauri copiant les sidecars dans
+    // `target/<profil>/`, ce chemin est aussi celui utilisé en dev.
     if let Some(completion) = resolve_binary() {
         let candidate = completion.with_file_name(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
         if candidate.is_file() { return Some(candidate); }
@@ -958,9 +960,19 @@ pub struct LlamaEngine {
 /// creuse des trous dans le classement.
 static FAILED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Appels de génération TOTAUX (réussis + échoués) — le coût réel d'une passe, la
+/// génération étant le goulot d'étranglement. Même usage que `FAILED_CALLS` :
+/// cumulatif, les lecteurs comparent deux relevés.
+static TOTAL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Nombre cumulé d'appels de génération en échec depuis le lancement.
 pub fn failed_calls() -> usize {
     FAILED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Nombre cumulé d'appels de génération depuis le lancement.
+pub fn total_calls() -> usize {
+    TOTAL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl LlamaEngine {
@@ -979,6 +991,7 @@ impl LlamaEngine {
     /// Point de passage unique de TOUS les appels de génération de l'app — d'où
     /// le comptage des échecs ici plutôt que sur chaque site appelant.
     pub fn complete(&self, system: Option<&str>, user: &str, max_tokens: u32) -> Result<String, String> {
+        TOTAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let out = self.complete_inner(system, user, max_tokens);
         if out.is_err() {
             FAILED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

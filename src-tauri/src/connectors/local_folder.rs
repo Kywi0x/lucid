@@ -44,6 +44,15 @@ fn cache_path() -> Option<PathBuf> {
     crate::ai::llama::app_data_dir().map(|d| d.join("local_folder_conversations.json"))
 }
 
+/// Résultat du dernier scan, persisté pour le rapport de diagnostic. Sans lui, le
+/// nombre de fichiers illisibles ne vivait que dans un toast et un `console.warn` :
+/// impossible, sur un corpus qu'on n'a pas sous les yeux, de distinguer « le tri
+/// échoue » de « 200 fichiers n'ont jamais produit une ligne de texte » (demande
+/// Liam, 2026-08-03, avant le test Windows sur 800 fichiers).
+fn last_sync_path() -> Option<PathBuf> {
+    crate::ai::llama::app_data_dir().map(|d| d.join("local_folder_last_sync.json"))
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
     folders: Vec<String>,
@@ -162,7 +171,7 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
 
 // ─── Sync ─────────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SyncReport {
     /// Fichiers extraits (nouveaux ou modifiés) pendant ce sync.
     pub new: usize,
@@ -273,7 +282,19 @@ pub fn sync(mut on_progress: impl FnMut(usize, usize, &str)) -> Result<SyncRepor
     std::fs::write(&path, serde_json::to_string(&out).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
 
-    Ok(SyncReport { new: new_count, total: out.len(), skipped })
+    let report = SyncReport { new: new_count, total: out.len(), skipped };
+    // Best-effort : le rapport de diagnostic le relit, mais un échec d'écriture ne
+    // doit jamais faire échouer un scan qui, lui, a réussi.
+    if let (Some(p), Ok(json)) = (last_sync_path(), serde_json::to_string(&report)) {
+        let _ = std::fs::write(p, json);
+    }
+    Ok(report)
+}
+
+/// Dernier scan persisté (`None` si aucun scan depuis l'installation).
+pub fn last_sync() -> Option<SyncReport> {
+    std::fs::read_to_string(last_sync_path()?).ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
 }
 
 // ─── Lecture ──────────────────────────────────────────────────────────────────
