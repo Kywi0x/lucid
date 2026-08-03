@@ -743,7 +743,13 @@ function App() {
           const resolvedIds = await resolveAllMcpProposals().catch(() => [] as string[]);
           // Sans ça, l'écriture est réelle (brain.json à jour) mais invisible tant
           // que l'utilisateur ne régénère/rouvre pas — le mode autonome doit se voir.
-          if (!stop) { await refreshGraph(); setSpaces(await listSpaces()); }
+          // Gardé sur `resolvedIds.length` : une proposition DÉFINITIVEMENT bloquée
+          // (cible supprimée entre le scan et la résolution) reste en attente et
+          // faisait retomber ici toutes les 30 s, rechargeant tout le graphe pour
+          // rien — donc relayout d3-force et bulles qui sautent périodiquement
+          // (bug remonté par Liam le 2026-08-03). Rien de résolu = rien n'a changé
+          // dans le cerveau = rien à rafraîchir.
+          if (!stop && resolvedIds.length) { await refreshGraph(); setSpaces(await listSpaces()); }
           if (resolvedIds.length) {
             supabase?.from("mcp_proposals").delete().in("id", resolvedIds).then(() => {}, () => {});
             const n = resolvedIds.length;

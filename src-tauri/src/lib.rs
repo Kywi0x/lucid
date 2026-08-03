@@ -313,10 +313,14 @@ fn archivist_diagnostic(mask: bool) -> Result<String, String> {
     let graph: BrainGraph = backup::load_brain_cached(&dir)?;
 
     let is_theme = |id: &str| id.starts_with("arch-theme-") || id.starts_with("arch-cat-") || id.starts_with("arch-group-");
-    let is_leaf = |n: &BrainNode| n.kind == "leaf" || n.kind == "note";
-    let total = graph.nodes.iter().filter(|n| is_leaf(n)).count();
-    let sorted = graph.nodes.iter().filter(|n| is_leaf(n) && n.parent_id.as_deref().is_some_and(is_theme)).count();
-    let non_triable = graph.nodes.iter().filter(|n| is_leaf(n) && n.parent_id.as_deref().is_some_and(|p| p.starts_with("arch-non-triable"))).count();
+    // Les dossiers créés par l'Archiviste sont eux-mêmes des nœuds `kind:"note"`
+    // (cf. archivist.rs:1011) : sans exclure les ids `arch-`, ils étaient comptés
+    // comme des documents et gonflaient à la fois le total et les « rangés »
+    // (420/205 annoncés pour 394/187 réels — diagnostiqué le 2026-08-02).
+    let is_doc = |n: &BrainNode| (n.kind == "leaf" || n.kind == "note") && !n.id.starts_with("arch-");
+    let total = graph.nodes.iter().filter(|n| is_doc(n)).count();
+    let sorted = graph.nodes.iter().filter(|n| is_doc(n) && n.parent_id.as_deref().is_some_and(is_theme)).count();
+    let non_triable = graph.nodes.iter().filter(|n| is_doc(n) && n.parent_id.as_deref().is_some_and(|p| p.starts_with("arch-non-triable"))).count();
     let themes = graph.nodes.iter().filter(|n| n.id.starts_with("arch-theme-")).count();
     let cats = graph.nodes.iter().filter(|n| n.id.starts_with("arch-cat-") || n.id.starts_with("arch-group-")).count();
 
@@ -325,8 +329,6 @@ fn archivist_diagnostic(mask: bool) -> Result<String, String> {
     let mut dom_counts: BTreeMap<String, usize> = BTreeMap::new();
     for e in domains.values() { *dom_counts.entry(e.domain.clone()).or_default() += 1; }
 
-    let label_of: HashMap<&str, &str> = graph.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
-    let child_count = |id: &str| graph.nodes.iter().filter(|c| c.parent_id.as_deref() == Some(id)).count();
     // Domaine majoritaire des enfants tagués d'un dossier (pour le mode masqué).
     let folder_domain = |fid: &str| -> String {
         let mut c: HashMap<&str, usize> = HashMap::new();
@@ -339,39 +341,227 @@ fn archivist_diagnostic(mask: bool) -> Result<String, String> {
     };
 
     let mut out = String::from("==================== RAPPORT ARCHIVISTE ====================\n\n");
+    // Le rapport est fait pour être collé tel quel à un tiers (humain ou IA) qui
+    // ne connaît ni Lucid ni l'Archiviste : sans cette légende il était illisible
+    // hors contexte (retour Liam, 2026-08-02).
+    out.push_str(
+        "— Comment lire ce rapport —\n\
+         Lucid indexe les documents locaux d'un utilisateur et un module nommé\n\
+         « l'Archiviste » les range automatiquement dans des dossiers thématiques\n\
+         qu'il crée lui-même. Ce rapport ne décrit QUE la structure obtenue :\n\
+         aucun contenu, aucun nom de fichier, aucun nom de dossier réel.\n\
+         \n\
+         Documents totaux  : documents connus du cerveau.\n\
+         Rangés en thèmes  : rangés par l'Archiviste dans un dossier thématique.\n\
+         Non triable       : examinés, mais aucun thème pertinent trouvé.\n\
+         Hors périmètre    : jamais traités (ni rangés, ni marqués non triable) —\n\
+         \x20                   éclatés par cause juste après, les causes sont\n\
+         \x20                   exclusives et leur somme fait le total.\n\
+         Domaines          : étiquette donnée à chaque document par le modèle local.\n\
+         Arbre             : « N ici » = documents directement dans ce dossier,\n\
+         \x20                   « N au total » = en incluant les sous-dossiers.\n\
+         [Domaine] #N      : nom de dossier masqué. Le #N identifie le dossier de\n\
+         \x20                   façon unique DANS CE RAPPORT — deux lignes du même\n\
+         \x20                   domaine avec des numéros différents sont bien deux\n\
+         \x20                   dossiers distincts, pas un doublon d'affichage.\n\n",
+    );
+    // Réglages EN TÊTE : sans eux, impossible de savoir à quelle configuration
+    // correspond un rapport quand on en compare plusieurs (demande Liam, 2026-08-03).
+    let last_pass: Option<PassMetrics> = std::fs::read_to_string(pass_metrics_path(&dir)).ok()
+        .and_then(|r| serde_json::from_str(&r).ok());
+    match &last_pass {
+        Some(m) => out.push_str(&format!(
+            "— Réglages de la dernière passe —\ngarde de domaine (ancrage)    : {}\ngarde de domaine (clustering) : {}\nseuil d'ancrage               : {:.2}\nregroupement en parents       : {}\n\n",
+            m.tuning.domain_guard_anchor, m.tuning.domain_guard_cluster,
+            m.tuning.anchor_sim_threshold, m.tuning.taxonomy_grouping,
+        )),
+        None => out.push_str("— Réglages de la dernière passe —\n(aucune passe enregistrée : lance l'Archiviste une fois)\n\n"),
+    }
+
+    // Ni rangé ni marqué non-triable = jamais passé entre les mains de
+    // l'Archiviste. Sans cette ligne les trois compteurs ne bouclaient pas sur le
+    // total et on ne voyait pas les documents hors périmètre. La population est
+    // constituée en extension (pas en soustraction) pour pouvoir l'éclater par
+    // cause juste après — un total sans explication n'est pas actionnable
+    // (retour Liam, 2026-08-03).
+    let hors_ids: std::collections::HashSet<&str> = graph.nodes.iter()
+        .filter(|n| is_doc(n))
+        .filter(|n| !n.parent_id.as_deref().is_some_and(|p| is_theme(p) || p.starts_with("arch-non-triable")))
+        .map(|n| n.id.as_str())
+        .collect();
+    let hors = hors_ids.len();
+    let why = archivist::skip_breakdown(&graph, &hors_ids);
     out.push_str(&format!(
-        "Documents totaux   : {total}\nRangés en thèmes   : {sorted}\nNon triable        : {non_triable}\nThèmes / catégories: {themes} / {cats}\n\n"
+        "— Chiffres clés —\nDocuments totaux   : {total}\nRangés en thèmes   : {sorted}\nNon triable        : {non_triable}\nHors périmètre     : {hors}\nThèmes / catégories: {themes} / {cats}\n\n"
     ));
-    out.push_str("— Domaines (tags Gemma) —\n");
+    if hors > 0 {
+        out.push_str("— Hors périmètre, par cause —\n");
+        for (n, cause) in [
+            (why.duplicate_title, "titre partagé avec un autre nœud → réservé à la décision de fusion, jamais rangé"),
+            (why.outside_scan_scope, "ni à la racine ni sous un dossier scanné → réputé déjà rangé"),
+            (why.has_children, "a des sous-pages → traité comme un dossier, pas comme un document"),
+            (why.routed_pending, "rangé par l'Archiviste, mais la proposition n'est pas appliquée"),
+            (why.wrong_kind, "type de nœud inattendu"),
+        ] {
+            if n > 0 { out.push_str(&format!("  {n:>4}  {cause}\n")); }
+        }
+        out.push('\n');
+    }
+    // Métriques de la dernière passe : ce que le cerveau seul ne dit pas.
+    if let Some(m) = &last_pass {
+        out.push_str("— Dernière passe de l'Archiviste —\n");
+        out.push_str(&format!("Ancrés sur un dossier existant : {}\n", m.anchored));
+        out.push_str(&format!("Clusters formés                : {}\n", m.clusters));
+        out.push_str(&format!("Plus gros cluster              : {}\n", m.largest_cluster));
+        out.push_str(&format!("Envoyés en « Non triable »     : {}\n", m.non_triable_this_pass));
+        out.push_str(&format!("Noms repris du cache           : {}\n", m.names_reused));
+        if m.cohesion.is_empty() {
+            out.push_str("Similarité interne des clusters : (aucun cluster)\n");
+        } else {
+            let avg = m.cohesion.iter().sum::<f32>() / m.cohesion.len() as f32;
+            let mut sorted = m.cohesion.clone();
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let each: Vec<String> = sorted.iter().map(|c| format!("{c:.3}")).collect();
+            out.push_str(&format!("Similarité interne moyenne     : {avg:.3}\n"));
+            out.push_str(&format!("  par cluster (décroissant)    : {}\n", each.join(", ")));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("— Domaines (étiquette attribuée par le modèle local) —\n");
     let mut dv: Vec<_> = dom_counts.iter().collect();
     dv.sort_by(|a, b| b.1.cmp(a.1));
     for (d, c) in dv { out.push_str(&format!("  {c:>4}  {d}\n")); }
-    out.push_str(&format!("  total taggé : {}\n\n", domains.len()));
+    out.push_str(&format!(
+        "  {} documents étiquetés sur {total} ({} sans étiquette)\n\n",
+        domains.len(),
+        total.saturating_sub(domains.len())
+    ));
 
-    out.push_str("— Structure (nb docs · dossier ← parent) —\n");
-    let mut rows: Vec<(usize, String, String)> = graph.nodes.iter()
-        .filter(|n| n.id.starts_with("arch-"))
-        .map(|n| {
-            let k = child_count(&n.id);
-            let parent = n.parent_id.as_deref().and_then(|p| label_of.get(p).copied()).unwrap_or("RACINE").to_string();
-            (k, n.id.clone(), parent)
-        })
-        .map(|(k, id, parent)| {
-            if mask {
-                let name = if id.starts_with("arch-non-triable") { "Non triable".to_string() } else { format!("[{}]", folder_domain(&id)) };
-                let par = if parent == "RACINE" { "RACINE".to_string() } else { "[parent]".to_string() };
-                (k, name, par)
+    out.push_str("— Arbre des dossiers créés par l'Archiviste —\n");
+    // Mode masqué : le domaine seul ne suffit pas à identifier un dossier — cinq
+    // dossiers distincts de facturation s'affichaient tous « [Facturation] », et
+    // le parent réduit à un « [parent] » constant faisait perdre TOUTE la
+    // hiérarchie (rapport illisible sur données réelles, constaté 2026-08-02).
+    // On numérote chaque dossier : l'arbre redevient reconstructible sans jamais
+    // révéler un label. Le numéro n'a de sens que dans un rapport donné.
+    let arch: Vec<&BrainNode> = graph.nodes.iter().filter(|n| n.id.starts_with("arch-")).collect();
+    let masked: HashMap<&str, String> = arch.iter().enumerate()
+        .map(|(i, n)| {
+            let name = if n.id.starts_with("arch-non-triable") {
+                format!("Non triable #{i}")
             } else {
-                (k, label_of.get(id.as_str()).copied().unwrap_or("?").to_string(), parent)
-            }
+                format!("[{}] #{i}", folder_domain(&n.id))
+            };
+            (n.id.as_str(), name)
         })
         .collect();
-    rows.sort_by(|a, b| a.2.cmp(&b.2).then(b.0.cmp(&a.0)));
-    for (k, name, parent) in rows { out.push_str(&format!("  {k:>4}  {name} ← {parent}\n")); }
 
-    out.push_str("\n(aucun contenu de document dans ce rapport — RGPD)\n");
-    if mask { out.push_str("(mode masqué : noms de dossiers remplacés par leur domaine)\n"); }
+    // Liste plate « dossier ← parent » auparavant : le lecteur devait reconstruire
+    // l'arbre de tête, et le compteur affiché mélangeait documents et sous-dossiers
+    // (un dossier de 4 sous-dossiers affichait « 4 », lu comme 4 documents).
+    let names: HashMap<&str, String> = if mask {
+        masked
+    } else {
+        arch.iter().map(|n| (n.id.as_str(), n.label.clone())).collect()
+    };
+    let direct_docs: HashMap<&str, usize> = arch.iter()
+        .map(|n| {
+            let k = graph.nodes.iter()
+                .filter(|c| c.parent_id.as_deref() == Some(n.id.as_str()) && is_doc(c))
+                .count();
+            (n.id.as_str(), k)
+        })
+        .collect();
+
+    // Noms des documents rangés dans chaque dossier — UNIQUEMENT en mode non
+    // masqué. C'est le mode de vérification LOCALE : sans les noms, impossible de
+    // dire pourquoi un document se retrouve dans le mauvais dossier (demande de
+    // Liam le 2026-08-03). Le mode masqué reste le mode de PARTAGE et ne doit
+    // jamais en contenir un seul.
+    let doc_labels: Option<std::collections::HashMap<&str, Vec<&str>>> = (!mask).then(|| {
+        let mut m: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+        for n in &graph.nodes {
+            if !is_doc(n) { continue; }
+            if let Some(p) = n.parent_id.as_deref() {
+                if p.starts_with("arch-") { m.entry(p).or_default().push(n.label.as_str()); }
+            }
+        }
+        for v in m.values_mut() { v.sort_unstable(); }
+        m
+    });
+
+    let arch_ids: std::collections::HashSet<&str> = arch.iter().map(|n| n.id.as_str()).collect();
+    let mut kids: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut roots: Vec<&str> = Vec::new();
+    for n in &arch {
+        match n.parent_id.as_deref() {
+            Some(p) if arch_ids.contains(p) => kids.entry(p).or_default().push(n.id.as_str()),
+            _ => roots.push(n.id.as_str()),
+        }
+    }
+
+    let mut trees: Vec<(usize, String)> = roots.iter()
+        .map(|r| {
+            let mut buf = String::new();
+            let t = diag_tree(r, 0, &kids, &direct_docs, &names, doc_labels.as_ref(), &mut buf);
+            (t, buf)
+        })
+        .collect();
+    trees.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, buf) in trees { out.push_str(&buf); }
+
+    if mask {
+        out.push_str("\n(aucun contenu ni nom de fichier dans ce rapport — RGPD)\n");
+        out.push_str("(mode masqué : noms de dossiers remplacés par leur domaine + un numéro)\n");
+    } else {
+        out.push_str("\n⚠️ MODE LOCAL — ce rapport contient les VRAIS noms de dossiers et de\n");
+        out.push_str("documents. À garder sur ta machine : ne le colle ni dans un chat, ni dans\n");
+        out.push_str("un ticket, ni à une IA tierce. Pour partager, utilise le diagnostic anonymisé.\n");
+    }
     Ok(out)
+}
+
+/// Rend un dossier de l'Archiviste et sa descendance en arbre indenté ; renvoie
+/// le nombre de documents du sous-arbre. Sous-arbres triés par taille pour que
+/// l'essentiel arrive en haut. Fonction libre plutôt que closure : elle récurse.
+fn diag_tree(
+    id: &str,
+    depth: usize,
+    kids: &std::collections::HashMap<&str, Vec<&str>>,
+    docs: &std::collections::HashMap<&str, usize>,
+    names: &std::collections::HashMap<&str, String>,
+    doc_labels: Option<&std::collections::HashMap<&str, Vec<&str>>>,
+    out: &mut String,
+) -> usize {
+    let direct = docs.get(id).copied().unwrap_or(0);
+    let mut parts: Vec<(usize, String)> = kids.get(id).map(|v| v.as_slice()).unwrap_or(&[]).iter()
+        .map(|c| {
+            let mut buf = String::new();
+            let t = diag_tree(c, depth + 1, kids, docs, names, doc_labels, &mut buf);
+            (t, buf)
+        })
+        .collect();
+    parts.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let total = direct + parts.iter().map(|p| p.0).sum::<usize>();
+    let name = names.get(id).map(|s| s.as_str()).unwrap_or("?");
+    let indent = "    ".repeat(depth);
+    let bullet = if depth == 0 { "" } else { "└ " };
+    if parts.is_empty() {
+        out.push_str(&format!("  {indent}{bullet}{name} — {direct} ici\n"));
+    } else {
+        out.push_str(&format!("  {indent}{bullet}{name} — {direct} ici, {total} au total\n"));
+    }
+    // Mode local : le contenu du dossier, un document par ligne — c'est là qu'on
+    // voit d'un coup d'œil ce qui n'a rien à y faire.
+    if let Some(labels) = doc_labels {
+        for label in labels.get(id).map(|v| v.as_slice()).unwrap_or(&[]) {
+            out.push_str(&format!("  {indent}    · {label}\n"));
+        }
+    }
+    for (_, buf) in parts { out.push_str(&buf); }
+    total
 }
 
 // ── Cache d'embeddings (incrémental) ─────────────────────────────────────────
@@ -459,11 +649,15 @@ struct DomainEntry { sig: String, domain: String }
 
 fn domain_cache_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_domains.json") }
 
-fn domain_tags_cached(dir: &std::path::Path, nodes: &[&BrainNode], engine: Option<&LlamaEngine>) -> std::collections::HashMap<String, String> {
+/// Renvoie `(id → domaine, lots_en_échec)`. Le second terme remonte jusqu'au
+/// rapport de l'Archiviste : une passe avec des lots en échec a des trous, et
+/// doit le dire plutôt que de se lire comme une passe réussie.
+fn domain_tags_cached(dir: &std::path::Path, nodes: &[&BrainNode], engine: Option<&LlamaEngine>) -> (std::collections::HashMap<String, String>, usize) {
     let mut cache: std::collections::HashMap<String, DomainEntry> =
         std::fs::read_to_string(domain_cache_path(dir)).ok()
             .and_then(|r| serde_json::from_str(&r).ok())
             .unwrap_or_default();
+    let mut failed_batches = 0usize;
     if let Some(e) = engine {
         // À (re)tagger : entrée absente ou signature changée.
         let todo: Vec<(String, String, String)> = nodes.iter()
@@ -477,7 +671,12 @@ fn domain_tags_cached(dir: &std::path::Path, nodes: &[&BrainNode], engine: Optio
         if !todo.is_empty() {
             let sigs: std::collections::HashMap<String, String> =
                 nodes.iter().map(|n| (n.id.clone(), embed_sig(n))).collect();
-            let tags = archivist::ai_domain_tags(e, &todo);
+            // Seuls les docs des lots RÉUSSIS reviennent ici : ceux des lots en
+            // échec sont absents, donc rien n'est écrit pour eux et ils seront
+            // retentés au prochain scan (cf. `ai_domain_tags`).
+            let (tags, fails) = archivist::ai_domain_tags(e, &todo);
+            failed_batches = fails;
+            let written = tags.len();
             for (id, domain) in tags {
                 if let Some(sig) = sigs.get(&id) {
                     cache.insert(id.clone(), DomainEntry { sig: sig.clone(), domain });
@@ -487,14 +686,54 @@ fn domain_tags_cached(dir: &std::path::Path, nodes: &[&BrainNode], engine: Optio
             // Diagnostic : combien de docs ont VRAIMENT reçu un domaine (≠ « Autre ») —
             // si ~0, le tagging a échoué (réponse Gemma inexploitable) et la garde ne
             // filtre rien (bug 2026-07-29 : réponse tronquée → 202/202 « Autre »).
-            let classified = cache.values().filter(|d| d.domain != "Autre").count();
-            crate::elog!("🗂️ domaines: {} nouveau(x) tag(s), {} déjà en cache — {}/{} classés (≠ Autre).",
-                todo.len(), nodes.len().saturating_sub(todo.len()), classified, cache.len());
+            crate::elog!("🗂️ domaines: {written} nouveau(x) tag(s) sur {} demandé(s), {} déjà en cache — {} tag(s) au total, {failed_batches} lot(s) en échec.",
+                todo.len(), nodes.len().saturating_sub(todo.len()), cache.len());
         }
     }
-    nodes.iter()
+    let tags = nodes.iter()
         .filter_map(|n| cache.get(&n.id).map(|d| (n.id.clone(), d.domain.clone())))
-        .collect()
+        .collect();
+    (tags, failed_batches)
+}
+
+/// Purge unique des « Autre » fossilisés par l'ancien `ai_domain_tags` : un lot
+/// en échec y écrivait « Autre » sous la signature courante des documents, qui
+/// n'étaient donc plus jamais reclassés. On retire ces entrées UNE fois — les
+/// docs concernés seront simplement retaggés à la passe suivante (ceux qui sont
+/// légitimement « Autre » le redeviendront, au prix d'un appel par 30 docs).
+///
+/// Marqueur sur disque, sinon purger à chaque lancement forcerait le
+/// reclassement de tous les « Autre » légitimes indéfiniment. Le marqueur n'est
+/// posé qu'après une écriture réussie : un disque plein fait retenter au
+/// lancement suivant plutôt que de perdre la purge en silence.
+///
+/// Appelée au début de chaque passe de l'Archiviste plutôt qu'au démarrage de
+/// l'app : c'est le seul endroit où le dossier de données du compte ACTIF est
+/// garanti (il dépend de `active_user`, qui peut changer après un login), et ça
+/// enchaîne directement sur le retaggage au lieu d'attendre la passe suivante.
+fn purge_fossil_autre_once(dir: &std::path::Path) {
+    // Marqueur VERSIONNÉ : « Autre » a été retiré de la taxonomie le 2026-08-03,
+    // les entrées « Autre » encore en cache doivent donc être retaguées une fois
+    // de plus. Bump du suffixe = la purge se rejoue exactement une fois.
+    let marker = dir.join("archivist_domains.purged.v2");
+    if marker.exists() { return; }
+    let path = domain_cache_path(dir);
+    let mut cache: std::collections::HashMap<String, DomainEntry> =
+        match std::fs::read_to_string(&path).ok().and_then(|r| serde_json::from_str(&r).ok()) {
+            Some(c) => c,
+            // Pas de cache (ou illisible) : rien à purger, mais on pose quand
+            // même le marqueur — le nouveau code ne peut plus produire de fossile.
+            None => { let _ = std::fs::write(&marker, b""); return; }
+        };
+    let before = cache.len();
+    cache.retain(|_, d| d.domain != "Autre");
+    let removed = before - cache.len();
+    if removed > 0 {
+        let Ok(json) = serde_json::to_string(&cache) else { return };
+        if std::fs::write(&path, json).is_err() { return; }
+        crate::elog!("🗂️ domaines: {removed} tag(s) « Autre » purgé(s) (fossiles d'un lot en échec) — reclassement à cette passe.");
+    }
+    let _ = std::fs::write(&marker, b"");
 }
 
 // ── Cache des NOMS de thèmes (stabilité entre deux passes) ───────────────────
@@ -626,14 +865,104 @@ fn centroid(vecs: &[&Vec<f32>]) -> Vec<f32> {
 struct EmbedPlan {
     anchors: Vec<(String, String)>,
     clusters: Vec<archivist::ThemeCluster>,
+    /// Lots de classement de domaine dont l'appel IA a échoué — remontés au
+    /// rapport pour ne pas présenter une passe trouée comme une passe complète.
+    domain_failures: usize,
+    /// Similarité interne moyenne de chaque cluster retenu (membres ↔ centroïde),
+    /// même mesure que la garde de cohésion. Même ordre que `clusters`.
+    cohesion: Vec<f32>,
+    /// Clusters dont le nom vient du cache (donc aucun appel de nommage).
+    names_reused: usize,
 }
 
 /// Seuil pour rattacher un document à un dossier EXISTANT (§②). Un peu plus
 /// permissif que la création d'un nouveau thème : on préfère rejoindre l'existant.
+/// Défaut seulement : la valeur effective vient de `ArchivistTuning`.
 const ANCHOR_SIM_THRESHOLD: f32 = 0.84;
 
-fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &BrainGraph, engine: Option<&LlamaEngine>) -> EmbedPlan {
-    let mut plan = EmbedPlan { anchors: Vec::new(), clusters: Vec::new() };
+// ── Réglages de passe (fichier, sans recompilation) ──────────────────────────
+// Les deux gardes inter-domaines et le seuil d'ancrage sont pilotables par
+// fichier pour MESURER leur effet sur des passes successives (demande Liam,
+// 2026-08-03 — hypothèse à tester : depuis le k-NN mutuel + la garde de cohésion,
+// la garde de domaine ne protégerait plus rien et empêcherait l'ancrage, qui
+// exige simultanément cosinus ≥ seuil ET même domaine). Les défauts reproduisent
+// exactement le comportement d'avant ce flag.
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
+struct ArchivistTuning {
+    /// Garde inter-domaines à l'ANCRAGE sur un dossier existant.
+    #[serde(default = "tuning_true")]
+    domain_guard_anchor: bool,
+    /// Garde inter-domaines au CLUSTERING (un paquet par domaine).
+    #[serde(default = "tuning_true")]
+    domain_guard_cluster: bool,
+    /// Similarité cosinus minimale pour rejoindre un dossier existant.
+    #[serde(default = "tuning_anchor_sim")]
+    anchor_sim_threshold: f32,
+    /// Passe de consolidation qui invente des dossiers PARENTS pour chapeauter les
+    /// thèmes. `false` par défaut (décision Liam, 2026-08-03) : les feuilles sont
+    /// fiables, les parents étaient devinés d'après un nom et rangeaient de travers.
+    /// Repasser à `true` pour remesurer.
+    #[serde(default)]
+    taxonomy_grouping: bool,
+}
+
+fn tuning_true() -> bool { true }
+fn tuning_anchor_sim() -> f32 { ANCHOR_SIM_THRESHOLD }
+
+impl Default for ArchivistTuning {
+    fn default() -> Self {
+        Self {
+            domain_guard_anchor: true,
+            domain_guard_cluster: true,
+            anchor_sim_threshold: ANCHOR_SIM_THRESHOLD,
+            taxonomy_grouping: false,
+        }
+    }
+}
+
+fn tuning_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_tuning.json") }
+
+/// Lit les réglages de la passe. Crée le fichier avec les défauts s'il est absent
+/// — sinon il faudrait deviner son nom ET son schéma pour le modifier. Fichier
+/// illisible ⇒ défauts : un réglage cassé ne doit jamais empêcher une passe.
+/// Chaque champ a son `serde(default)` : un fichier partiel garde les défauts
+/// pour le reste, il n'y a donc pas de garde désactivée par omission.
+fn load_tuning(dir: &std::path::Path) -> ArchivistTuning {
+    let path = tuning_path(dir);
+    match std::fs::read_to_string(&path).ok().and_then(|r| serde_json::from_str(&r).ok()) {
+        Some(t) => t,
+        None => {
+            let t = ArchivistTuning::default();
+            if let Ok(json) = serde_json::to_string_pretty(&t) { let _ = std::fs::write(&path, json); }
+            t
+        }
+    }
+}
+
+// ── Métriques de la dernière passe ───────────────────────────────────────────
+// Le rapport de diagnostic lit le CERVEAU, pas une passe : ces chiffres-là ne
+// sont visibles que pendant l'exécution. On les persiste donc pour pouvoir
+// comparer deux passes lancées avec deux réglages différents.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct PassMetrics {
+    tuning: ArchivistTuning,
+    anchored: usize,
+    clusters: usize,
+    largest_cluster: usize,
+    cohesion: Vec<f32>,
+    /// Documents envoyés en « Non triable » PAR CETTE PASSE (≠ total du bac).
+    non_triable_this_pass: usize,
+    names_reused: usize,
+}
+
+fn pass_metrics_path(dir: &std::path::Path) -> std::path::PathBuf { dir.join("archivist_last_pass.json") }
+
+fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &BrainGraph, engine: Option<&LlamaEngine>, tuning: &ArchivistTuning) -> EmbedPlan {
+    let mut plan = EmbedPlan {
+        anchors: Vec::new(), clusters: Vec::new(), domain_failures: 0,
+        cohesion: Vec::new(), names_reused: 0,
+    };
     if pool.is_empty() { return plan; }
 
     // Dossiers thématiques existants (jamais « Non triable » ni dossiers-source)
@@ -661,17 +990,29 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     // Tag de domaine (le signal SUJET) pour tout ce qu'on manipule. Sert de GARDE :
     // on n'ancre/ne regroupe jamais à travers deux domaines, même si l'embedding
     // les croit proches (forme partagée). Caché → payé une fois par doc.
-    let domains = domain_tags_cached(dir, &to_embed, engine);
-    let domain_of = |id: &str| domains.get(id).map(|s| s.as_str()).unwrap_or("Autre");
+    let (domains, domain_failures) = domain_tags_cached(dir, &to_embed, engine);
+    plan.domain_failures = domain_failures;
+    // `None` = document non tagué. Plus de repli « Autre » : sans domaine il n'y a
+    // pas de garde à évaluer, donc on ne regroupe pas — le document repart en
+    // « Non triable » et sera retagué au scan suivant (son absence du cache le
+    // garantit). Assimiler « pas de domaine » à un domaine revenait à autoriser
+    // tous ces documents à se regrouper entre eux, ce que la garde était
+    // précisément censée empêcher.
+    let domain_of = |id: &str| domains.get(id).map(|s| s.as_str());
 
     // Centroïde + domaine MAJORITAIRE des enfants de chaque dossier existant.
-    let centroids: Vec<(String, Vec<f32>, String)> = folder_children.iter()
+    // Le domaine est `Option` : un dossier dont aucun enfant n'est tagué n'en a
+    // pas. Garde ON, il devient inancrable (rien à comparer) ; garde OFF, il
+    // redevient candidat comme les autres — c'est ce qu'on veut pouvoir mesurer.
+    let centroids: Vec<(String, Vec<f32>, Option<String>)> = folder_children.iter()
         .filter_map(|(fid, kids)| {
             let kv: Vec<&Vec<f32>> = kids.iter().filter_map(|n| vecs.get(&n.id)).collect();
             if kv.is_empty() { return None; }
             let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-            for n in kids { *counts.entry(domain_of(&n.id)).or_default() += 1; }
-            let dom = counts.into_iter().max_by_key(|(_, c)| *c).map(|(d, _)| d.to_string()).unwrap_or_else(|| "Autre".into());
+            for n in kids {
+                if let Some(d) = domain_of(&n.id) { *counts.entry(d).or_default() += 1; }
+            }
+            let dom = counts.into_iter().max_by_key(|(_, c)| *c).map(|(d, _)| d.to_string());
             Some((fid.to_string(), centroid(&kv), dom))
         })
         .collect();
@@ -684,14 +1025,17 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     for (id, _) in pool {
         let Some(v) = vecs.get(id) else { continue };
         let doc_dom = domain_of(id);
+        // Garde ON et document non tagué → rien à comparer, on passe. Garde OFF,
+        // le domaine n'entre pas en compte : un non tagué reste ancrable.
+        if tuning.domain_guard_anchor && doc_dom.is_none() { continue; }
         let mut best: Option<(&str, f32)> = None;
         for (fid, c, fdom) in &centroids {
-            if fdom != doc_dom { continue; } // garde de domaine
+            if tuning.domain_guard_anchor && fdom.as_deref() != doc_dom { continue; } // garde de domaine
             let s = ai::llama::cosine(v, c);
             if best.map(|(_, bs)| s > bs).unwrap_or(true) { best = Some((fid.as_str(), s)); }
         }
         if let Some((fid, s)) = best {
-            if s >= ANCHOR_SIM_THRESHOLD {
+            if s >= tuning.anchor_sim_threshold {
                 plan.anchors.push((id.clone(), fid.to_string()));
                 anchored.insert(id.clone());
             }
@@ -705,7 +1049,17 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     let mut name_cache = load_cluster_names(dir);
     let mut reused = 0usize;
     let mut by_domain: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
-    for (i, (id, _)) in rest.iter().enumerate() { by_domain.entry(domain_of(id)).or_default().push(i); }
+    // Garde ON : un paquet par domaine, les non tagués ne forment aucun paquet.
+    // Garde OFF : UN seul paquet, le k-NN mutuel et la garde de cohésion font seuls
+    // le travail — c'est l'hypothèse à mesurer. La suite (seuils, MIN_CLUSTER,
+    // cohésion) est identique dans les deux cas.
+    for (i, (id, _)) in rest.iter().enumerate() {
+        if !tuning.domain_guard_cluster {
+            by_domain.entry("(garde désactivée)").or_default().push(i);
+        } else if let Some(d) = domain_of(id) {
+            by_domain.entry(d).or_default().push(i);
+        }
+    }
     for (_dom, idxs) in &by_domain {
         if idxs.len() < 3 { continue; }
         let sub_vecs: Vec<Vec<f32>> = idxs.iter().map(|&i| vecs[&rest[i].0].clone()).collect();
@@ -734,12 +1088,22 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
                 }
             };
             remember_cluster_name(&mut name_cache, &node_ids, &label);
+            // Cohésion du cluster RETENU, dans le même ordre que `clusters` : mesure
+            // seule, elle n'entre dans aucune décision (la garde de cohésion a déjà
+            // statué dans `cluster_indices`).
+            let member_vecs: Vec<&Vec<f32>> = node_ids.iter().filter_map(|id| vecs.get(id)).collect();
+            let coh = if member_vecs.is_empty() { 0.0 } else {
+                let c = centroid(&member_vecs);
+                member_vecs.iter().map(|v| ai::llama::cosine(v, &c)).sum::<f32>() / member_vecs.len() as f32
+            };
+            plan.cohesion.push(coh);
             plan.clusters.push(archivist::ThemeCluster { label, node_ids });
         }
     }
     if let Ok(json) = serde_json::to_string(&name_cache) {
         let _ = std::fs::write(cluster_names_path(dir), json);
     }
+    plan.names_reused = reused;
     crate::elog!("🗂️ embed_organize: {} ancré(s) sur l'existant, {} thème(s) (dont {} noms repris du cache).",
         plan.anchors.len(), plan.clusters.len(), reused);
     plan
@@ -755,9 +1119,18 @@ fn run_archivist_scan_once_in_progress(
     on_progress: impl Fn(usize, usize),
 ) -> Result<String, String> {
     let _ = std::fs::write(archivist_marker_path(dir), b"");
+    purge_fossil_autre_once(dir);
+    let tuning = load_tuning(dir);
+    let mut metrics = PassMetrics { tuning, ..Default::default() };
+    crate::elog!("🗂️ réglages: garde_ancrage={}, garde_clustering={}, seuil_ancrage={:.2}",
+        tuning.domain_guard_anchor, tuning.domain_guard_cluster, tuning.anchor_sim_threshold);
     let graph: BrainGraph = backup::load_brain_cached(dir)?;
     let result = archivist::scan(&graph);
     let engine = LlamaEngine::detect().ok();
+    // Relevé d'avant-passe : le compteur du moteur est cumulatif depuis le
+    // lancement, seul le delta concerne CETTE passe.
+    let failed_calls_before = ai::llama::failed_calls();
+    let mut domain_failures = 0usize;
 
     let mut report = String::new();
     let mut n = 0usize;
@@ -857,7 +1230,13 @@ fn run_archivist_scan_once_in_progress(
         engine.is_some(), ai::llama::embed_model_available(), ai_pool.len(), result.catchall_id);
 
     if ai::llama::embed_model_available() {
-        let plan = embed_organize(dir, &ai_pool, &graph, engine.as_ref());
+        let plan = embed_organize(dir, &ai_pool, &graph, engine.as_ref(), &tuning);
+        domain_failures = plan.domain_failures;
+        metrics.anchored = plan.anchors.len();
+        metrics.clusters = plan.clusters.len();
+        metrics.largest_cluster = plan.clusters.iter().map(|c| c.node_ids.len()).max().unwrap_or(0);
+        metrics.cohesion = plan.cohesion.clone();
+        metrics.names_reused = plan.names_reused;
         let mut anchored: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (doc, folder) in &plan.anchors {
             let mv = format!("arch-move-{n}"); n += 1;
@@ -939,6 +1318,7 @@ fn run_archivist_scan_once_in_progress(
         .filter(|(id, _)| !ai_clustered.contains(id))
         .cloned()
         .collect();
+    metrics.non_triable_this_pass = still_leftover.len();
     if !still_leftover.is_empty() {
         let target_id = match &result.catchall_id {
             Some(existing) => existing.clone(),
@@ -963,13 +1343,21 @@ fn run_archivist_scan_once_in_progress(
         ));
     }
 
-    // Consolidation : le clustering par lots crée des thèmes qui se recouvrent
-    // (« Immobilier » ×3, « Administratif » ×2…). Une passe Gemma les organise en
-    // ARBORESCENCE multi-niveaux (profondeur jugée par l'IA — Liam, 2026-07-28) :
-    // root › « Immobilier » › « Ventes » › { thèmes }. Chaque segment de chemin
-    // devient un conteneur `arch-cat-<slug cumulé>` (id déterministe → idempotent,
-    // pas de doublon entre runs). Le circuit de résolution applique « create » d'un
-    // parent avant le « create »/« move » de ses enfants (dépendance parent_id).
+    // ── Consolidation en arborescence — DÉSACTIVÉE PAR DÉFAUT ────────────────
+    // Elle regroupe les dossiers-thèmes sous des parents inventés par Gemma, à
+    // partir de leur NOM et d'un échantillon de 5 libellés d'enfants. Sur données
+    // réelles, c'est la couche qui produit les erreurs les plus visibles : des
+    // devis d'un client pharmaceutique classés sous « Santé », avec des notes de
+    // physique et des fichiers de nutrition pour voisins. Elle sur-structure aussi
+    // (« Administration › Facturation › Factures X » = trois niveaux pour dire
+    // « des factures »), et `collapse_taxonomy` n'y suffit pas.
+    //
+    // Décision Liam, 2026-08-03 : « vaut mieux 25 dossiers bien rangés que 8
+    // nuls. » Les FEUILLES sont bonnes (elles viennent du clustering par
+    // embeddings, déterministe) ; les parents sont des devinettes. On garde donc
+    // les dossiers à plat. Le code reste en place derrière `taxonomy_grouping`
+    // pour pouvoir le remesurer sans le réécrire.
+    if tuning.taxonomy_grouping {
     if let (Some(e), Some(root_id)) = (&engine, root_id.as_ref()) {
         // Candidats = tous les regroupements thématiques Archiviste au niveau racine
         // (thèmes plats + groupes/catégories déjà créés) + les clusters de CE run,
@@ -1029,6 +1417,32 @@ fn run_archivist_scan_once_in_progress(
                 write_pending_proposal(dir, &id, "move", "", "", theme_id, &parent, &[])?;
             }
             report.push_str(&format!("→ regrouper {} dossier(s) sous « {} »\n", grp.theme_ids.len(), grp.path.join(" / ")));
+        }
+    }
+    } else if let Some(root_id) = root_id.as_ref() {
+        // Aplatissement : ramène à la racine les thèmes qu'une passe précédente a
+        // rangés sous un parent inventé. Sans ça, désactiver la consolidation
+        // arrêterait seulement d'en créer de NOUVEAUX — les mauvais parents déjà
+        // en place resteraient affichés, donc le problème resterait entier.
+        //
+        // Idempotent sans marqueur : on ne propose que pour un thème dont le parent
+        // ACTUEL est un conteneur de consolidation. Une fois à la racine, plus rien
+        // n'est proposé. Passe par le circuit de propositions comme le reste — pas
+        // d'écriture directe dans le cerveau.
+        let is_cat = |id: &str| id.starts_with("arch-cat-") || id.starts_with("arch-group-");
+        let mut flattened = 0usize;
+        for node in &graph.nodes {
+            if !node.id.starts_with("arch-theme-") { continue; }
+            if !node.parent_id.as_deref().is_some_and(is_cat) { continue; }
+            let id = format!("arch-move-{n}");
+            n += 1;
+            write_pending_proposal(dir, &id, "move", "", "", &node.id, root_id, &[])?;
+            flattened += 1;
+        }
+        if flattened > 0 {
+            report.push_str(&format!(
+                "→ {flattened} dossier(s) ramené(s) à la racine (regroupement automatique désactivé)\n"
+            ));
         }
     }
 
@@ -1156,6 +1570,23 @@ fn run_archivist_scan_once_in_progress(
     // même passage (cf. commentaire sur `orphans_unresolved_ids`) — le laisser
     // aurait rapporté deux fois la même chose sous deux formulations différentes.
 
+    // Une passe trouée ne doit pas se lire comme une passe réussie. Les documents
+    // des lots en échec ne sont ni taggés ni mis en cache (ils repasseront), mais
+    // sans cette ligne l'utilisateur ne voit qu'un rangement incomplet sans cause
+    // — c'est exactement ce qui a rendu la fossilisation « Autre » invisible
+    // pendant des semaines. Placé AVANT la garde « rapport jamais vide » : une
+    // passe dont le seul événement est un échec ne doit pas annoncer « rien à ranger ».
+    let failed_calls = ai::llama::failed_calls().saturating_sub(failed_calls_before);
+    if failed_calls > 0 || domain_failures > 0 {
+        report.push_str(&format!("⚠️ {failed_calls} appel(s) IA en échec pendant cette passe"));
+        if domain_failures > 0 {
+            report.push_str(&format!(
+                " — {domain_failures} lot(s) de classement laissé(s) sans domaine, à retenter au prochain scan"
+            ));
+        }
+        report.push_str(".\n");
+    }
+
     // Le rapport ne doit JAMAIS être silencieux : sans ça, "rien à faire" et
     // "je n'ai pas encore tourné" sont indiscernables pour l'utilisateur
     // (retour de Liam le 2026-07-23 : impression que l'Archiviste ne fait rien).
@@ -1164,6 +1595,13 @@ fn run_archivist_scan_once_in_progress(
             Some(_) => "Rien à ranger : ton cerveau est déjà bien organisé.",
             None => "Rien à ranger côté script — IA locale indisponible, aucune fusion ambiguë tranchée.",
         });
+    }
+
+    // Métriques persistées : le rapport de diagnostic lit le cerveau, pas une
+    // passe — sans ce fichier ces chiffres seraient invisibles après coup, donc
+    // impossibles à comparer d'une configuration à l'autre.
+    if let Ok(json) = serde_json::to_string_pretty(&metrics) {
+        let _ = std::fs::write(pass_metrics_path(dir), json);
     }
 
     let _ = std::fs::remove_file(archivist_marker_path(dir));
@@ -1179,6 +1617,84 @@ mod archivist_orchestration_tests {
             "id": id, "label": label, "kind": "note", "weight": 1, "parent_id": parent
         }))
         .unwrap()
+    }
+
+    /// Les flags existent pour MESURER, pas pour changer le comportement : par
+    /// défaut, et sur un dossier sans fichier de réglages, la passe doit se
+    /// comporter exactement comme avant leur introduction (gardes actives, seuil
+    /// d'ancrage 0,84). Et un fichier PARTIEL ne doit jamais désactiver une garde
+    /// par omission — c'est le piège le plus facile à créer ici.
+    #[test]
+    fn les_reglages_par_defaut_reproduisent_le_comportement_dorigine() {
+        let d = ArchivistTuning::default();
+        assert!(d.domain_guard_anchor, "garde d'ancrage active par défaut");
+        assert!(d.domain_guard_cluster, "garde de clustering active par défaut");
+        assert_eq!(d.anchor_sim_threshold, ANCHOR_SIM_THRESHOLD);
+        assert_eq!(d.anchor_sim_threshold, 0.84, "seuil historique inchangé");
+        // Seule exception au « défaut = comportement d'origine » : le regroupement
+        // en dossiers parents est volontairement COUPÉ (décision Liam 2026-08-03),
+        // les dossiers restent à plat.
+        assert!(!d.taxonomy_grouping, "regroupement en parents coupé par défaut");
+
+        let dir = std::env::temp_dir().join("lucid_test_tuning");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Dossier vierge → défauts, ET le fichier est créé pour être éditable.
+        assert_eq!(load_tuning(&dir), d);
+        assert!(tuning_path(&dir).exists(), "le fichier de réglages est créé pour pouvoir l'éditer");
+
+        // Fichier partiel : seul le seuil est donné, les deux gardes restent ACTIVES.
+        std::fs::write(tuning_path(&dir), r#"{"anchor_sim_threshold":0.7}"#).unwrap();
+        let partial = load_tuning(&dir);
+        assert!(partial.domain_guard_anchor && partial.domain_guard_cluster,
+            "un réglage omis ne doit jamais désactiver une garde");
+        assert_eq!(partial.anchor_sim_threshold, 0.7);
+
+        // Fichier illisible → défauts, jamais un plantage de passe.
+        std::fs::write(tuning_path(&dir), "pas du json").unwrap();
+        assert_eq!(load_tuning(&dir), d);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Récupération des « Autre » fossilisés (2026-08-02) : un lot en échec les
+    /// gravait en cache sous la signature courante des docs, qui n'étaient plus
+    /// jamais reclassés. La purge doit retirer les « Autre » SANS toucher aux
+    /// vrais domaines, et ne jamais retourner une seconde fois (sinon tout
+    /// « Autre » légitime serait reclassé à chaque passe, pour rien).
+    #[test]
+    fn la_purge_des_autre_fossiles_ne_passe_quune_fois_et_epargne_les_vrais_domaines() {
+        let dir = std::env::temp_dir().join("lucid_test_purge_autre");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let entry = |domain: &str| DomainEntry { sig: "sig".into(), domain: domain.into() };
+        let cache: std::collections::HashMap<String, DomainEntry> = [
+            ("doc-1".to_string(), entry("Autre")),
+            ("doc-2".to_string(), entry("Facturation")),
+            ("doc-3".to_string(), entry("Autre")),
+        ].into_iter().collect();
+        std::fs::write(domain_cache_path(&dir), serde_json::to_string(&cache).unwrap()).unwrap();
+
+        purge_fossil_autre_once(&dir);
+        let after: std::collections::HashMap<String, DomainEntry> =
+            serde_json::from_str(&std::fs::read_to_string(domain_cache_path(&dir)).unwrap()).unwrap();
+        assert_eq!(after.len(), 1, "les deux « Autre » doivent être partis");
+        assert_eq!(after.get("doc-2").map(|d| d.domain.as_str()), Some("Facturation"),
+            "un domaine réel n'est jamais purgé");
+
+        // Deuxième passe : un « Autre » légitime réapparu doit SURVIVRE.
+        let mut relu = after;
+        relu.insert("doc-4".to_string(), entry("Autre"));
+        std::fs::write(domain_cache_path(&dir), serde_json::to_string(&relu).unwrap()).unwrap();
+        purge_fossil_autre_once(&dir);
+        let final_cache: std::collections::HashMap<String, DomainEntry> =
+            serde_json::from_str(&std::fs::read_to_string(domain_cache_path(&dir)).unwrap()).unwrap();
+        assert!(final_cache.contains_key("doc-4"), "purge non rejouée : marqueur en place");
+        assert_eq!(final_cache.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Régression du 2026-07-31 : Gemma renommait le même groupe à chaque passe,

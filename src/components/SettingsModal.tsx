@@ -1294,6 +1294,28 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
           Copier un diagnostic (anonymisé)
         </button>
 
+        {/* Variante LOCALE : vrais noms de dossiers ET de documents, pour vérifier
+            soi-même pourquoi un document est mal rangé. Volontairement séparée du
+            bouton de partage ci-dessus, et libellée pour qu'on ne confonde pas les
+            deux — celui-ci ne doit jamais partir dans un retour bêta. */}
+        <button
+          onClick={async () => {
+            setBusy("diag-local"); setMsg(null);
+            try {
+              const report = await archivistDiagnostic(false); // non masqué = usage local
+              const ok = await copyText(report);
+              setMsg(ok ? "Diagnostic local copié ✓ — contient tes vrais noms, garde-le pour toi." : "Copie impossible.");
+            } catch (e) {
+              setMsg(String((e as Error).message ?? e));
+            } finally { setBusy(null); }
+          }}
+          disabled={busy !== null}
+          className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] disabled:opacity-40"
+        >
+          {busy === "diag-local" ? <Loader2 className="size-4 animate-spin" /> : null}
+          Copier avec les noms (usage local, ne pas partager)
+        </button>
+
         {/* Diagnostic stack IA : binaires/modèles présents + fin de lucid.log
             (démarrages/échecs llama-server, bootstrap, embeddings). Sert la
             boucle de test Windows : l'user colle ce bloc en cas de souci. */}

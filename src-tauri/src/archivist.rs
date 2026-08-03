@@ -330,6 +330,104 @@ pub fn scan(graph: &BrainGraph) -> ScanResult {
     }
 }
 
+/// Répartition PAR CAUSE des documents que `scan` n'a jamais routés — purement
+/// informatif (rapport de diagnostic). Ne décide rien, ne modifie rien.
+#[derive(Default, Debug)]
+pub struct SkipBreakdown {
+    /// Titre normalisé partagé avec un autre nœud : `scan` réserve ces cas à la
+    /// décision de fusion et ne les range JAMAIS thématiquement (`:256`).
+    pub duplicate_title: usize,
+    /// Le nœud a des enfants (ou c'est le bac, ou une entité) → traité en hub (`:239`).
+    pub has_children: usize,
+    /// Ni enfant direct de la racine ni sous un dossier de scan → réputé « déjà
+    /// dans un dossier thématique choisi » (`:247`).
+    pub outside_scan_scope: usize,
+    /// Kind hors leaf/note (`:252`). Structurellement 0 quand l'appelant a déjà
+    /// filtré sur leaf/note (c'est le cas du rapport) — compté quand même pour
+    /// que le total boucle si ce filtre amont change un jour.
+    pub wrong_kind: usize,
+    /// Aucune garde ne s'applique : `scan` a bel et bien routé ce document, mais
+    /// il n'est pas à sa place dans le graphe — la proposition correspondante
+    /// n'a pas (encore) été appliquée : en attente dans `mcp_pending/`, refusée,
+    /// ou bloquée par une dépendance.
+    pub routed_pending: usize,
+}
+
+/// Attribue à chaque id de `ids` la garde de `scan` qui l'a écarté du rangement.
+///
+/// ponytail: réplique les prédicats de `scan` (mêmes tests, MÊME ORDRE
+/// d'évaluation) au lieu de refactorer `scan` pour les partager — un compteur de
+/// diagnostic ne doit pas pouvoir changer le comportement du tri. Les deux
+/// vivent côte à côte dans ce fichier : toute modification d'une garde de `scan`
+/// doit être répercutée ici. Un écart reste visible plutôt que silencieux — il
+/// se déverse dans `routed_pending`, qui gonflerait sans raison.
+pub fn skip_breakdown(graph: &BrainGraph, ids: &HashSet<&str>) -> SkipBreakdown {
+    let mut out = SkipBreakdown::default();
+    if ids.is_empty() {
+        return out;
+    }
+    let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone());
+
+    // Occurrences par titre normalisé (≥2 ⇒ le nœud est dans un groupe de doublons).
+    let mut label_counts: HashMap<String, usize> = HashMap::new();
+    for n in &graph.nodes {
+        if n.kind == "root" {
+            continue;
+        }
+        *label_counts.entry(normalize(&n.label)).or_default() += 1;
+    }
+
+    let parent_of: HashMap<&str, &str> = graph
+        .nodes
+        .iter()
+        .filter_map(|n| n.parent_id.as_deref().map(|p| (n.id.as_str(), p)))
+        .collect();
+
+    let scan_root_ids: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|c| c.kind == "container" && c.parent_id.as_deref() == root_id.as_deref())
+        .filter(|c| {
+            graph.nodes.iter().any(|n| {
+                n.connector.as_deref().is_some_and(|conn| SORTABLE_CONNECTORS.contains(&conn))
+                    && ancestor_chain(&n.id, &parent_of).contains(&c.id.as_str())
+            })
+        })
+        .map(|c| c.id.as_str())
+        .collect();
+    let under_scan_root = |id: &str| ancestor_chain(id, &parent_of).iter().any(|a| scan_root_ids.contains(a));
+
+    let catchall_id: Option<&str> = graph
+        .nodes
+        .iter()
+        .find(|n| normalize(&n.label) == normalize(CATCHALL_LABEL) && !under_scan_root(&n.id))
+        .map(|n| n.id.as_str());
+
+    let has_children: HashSet<&str> = graph.nodes.iter().filter_map(|n| n.parent_id.as_deref()).collect();
+
+    for n in graph.nodes.iter().filter(|n| ids.contains(n.id.as_str())) {
+        // Ordre identique à la boucle de `scan` : chaque document est compté dans
+        // la garde qui l'a RÉELLEMENT écarté, pas dans la première qui pourrait
+        // s'appliquer. Sans racine, `scan` ne route rien du tout — tout tombe
+        // alors dans `outside_scan_scope`, ce que le test d'égalité produit déjà.
+        if Some(n.id.as_str()) == catchall_id
+            || has_children.contains(n.id.as_str())
+            || n.id.starts_with("arch-entity-")
+        {
+            out.has_children += 1;
+        } else if n.parent_id.as_ref() != root_id.as_ref() && !under_scan_root(&n.id) {
+            out.outside_scan_scope += 1;
+        } else if n.kind != "leaf" && n.kind != "note" {
+            out.wrong_kind += 1;
+        } else if label_counts.get(&normalize(&n.label)).copied().unwrap_or(0) > 1 {
+            out.duplicate_title += 1;
+        } else {
+            out.routed_pending += 1;
+        }
+    }
+    out
+}
+
 const MIN_CLUSTER: usize = 3;
 /// Mots trop génériques pour porter un thème à eux seuls (connecteurs de
 /// remplissage, jamais un vrai sujet).
@@ -916,40 +1014,55 @@ pub fn ai_name_cluster(engine: &LlamaEngine, samples: &[String]) -> Option<Strin
 // si l'embedding les croit proches. Grossier exprès — le tri fin (quel client)
 // reste fait par l'embedding À L'INTÉRIEUR du domaine.
 
-/// Taxonomie fermée. « Autre » = repli sûr (retombe sur le clustering embedding
-/// puis le bac « Non triable »). À ajuster après essai réel — volontairement court.
-pub const DOMAIN_LIST: [&str; 10] = [
+/// Taxonomie fermée. Plus de repli « Autre » (décision Liam, 2026-08-03) : un
+/// document que le modèle ne classe pas reste NON TAGUÉ — absent du cache, donc
+/// retenté au scan suivant — au lieu d'être versé dans un fourre-tout. « Autre »
+/// agrégeait des documents sans aucun rapport et, comme la garde ne compare que
+/// des domaines égaux, elle devenait inopérante ENTRE eux : c'est ce qui laissait
+/// des exports de base de données se regrouper avec des pièces d'identité.
+pub const DOMAIN_LIST: [&str; 9] = [
     "Facturation", "Devis & Commercial", "Immobilier", "Finance & Trading",
     "Contrats & Juridique", "Identité & Papiers", "Études & Cours", "Santé",
-    "Technique & Data", "Autre",
+    "Technique & Data",
+];
+
+/// Codes de transport (3 lettres) ↔ domaines canoniques. Le modèle ne rend que le
+/// code : « FAC » au lieu d'un objet `{"n":1,"domain":"Devis & Commercial"}`
+/// divise par ~3 les tokens GÉNÉRÉS, et la génération est le goulot
+/// d'étranglement (les prompts, eux, sont traités en parallèle).
+///
+/// Les codes ne sortent JAMAIS d'ici : `parse_domains` les résout en noms
+/// complets avant tout stockage, donc `archivist_domains.json`, la garde de
+/// domaine et le rapport continuent de ne voir que les noms complets.
+const DOMAIN_CODES: [(&str, &str); 9] = [
+    ("FAC", "Facturation"),
+    ("DEV", "Devis & Commercial"),
+    ("IMM", "Immobilier"),
+    ("FIN", "Finance & Trading"),
+    ("JUR", "Contrats & Juridique"),
+    ("IDE", "Identité & Papiers"),
+    ("ETU", "Études & Cours"),
+    ("SAN", "Santé"),
+    ("TEC", "Technique & Data"),
 ];
 const DOMAIN_BATCH_MAX: usize = 30;
 
-/// Ramène une chaîne libre au domaine canonique le plus proche, sinon « Autre ».
-/// Robuste aux variantes de casse/formulation de Gemma.
-pub fn normalize_domain(raw: &str) -> String {
-    let low = raw.trim().to_lowercase();
-    if low.is_empty() { return "Autre".to_string(); }
-    // Match exact d'abord, puis inclusion dans un sens ou l'autre (ex. « finance »
-    // → « Finance & Trading », « trading » aussi).
-    for d in DOMAIN_LIST {
-        let dl = d.to_lowercase();
-        if dl == low { return d.to_string(); }
+/// Code de 3 lettres → domaine canonique. `None` = inexploitable (code inconnu,
+/// halluciné, vide) : l'appelant laisse alors le document NON TAGUÉ, jamais dans
+/// un repli. Tolère le nom complet, que le modèle recopie parfois malgré la
+/// consigne — c'est du transport, pas une décision.
+pub fn domain_from_code(raw: &str) -> Option<&'static str> {
+    let key = raw.trim().to_uppercase();
+    if key.is_empty() { return None; }
+    if let Some((_, d)) = DOMAIN_CODES.iter().find(|(c, _)| *c == key) {
+        return Some(d);
     }
-    for d in DOMAIN_LIST {
-        let dl = d.to_lowercase();
-        if dl.split(&[' ', '&'][..]).any(|w| !w.trim().is_empty() && low.contains(w.trim()))
-            || low.split(&[' ', '&'][..]).any(|w| !w.trim().is_empty() && dl.contains(w.trim()))
-        {
-            return d.to_string();
-        }
-    }
-    "Autre".to_string()
+    DOMAIN_LIST.iter().find(|d| d.to_uppercase() == key).copied()
 }
 
 fn domain_prompt(docs: &[(String, String, String)]) -> String {
-    let mut out = String::from("Classe chaque document dans UN de ces domaines (recopie le nom EXACT) :\n");
-    for d in DOMAIN_LIST { out.push_str(&format!("- {d}\n")); }
+    let mut out = String::from("Classe chaque document dans UN de ces domaines. Réponds avec le CODE de 3 lettres :\n");
+    for (code, name) in DOMAIN_CODES { out.push_str(&format!("- {code} = {name}\n")); }
     out.push_str("\nDocuments (numéro : titre — extrait) :\n");
     // NB : on NUMÉROTE (1, 2, 3…) au lieu de faire recopier l'id — les ids réels
     // font 60+ caractères, 30 par lot faisaient dépasser la réponse au-delà des
@@ -963,44 +1076,84 @@ fn domain_prompt(docs: &[(String, String, String)]) -> String {
         }
     }
     out.push_str(
-        "\nFonde-toi sur le SUJET RÉEL (le contenu), pas la forme. En cas de doute, « Autre ».\n\
-         Renvoie UNIQUEMENT le JSON :\n{\"tags\": [{\"n\": 1, \"domain\": \"…\"}, ...]}\n",
+        "\nFonde-toi sur le SUJET RÉEL (le contenu), pas la forme. Choisis TOUJOURS le code le \
+         plus proche, même si l'ajustement est imparfait. N'invente aucun code.\n\
+         Renvoie UNIQUEMENT le JSON, une map plate numéro → code :\n\
+         {\"1\":\"FAC\",\"2\":\"IMM\",\"3\":\"TEC\"}\n",
     );
     out
 }
 
-/// Parse la réponse de classification en `numéro (1-based) → domaine canonique`.
-/// Ne garde que les numéros dans la borne du lot (anti-hallucination), normalise.
+/// Parse la map plate `{"1":"FAC", …}` en `numéro (1-based) → domaine canonique`.
+///
+/// Toute entrée douteuse est ABSENTE du résultat plutôt que rabattue sur un
+/// repli : numéro hors de la borne du lot (anti-hallucination), valeur non
+/// textuelle, ou code inconnu. Un document absent d'ici reste non tagué — donc
+/// non mis en cache par l'appelant, donc retenté au scan suivant.
 pub fn parse_domains(raw: &str, count: usize) -> std::collections::HashMap<usize, String> {
     let mut out = std::collections::HashMap::new();
     let Some(js) = crate::ai::pipeline::extract_json(raw) else { return out };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(js) else { return out };
-    let Some(arr) = v.get("tags").and_then(|t| t.as_array()) else { return out };
-    for e in arr {
-        let (Some(n), Some(dom)) = (e.get("n").and_then(|x| x.as_u64()), e.get("domain").and_then(|x| x.as_str())) else { continue };
-        let idx = n as usize;
-        if idx >= 1 && idx <= count { out.insert(idx, normalize_domain(dom)); }
+    let Some(obj) = v.as_object() else { return out };
+    for (key, val) in obj {
+        let Ok(idx) = key.trim().parse::<usize>() else { continue };
+        if idx < 1 || idx > count { continue; }
+        let Some(code) = val.as_str() else { continue };
+        if let Some(domain) = domain_from_code(code) {
+            out.insert(idx, domain.to_string());
+        }
     }
     out
 }
 
 /// Tag de domaine pour un lot de docs (id, titre, extrait) — par batches pour
-/// limiter les appels Gemma. Les docs sans réponse exploitable retombent sur
-/// « Autre » (jamais perdus). L'appelant met le résultat en cache.
-pub fn ai_domain_tags(engine: &LlamaEngine, docs: &[(String, String, String)]) -> std::collections::HashMap<String, String> {
+/// limiter les appels Gemma. Renvoie `(tags, lots_en_échec)`.
+///
+/// Un lot dont l'appel ÉCHOUE (erreur moteur) ou dont la réponse est
+/// INEXPLOITABLE (pas de JSON, JSON tronqué → aucun numéro parsé) ne produit
+/// AUCUNE entrée : ses documents sont absents du résultat, donc jamais mis en
+/// cache par l'appelant, donc retentés au prochain scan. Avant ce garde, un
+/// `unwrap_or_default()` faisait retomber les 30 docs du lot sur « Autre » et
+/// l'appelant gravait ce « Autre » dans le cache SOUS LEUR SIGNATURE COURANTE :
+/// ils n'étaient plus jamais reclassés tant que leur contenu ne changeait pas.
+/// Une panne de quelques secondes devenait un état permanent (diagnostiqué le
+/// 2026-08-02 ; déjà soupçonné le 2026-07-29 avec 202/202 docs en « Autre »).
+///
+/// À l'INTÉRIEUR d'un lot réussi, un document absent de la réponse garde son
+/// repli « Autre » : là, le modèle a bel et bien répondu — c'est une décision,
+/// pas une panne, et elle mérite d'être mise en cache.
+pub fn ai_domain_tags(
+    engine: &LlamaEngine,
+    docs: &[(String, String, String)],
+) -> (std::collections::HashMap<String, String>, usize) {
     let mut out = std::collections::HashMap::new();
+    let mut failed = 0usize;
     for chunk in docs.chunks(DOMAIN_BATCH_MAX) {
-        // Réponse courte (numéro + domaine) → 900 tokens laissent large pour 30 items.
-        let parsed = engine
-            .complete(Some(SYSTEM_PROMPT), &domain_prompt(chunk), 900)
-            .ok()
-            .map(|raw| parse_domains(&raw, chunk.len()))
-            .unwrap_or_default();
+        // Map plate de codes à 3 lettres : ~10 tokens par document, donc 300
+        // suffisent largement pour 30 items (c'était 900 avec l'ancien format
+        // verbeux `{"n":1,"domain":"Devis & Commercial"}`).
+        let parsed = match engine.complete(Some(SYSTEM_PROMPT), &domain_prompt(chunk), 300) {
+            Ok(raw) => parse_domains(&raw, chunk.len()),
+            Err(e) => {
+                crate::elog!("🗂️ domaines: lot de {} doc(s) → ÉCHEC appel IA ({e}) — lot non taggé, à retenter.", chunk.len());
+                failed += 1;
+                continue;
+            }
+        };
+        if parsed.is_empty() {
+            crate::elog!("🗂️ domaines: lot de {} doc(s) → réponse inexploitable — lot non taggé, à retenter.", chunk.len());
+            failed += 1;
+            continue;
+        }
+        // Un document sans code exploitable est simplement absent : plus de repli
+        // « Autre » qui le figeait en cache et le retirait de toute reprise.
         for (i, (id, _, _)) in chunk.iter().enumerate() {
-            out.insert(id.clone(), parsed.get(&(i + 1)).cloned().unwrap_or_else(|| "Autre".to_string()));
+            if let Some(domain) = parsed.get(&(i + 1)) {
+                out.insert(id.clone(), domain.clone());
+            }
         }
     }
-    out
+    (out, failed)
 }
 
 // ─── Ancrage incrémental sur les dossiers existants ─────────────────────────
@@ -1355,6 +1508,59 @@ mod tests {
         let mut n = node(id, label, "leaf", Some(parent));
         n.connector = Some("local-folder".into());
         n
+    }
+
+    /// Le rapport annonçait « Hors périmètre : 160 » sans dire pourquoi (retour
+    /// Liam, 2026-08-03). Les causes doivent être EXCLUSIVES (chaque document
+    /// compté une fois, dans la garde qui l'a réellement écarté) et leur somme
+    /// doit faire le total, sinon la répartition ment.
+    #[test]
+    fn skip_breakdown_attribue_une_seule_cause_par_document_et_boucle_sur_le_total() {
+        let mut container = |id: &str| node(id, id, "container", Some("root"));
+        let nodes = vec![
+            node("root", "Cerveau", "root", None),
+            // Dossier de scan : reconnu comme tel parce qu'une feuille local-folder vit dessous.
+            container("p:Documents"),
+            // Conteneur d'une source NON triable (Obsidian) : aucune feuille
+            // local-folder/apple-notes dessous → n'est pas un dossier de scan, son
+            // arborescence est respectée telle quelle (ADR-0020).
+            container("p:Ailleurs"),
+            // Passe toutes les gardes → `scan` l'a routé, la proposition n'est pas appliquée.
+            local_leaf("leaf:a", "Titre unique A", "p:Documents"),
+            // Deux titres identiques → réservés à la décision de fusion.
+            local_leaf("leaf:dup1", "Facture", "p:Documents"),
+            local_leaf("leaf:dup2", "Facture", "p:Documents"),
+            // A une sous-page → traité en hub, jamais rangé comme document.
+            local_leaf("leaf:hub", "Dossier client", "p:Documents"),
+            local_leaf("leaf:kid", "Sous-page unique", "leaf:hub"),
+            // Hors racine ET hors dossier de scan → réputé déjà rangé. Il FAUT une
+            // source non triable ici : avec un connecteur `local-folder`, son
+            // conteneur deviendrait lui-même un dossier de scan et le document
+            // repasserait dans le périmètre.
+            {
+                let mut n = node("leaf:ailleurs", "Titre unique B", "leaf", Some("p:Ailleurs"));
+                n.connector = Some("obsidian".into());
+                n
+            },
+        ];
+        let g = graph(nodes);
+        let ids: HashSet<&str> = g.nodes.iter()
+            .filter(|n| n.kind == "leaf" || n.kind == "note")
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 6, "6 documents dans la population analysée");
+
+        let b = skip_breakdown(&g, &ids);
+        assert_eq!(b.duplicate_title, 2, "les deux « Facture »");
+        assert_eq!(b.has_children, 1, "le hub, pas sa sous-page");
+        assert_eq!(b.outside_scan_scope, 1, "celui rangé sous un conteneur non scanné");
+        assert_eq!(b.wrong_kind, 0, "population déjà filtrée sur leaf/note");
+        assert_eq!(b.routed_pending, 2, "leaf:a et la sous-page du hub");
+        assert_eq!(
+            b.duplicate_title + b.has_children + b.outside_scan_scope + b.wrong_kind + b.routed_pending,
+            ids.len(),
+            "les causes sont exclusives et couvrent tout le total",
+        );
     }
 
     #[test]
@@ -1739,21 +1945,54 @@ mod tests {
     }
 
     #[test]
-    fn normalize_domain_ramene_a_la_taxonomie() {
-        assert_eq!(normalize_domain("Immobilier"), "Immobilier");
-        assert_eq!(normalize_domain("trading"), "Finance & Trading");   // mot partiel
-        assert_eq!(normalize_domain("FINANCE"), "Finance & Trading");   // casse
-        assert_eq!(normalize_domain("banane"), "Autre");                // hors liste
-        assert_eq!(normalize_domain(""), "Autre");
+    fn domain_from_code_resout_les_codes_et_rejette_le_reste() {
+        assert_eq!(domain_from_code("IMM"), Some("Immobilier"));
+        assert_eq!(domain_from_code("fin"), Some("Finance & Trading")); // casse tolérée
+        assert_eq!(domain_from_code(" JUR "), Some("Contrats & Juridique")); // espaces
+        // Tolérance : le modèle recopie parfois le nom complet malgré la consigne.
+        assert_eq!(domain_from_code("Immobilier"), Some("Immobilier"));
+        // Rien d'exploitable ⇒ None, JAMAIS un repli : le document restera non
+        // tagué et sera retenté au scan suivant (« Autre » n'existe plus).
+        assert_eq!(domain_from_code("XYZ"), None);
+        assert_eq!(domain_from_code("banane"), None);
+        assert_eq!(domain_from_code(""), None);
+        assert!(!DOMAIN_LIST.contains(&"Autre"), "« Autre » ne doit plus être un domaine");
     }
 
+    /// Format compact (2026-08-03) : map plate numéro → code de 3 lettres, ~3× moins
+    /// de tokens générés que l'ancien `{"tags":[{"n":1,"domain":"…"}]}`. Les codes
+    /// sont résolus en noms complets AVANT de sortir, pour que le cache et la garde
+    /// de domaine ne voient jamais un code.
     #[test]
-    fn parse_domains_filtre_les_numeros_hors_borne_et_normalise() {
-        let raw = r#"{"tags":[{"n":1,"domain":"Trading"},{"n":2,"domain":"Immobilier"},{"n":9,"domain":"Immobilier"}]}"#;
-        let out = parse_domains(raw, 2); // lot de 2 docs
+    fn parse_domains_lit_le_format_compact_et_resout_les_codes() {
+        let raw = r#"{"1":"FIN","2":"IMM","3":"TEC","9":"FAC"}"#;
+        let out = parse_domains(raw, 3); // lot de 3 docs
         assert_eq!(out.get(&1).map(|s| s.as_str()), Some("Finance & Trading"));
         assert_eq!(out.get(&2).map(|s| s.as_str()), Some("Immobilier"));
+        assert_eq!(out.get(&3).map(|s| s.as_str()), Some("Technique & Data"));
         assert!(!out.contains_key(&9), "un numéro hors borne (halluciné) doit être ignoré");
+    }
+
+    /// Un code inconnu ne doit RIEN produire — surtout pas un repli. Le document
+    /// reste absent du résultat, donc absent du cache, donc retenté au scan suivant.
+    #[test]
+    fn parse_domains_laisse_non_tague_un_code_inconnu() {
+        let raw = r#"{"1":"FAC","2":"ZZZ","3":"","4":42}"#;
+        let out = parse_domains(raw, 4);
+        assert_eq!(out.get(&1).map(|s| s.as_str()), Some("Facturation"));
+        assert!(!out.contains_key(&2), "code inconnu → non tagué");
+        assert!(!out.contains_key(&3), "code vide → non tagué");
+        assert!(!out.contains_key(&4), "valeur non textuelle → non taguée");
+        assert_eq!(out.len(), 1, "seul le document classé sûrement ressort");
+    }
+
+    /// Une réponse dans l'ANCIEN format ne doit plus rien produire : le lot est
+    /// alors compté en échec par `ai_domain_tags` (`parsed.is_empty()`) et retenté,
+    /// au lieu d'être silencieusement mal interprété.
+    #[test]
+    fn parse_domains_ne_lit_plus_lancien_format_verbeux() {
+        let raw = r#"{"tags":[{"n":1,"domain":"Immobilier"}]}"#;
+        assert!(parse_domains(raw, 1).is_empty());
     }
 
     #[test]

@@ -950,6 +950,19 @@ pub struct LlamaEngine {
     model: PathBuf,
 }
 
+/// Appels de génération soldés par une erreur — serveur ET repli one-shot en
+/// échec, donc un vrai appel perdu (un échec du seul serveur, rattrapé par le
+/// one-shot, ne compte pas). Compteur de process, jamais remis à zéro : les
+/// lecteurs comparent deux relevés (cf. le rapport de l'Archiviste). Sans lui,
+/// un échec passager ne laissait qu'une ligne de log invisible alors qu'il
+/// creuse des trous dans le classement.
+static FAILED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Nombre cumulé d'appels de génération en échec depuis le lancement.
+pub fn failed_calls() -> usize {
+    FAILED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl LlamaEngine {
     pub fn detect() -> Result<Self, String> {
         let binary = resolve_binary()
@@ -963,7 +976,17 @@ impl LlamaEngine {
         resolve_binary().is_some() && resolve_model().is_some()
     }
 
+    /// Point de passage unique de TOUS les appels de génération de l'app — d'où
+    /// le comptage des échecs ici plutôt que sur chaque site appelant.
     pub fn complete(&self, system: Option<&str>, user: &str, max_tokens: u32) -> Result<String, String> {
+        let out = self.complete_inner(system, user, max_tokens);
+        if out.is_err() {
+            FAILED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        out
+    }
+
+    fn complete_inner(&self, system: Option<&str>, user: &str, max_tokens: u32) -> Result<String, String> {
         // Embed the chat template directly dans le prompt selon la famille de modèle.
         // Sans ça, les modèles instruction-tuned (Llama 3, Mistral…) se comportent
         // comme des modèles de complétion brute et hallucinent librement.
