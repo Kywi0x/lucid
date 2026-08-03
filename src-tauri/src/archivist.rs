@@ -85,6 +85,9 @@ pub struct ScanResult {
     /// rate (même sujet, aucun mot partagé) est le travail d'une passe IA
     /// séparée sur les mêmes candidats — cf. `ai_cluster_leftovers`.
     pub theme_clusters: Vec<ThemeCluster>,
+    /// Documents au texte IDENTIQUE, premier id = survivant. Bande « certain » :
+    /// l'orchestrateur émet directement une fusion, sans passer par Gemma.
+    pub exact_duplicates: Vec<Vec<String>>,
     /// Id RÉEL du bac "Non triable" s'il existe déjà dans ce graphe — peut
     /// différer de la constante `CATCHALL_ID` (dossier créé manuellement avant
     /// l'Archiviste, ou par une version antérieure). `None` : à créer sous
@@ -118,6 +121,29 @@ pub const CATCHALL_ID: &str = "arch-non-triable";
 /// - `apple-notes` : app de notes, pas de vraie hiérarchie (décision Liam 2026-07-30).
 const SORTABLE_CONNECTORS: &[&str] = &["local-folder", "apple-notes"];
 
+/// Sources dont les dossiers peuvent RECEVOIR un document venu d'ailleurs
+/// (ADR-0022 phase 1.3). Volontairement restrictif.
+///
+/// Obsidian et Claude Code en sont exclus : ce ne sont pas des systèmes de
+/// classement pour documents arbitraires, ce sont des **corpus autonomes**. Un vault
+/// est une base de connaissances curée, un dépôt Claude Code est un projet — y
+/// injecter un PDF venu de Téléchargements pollue une structure à forte autorité,
+/// même si ça ne touche pas la source réelle. ADR-0020 classe d'ailleurs le MCP en
+/// « on ne touche pas », et recevoir est une forme de toucher.
+///
+/// Apple Notes en est exclu aussi, mais pour une autre raison : ADR-0020 niveau 3
+/// le classe « toujours ranger », donc ses dossiers ne sont pas un signal fiable.
+///
+/// Constaté le 2026-08-03 : aucune contamination ne s'est produite sur la première
+/// passe (aucun document local n'était assez proche d'un dossier Obsidian), mais
+/// rien ne l'empêchait — le risque était latent, il est maintenant fermé.
+pub const RECEIVING_SOURCES: &[&str] = &["local-folder", "google-drive"];
+
+/// Sources triables dont on respecte tout de même les SOUS-dossiers (ADR-0022
+/// phase 1.2). Apple Notes en est absent exprès : ADR-0020 le classe niveau 3
+/// (« toujours ranger »), ses dossiers ne sont pas un signal fiable.
+const RESPECT_SUBFOLDERS: &[&str] = &["local-folder"];
+
 /// `true` si le bac "Non triable" n'existe pas encore dans ce graphe — à
 /// l'orchestrateur (lib.rs) de le créer avant le prochain passage.
 /// Peu importe le `kind` : une proposition "create" produit toujours un nœud
@@ -148,7 +174,13 @@ fn ancestor_chain<'a>(id: &str, parent_of: &HashMap<&'a str, &'a str>) -> Vec<&'
 /// feuille `connector == "local-folder"` en dessous — pas par leur nom. Tout
 /// fichier encore quelque part sous un tel dossier est un candidat au
 /// rattachement vers un vrai dossier thématique, à n'importe quelle profondeur.
-pub fn scan(graph: &BrainGraph) -> ScanResult {
+/// `respect_user_folders` (ADR-0022 phase 1.2) : quand il est vrai, un document
+/// d'une source triable rangé dans un SOUS-dossier créé par l'humain n'est plus
+/// candidat — seul le vrac posé DIRECTEMENT dans un dossier scanné l'est. Le nom
+/// qu'un utilisateur a donné à un dossier est une étiquette sémantique humaine,
+/// meilleure que tout ce qu'un modèle de 4 Md peut inférer ; la dissoudre était du
+/// gâchis de signal. Piloté par réglage : marche arrière sans recompilation.
+pub fn scan(graph: &BrainGraph, respect_user_folders: bool) -> ScanResult {
     let root_id = graph.nodes.iter().find(|n| n.kind == "root").map(|n| n.id.clone());
 
     let mut by_label: HashMap<String, Vec<&BrainNode>> = HashMap::new();
@@ -158,10 +190,23 @@ pub fn scan(graph: &BrainGraph) -> ScanResult {
         }
         by_label.entry(normalize(&n.label)).or_default().push(n);
     }
+    // Doublons EXACTS d'abord : la certitude prime sur l'inférence. Les documents
+    // absorbés sont retirés des groupes de titres (inutile de faire trancher Gemma
+    // sur un cas déjà résolu) ET des candidats au rangement (ils vont disparaître,
+    // leur proposer un déplacement en plus créerait une proposition bloquée à vie).
+    let exact_duplicates = exact_duplicates(graph);
+    let absorbed: HashSet<String> = exact_duplicates.iter()
+        .flat_map(|g| g[1..].iter().cloned())
+        .collect();
+
     let groups: Vec<DuplicateGroup> = by_label
         .into_iter()
         .filter(|(_, v)| v.len() > 1)
-        .map(|(label, v)| DuplicateGroup { label, node_ids: v.iter().map(|n| n.id.clone()).collect() })
+        .map(|(label, v)| DuplicateGroup {
+            label,
+            node_ids: v.iter().map(|n| n.id.clone()).filter(|id| !absorbed.contains(id)).collect(),
+        })
+        .filter(|g| g.node_ids.len() > 1)
         .collect();
     let grouped_ids: HashSet<&str> =
         groups.iter().flat_map(|g| g.node_ids.iter().map(String::as_str)).collect();
@@ -247,6 +292,17 @@ pub fn scan(graph: &BrainGraph) -> ScanResult {
             if !direct_root_child && !nested_in_scan_root {
                 continue; // déjà dans un dossier thématique choisi, on n'y touche pas
             }
+            // Structure montée à la main : un fichier dans `Documents/Clients/X/` a
+            // été rangé par un humain, contrairement à celui posé dans `Documents/`.
+            // On ne garde donc comme candidat que le vrac DIRECTEMENT dans un dossier
+            // scanné. Ne s'applique qu'aux sources de `RESPECT_SUBFOLDERS`.
+            if respect_user_folders && !direct_root_child {
+                let parent_is_scan_root = n.parent_id.as_deref()
+                    .is_some_and(|p| scan_root_ids.contains(p));
+                let respects = n.connector.as_deref()
+                    .is_some_and(|c| RESPECT_SUBFOLDERS.contains(&c));
+                if respects && !parent_is_scan_root { continue; }
+            }
             // Un conteneur directement sous la racine est une catégorie
             // volontaire (source détectée, dossier scanné...), pas un orphelin.
             if n.kind != "leaf" && n.kind != "note" {
@@ -254,6 +310,10 @@ pub fn scan(graph: &BrainGraph) -> ScanResult {
             }
             // Déjà couvert par un groupe de doublons : Gemma tranche, pas le script.
             if grouped_ids.contains(n.id.as_str()) {
+                continue;
+            }
+            // Absorbé par une fusion de doublon exact : il va disparaître.
+            if absorbed.contains(&n.id) {
                 continue;
             }
             let n_tokens = tokens(&n.label);
@@ -323,6 +383,7 @@ pub fn scan(graph: &BrainGraph) -> ScanResult {
     ScanResult {
         moves,
         groups,
+        exact_duplicates,
         orphans_unresolved,
         orphans_unresolved_ids,
         theme_clusters,
@@ -346,6 +407,11 @@ pub struct SkipBreakdown {
     /// filtré sur leaf/note (c'est le cas du rapport) — compté quand même pour
     /// que le total boucle si ce filtre amont change un jour.
     pub wrong_kind: usize,
+    /// Rangé à la main par l'utilisateur dans un sous-dossier, et volontairement
+    /// respecté (ADR-0022 phase 1.2). Ce n'est ni un échec ni un oubli : c'est une
+    /// décision. Sans cette catégorie, ces documents tombaient dans
+    /// `routed_pending` et le rapport annonçait un échec là où il y a un choix.
+    pub user_filed: usize,
     /// Aucune garde ne s'applique : `scan` a bel et bien routé ce document, mais
     /// il n'est pas à sa place dans le graphe — la proposition correspondante
     /// n'a pas (encore) été appliquée : en attente dans `mcp_pending/`, refusée,
@@ -361,7 +427,7 @@ pub struct SkipBreakdown {
 /// vivent côte à côte dans ce fichier : toute modification d'une garde de `scan`
 /// doit être répercutée ici. Un écart reste visible plutôt que silencieux — il
 /// se déverse dans `routed_pending`, qui gonflerait sans raison.
-pub fn skip_breakdown(graph: &BrainGraph, ids: &HashSet<&str>) -> SkipBreakdown {
+pub fn skip_breakdown(graph: &BrainGraph, ids: &HashSet<&str>, respect_user_folders: bool) -> SkipBreakdown {
     let mut out = SkipBreakdown::default();
     if ids.is_empty() {
         return out;
@@ -417,6 +483,12 @@ pub fn skip_breakdown(graph: &BrainGraph, ids: &HashSet<&str>) -> SkipBreakdown 
             out.has_children += 1;
         } else if n.parent_id.as_ref() != root_id.as_ref() && !under_scan_root(&n.id) {
             out.outside_scan_scope += 1;
+        } else if respect_user_folders
+            && n.parent_id.as_ref() != root_id.as_ref()
+            && !n.parent_id.as_deref().is_some_and(|p| scan_root_ids.contains(p))
+            && n.connector.as_deref().is_some_and(|c| RESPECT_SUBFOLDERS.contains(&c))
+        {
+            out.user_filed += 1;
         } else if n.kind != "leaf" && n.kind != "note" {
             out.wrong_kind += 1;
         } else if label_counts.get(&normalize(&n.label)).copied().unwrap_or(0) > 1 {
@@ -425,6 +497,224 @@ pub fn skip_breakdown(graph: &BrainGraph, ids: &HashSet<&str>) -> SkipBreakdown 
             out.routed_pending += 1;
         }
     }
+    out
+}
+
+// ─── Doublons EXACTS (même texte) ───────────────────────────────────────────
+// Bande « certain » de l'ADR-0022 : aucune inférence, donc aucun appel au modèle
+// et aucune décision à valider. Le même document présent dans Téléchargements ET
+// dans Drive doit être UN nœud, pas deux — sinon il occupe deux fois la fenêtre
+// de contexte injectée, ce que la note produit désigne comme le réglage clé
+// (« trop de contexte = cher + dilue »).
+//
+// Remplace, pour ces cas, la détection par TITRE qui se trompe dans les deux sens :
+// deux « Document-20-01 » différents passaient pour des doublons, un fichier
+// renommé passait inaperçu.
+
+/// Texte servant à l'empreinte : espaces normalisés, casse conservée. La
+/// normalisation des espaces n'est pas cosmétique — le MÊME PDF extrait par
+/// `pdftotext` ou par le repli `pdf-extract` ne produit pas les mêmes sauts de
+/// ligne, et on veut que ces deux extractions se reconnaissent.
+fn dedup_text(n: &BrainNode) -> String {
+    let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Groupes de documents au texte IDENTIQUE. Premier id = survivant.
+///
+/// Survivant = le document rangé le plus PROFONDÉMENT, car c'est celui qui a été
+/// placé le plus délibérément (`Drive/Ideeri/Factures/x.pdf` plutôt que
+/// `Téléchargements/x.pdf`) ; à profondeur égale, le libellé le plus court
+/// (« facture.pdf » plutôt que « facture (1).pdf »), puis l'id pour être
+/// déterministe. Le survivant garde son lien vers l'original.
+///
+/// ponytail: le `SourceRef` des absorbés est perdu par la fusion — « ouvrir
+/// l'original » ne pointera que vers une des deux provenances. À corriger si on
+/// veut afficher « présent sur le disque ET sur Drive » (cf. ADR-0022).
+pub fn exact_duplicates(graph: &BrainGraph) -> Vec<Vec<String>> {
+    use sha2::{Digest, Sha256};
+    let depth_of = |id: &str| -> usize {
+        let parent_of: HashMap<&str, &str> = graph.nodes.iter()
+            .filter_map(|n| n.parent_id.as_deref().map(|p| (n.id.as_str(), p)))
+            .collect();
+        ancestor_chain(id, &parent_of).len()
+    };
+    let mut by_hash: HashMap<String, Vec<&BrainNode>> = HashMap::new();
+    for n in &graph.nodes {
+        if n.kind != "leaf" && n.kind != "note" { continue; }
+        if n.id.starts_with("arch-") { continue; }
+        let text = dedup_text(n);
+        // Un texte vide n'est pas une preuve d'identité : deux extractions ratées
+        // ne sont pas le même document.
+        if text.len() < 32 { continue; }
+        let mut h = Sha256::new();
+        h.update(text.as_bytes());
+        by_hash.entry(format!("{:x}", h.finalize())).or_default().push(n);
+    }
+    let mut out: Vec<Vec<String>> = by_hash.into_values()
+        .filter(|v| v.len() > 1)
+        .map(|mut v| {
+            v.sort_by(|a, b| {
+                depth_of(&b.id).cmp(&depth_of(&a.id))
+                    .then(a.label.len().cmp(&b.label.len()))
+                    .then(a.id.cmp(&b.id))
+            });
+            v.into_iter().map(|n| n.id.clone()).collect()
+        })
+        .collect();
+    out.sort_by(|a, b| a[0].cmp(&b[0])); // sortie déterministe
+    out
+}
+
+// ─── Fusion de dossiers ÉVIDEMMENT redondants ───────────────────────────────
+// Le clustering par lots fabrique plusieurs dossiers pour un seul sujet : trois
+// dossiers de communes aux noms quasi identiques, deux dossiers de factures du
+// même émetteur (constaté sur les données de Liam, 2026-08-03). C'est le défaut le
+// plus coûteux en crédibilité : un utilisateur qui voit trois dossiers au même nom
+// conclut que l'outil ne sait pas ce qu'il fait.
+//
+// À ne PAS confondre avec la passe de taxonomie qu'on vient de couper : elle
+// INVENTAIT un parent pour réunir des choses différentes (des devis pharma avec
+// des notes de physique sous « Santé »), sur le jugement d'un modèle. Ici on
+// FUSIONNE deux dossiers qui sont la même chose, sur une preuve mesurable, sans
+// créer de nœud ni de niveau. Aucun appel au modèle.
+
+/// Recouvrement de tokens minimal entre deux NOMS pour les tenir pour le même
+/// sujet. 0,50 vérifié sur les données réelles (2026-08-03) : les trois dossiers de
+/// communes se recouvrent à 0,50 deux à deux et fusionnent ; les quatre dossiers de
+/// factures (0,33) et les deux dossiers immobiliers (0,25) restent séparés.
+/// Desserrer ce seuil retransformerait la fusion en devinette.
+pub const FOLDER_MERGE_OVERLAP: f32 = 0.50;
+/// Documents de la même famille de nom exigés DE CHAQUE CÔTÉ : un fichier égaré ne
+/// doit jamais souder deux dossiers.
+const FAMILY_MIN_PER_FOLDER: usize = 2;
+
+pub struct FolderMerge {
+    /// Survivant (le plus gros dossier) — `ids[0]` d'une proposition `merge`.
+    pub survivor_id: String,
+    pub absorbed_ids: Vec<String>,
+    pub reason: String,
+}
+
+/// Famille d'un nom de fichier structuré : on retire les groupes de chiffres de
+/// FIN (le numéro d'ordre). `Invoice-14545AA1-0036` → `invoice-14545aa1`.
+///
+/// `None` si le nom n'est pas structuré — il faut au moins deux segments, dix
+/// caractères, et un segment contenant un chiffre (donc un code). Sans ces trois
+/// gardes, « Contenu site business » ferait famille avec n'importe quelle prose.
+pub fn filename_family(label: &str) -> Option<String> {
+    let mut segs: Vec<String> = label
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    while segs.last().is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+        segs.pop();
+    }
+    if segs.len() < 2 { return None; }
+    if !segs.iter().any(|s| s.chars().any(|c| c.is_ascii_digit())) { return None; }
+    let key = segs.join("-");
+    if key.len() < 10 { return None; }
+    Some(key)
+}
+
+/// Fusions évidentes entre dossiers-thèmes. Deux signaux, tous deux exigeant le
+/// MÊME domaine majoritaire (un dossier sans domaine ne fusionne jamais) :
+///  1. noms se recouvrant à `FOLDER_MERGE_OVERLAP` ;
+///  2. `FAMILY_MIN_PER_FOLDER` documents de la même famille de nom de chaque côté.
+///
+/// Les deux sont complémentaires sur données réelles : le signal des noms attrape
+/// les dossiers de communes (que les familles de noms ne voient pas, leurs
+/// libellés étant dérivés différemment), le signal des familles attrape les
+/// factures d'un même émetteur (dont les noms ne se recouvrent pas assez).
+///
+/// Pur : ni I/O, ni LLM. `domains` = `id de document → domaine`.
+pub fn folder_merges(graph: &BrainGraph, domains: &HashMap<String, String>) -> Vec<FolderMerge> {
+    let mut children: HashMap<&str, Vec<&BrainNode>> = HashMap::new();
+    for n in &graph.nodes {
+        if let Some(p) = n.parent_id.as_deref() {
+            if p.starts_with("arch-theme-") && (n.kind == "leaf" || n.kind == "note") {
+                children.entry(p).or_default().push(n);
+            }
+        }
+    }
+    let folders: Vec<&str> = {
+        let mut v: Vec<&str> = children.keys().copied().collect();
+        v.sort_unstable(); // ordre déterministe : la sortie ne doit pas dépendre du HashMap
+        v
+    };
+    if folders.len() < 2 { return Vec::new(); }
+
+    let label_of: HashMap<&str, &str> = graph.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
+    let majority_domain = |fid: &str| -> Option<String> {
+        let mut c: HashMap<&str, usize> = HashMap::new();
+        for n in children.get(fid).into_iter().flatten() {
+            if let Some(d) = domains.get(&n.id) { *c.entry(d.as_str()).or_default() += 1; }
+        }
+        c.into_iter().max_by_key(|(_, n)| *n).map(|(d, _)| d.to_string())
+    };
+    let families = |fid: &str| -> HashMap<String, usize> {
+        let mut m: HashMap<String, usize> = HashMap::new();
+        for n in children.get(fid).into_iter().flatten() {
+            if let Some(k) = filename_family(&n.label) { *m.entry(k).or_default() += 1; }
+        }
+        m
+    };
+
+    let info: Vec<(&str, Option<String>, HashSet<String>, HashMap<String, usize>, usize)> = folders.iter()
+        .map(|&fid| {
+            (fid, majority_domain(fid), tokens(label_of.get(fid).copied().unwrap_or("")),
+             families(fid), children.get(fid).map(Vec::len).unwrap_or(0))
+        })
+        .collect();
+
+    // Union-find sur les paires appariées → groupes transitifs.
+    let mut parent: Vec<usize> = (0..info.len()).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x { p[x] = p[p[x]]; x = p[x]; }
+        x
+    }
+    let mut reasons: HashMap<usize, &'static str> = HashMap::new();
+    for i in 0..info.len() {
+        for j in (i + 1)..info.len() {
+            let (_, di, ti, fi, _) = &info[i];
+            let (_, dj, tj, fj, _) = &info[j];
+            // Garde de domaine : sans domaine des deux côtés, et identique, on ne
+            // fusionne pas — même logique que la garde du clustering.
+            let (Some(di), Some(dj)) = (di, dj) else { continue };
+            if di != dj { continue; }
+            let by_name = overlap_score(ti, tj) >= FOLDER_MERGE_OVERLAP;
+            let by_family = !by_name && fi.iter().any(|(k, ni)| {
+                *ni >= FAMILY_MIN_PER_FOLDER && fj.get(k).copied().unwrap_or(0) >= FAMILY_MIN_PER_FOLDER
+            });
+            if !by_name && !by_family { continue; }
+            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            if ri != rj {
+                parent[ri] = rj;
+                reasons.insert(rj, if by_name { "noms quasi identiques" } else { "même famille de nom de fichier" });
+            }
+        }
+    }
+
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..info.len() {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    let mut out: Vec<FolderMerge> = groups.into_iter()
+        .filter(|(_, m)| m.len() >= 2)
+        .map(|(root, mut members)| {
+            // Survivant = le plus gros dossier ; à égalité, le plus petit id (stable).
+            members.sort_by(|&a, &b| info[b].4.cmp(&info[a].4).then(info[a].0.cmp(info[b].0)));
+            FolderMerge {
+                survivor_id: info[members[0]].0.to_string(),
+                absorbed_ids: members[1..].iter().map(|&i| info[i].0.to_string()).collect(),
+                reason: reasons.get(&root).copied().unwrap_or("dossiers redondants").to_string(),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.survivor_id.cmp(&b.survivor_id));
     out
 }
 
@@ -790,7 +1080,7 @@ pub fn ai_cluster_leftovers(engine: &LlamaEngine, leftover: &[(String, String)],
         if batch.len() < MIN_CLUSTER { batch.clear(); return; }
         let valid_ids: HashSet<&str> = batch.iter().map(|(id, _, _)| id.as_str()).collect();
         let prompt = ai_cluster_prompt(batch);
-        match engine.complete(Some(SYSTEM_PROMPT), &prompt, RESPONSE_TOKENS) {
+        match engine.complete_json(Some(SYSTEM_PROMPT), &prompt, RESPONSE_TOKENS) {
             Ok(raw) => {
                 let parsed = parse_ai_cluster_response(&raw, &valid_ids);
                 crate::elog!("🗂️ cluster lot: {} items, {} chars prompt → {} groupe(s) parsé(s).",
@@ -986,7 +1276,7 @@ pub fn ai_name_cluster(engine: &LlamaEngine, samples: &[String]) -> Option<Strin
          donne un nom thématique court (ex. « Factures », « Immobilier »). JAMAIS une phrase ni « Divers ».\n\
          Renvoie UNIQUEMENT : {\"name\": \"…\"}\n",
     );
-    let raw = engine.complete(Some(SYSTEM_PROMPT), &prompt, 60).ok()?;
+    let raw = engine.complete_json(Some(SYSTEM_PROMPT), &prompt, 60).ok()?;
     let js = crate::ai::pipeline::extract_json(&raw)?;
     let v: serde_json::Value = serde_json::from_str(js).ok()?;
     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
@@ -1132,7 +1422,7 @@ pub fn ai_domain_tags(
         // Map plate de codes à 3 lettres : ~10 tokens par document, donc 300
         // suffisent largement pour 30 items (c'était 900 avec l'ancien format
         // verbeux `{"n":1,"domain":"Devis & Commercial"}`).
-        let parsed = match engine.complete(Some(SYSTEM_PROMPT), &domain_prompt(chunk), 300) {
+        let parsed = match engine.complete_json(Some(SYSTEM_PROMPT), &domain_prompt(chunk), 300) {
             Ok(raw) => parse_domains(&raw, chunk.len()),
             Err(e) => {
                 crate::elog!("🗂️ domaines: lot de {} doc(s) → ÉCHEC appel IA ({e}) — lot non taggé, à retenter.", chunk.len());
@@ -1213,7 +1503,7 @@ pub fn ai_assign_to_folders(
     for chunk in pages.chunks(ASSIGN_BATCH_MAX) {
         let valid_pages: HashSet<&str> = chunk.iter().map(|(id, _, _)| id.as_str()).collect();
         let prompt = assign_prompt(chunk, folders);
-        let Ok(raw) = engine.complete(Some(SYSTEM_PROMPT), &prompt, 2000) else { continue };
+        let Ok(raw) = engine.complete_json(Some(SYSTEM_PROMPT), &prompt, 2000) else { continue };
         let assigns = parse_assignments(&raw, &valid_pages, &valid_folders);
         crate::elog!("🗂️ ancrage: {} pages, {} dossiers → {} assignation(s).", chunk.len(), folders.len(), assigns.len());
         for (page, folder) in assigns {
@@ -1303,7 +1593,7 @@ pub fn ai_group_themes(engine: &LlamaEngine, themes: &[(String, String, usize, V
     let prompt = taxonomy_prompt(themes);
     // Réponse potentiellement longue (chemins + ids) → budget large, comme le
     // clustering, pour ne pas tronquer le JSON (cf. bug troncature du 2026-07-28).
-    let Ok(raw) = engine.complete(Some(SYSTEM_PROMPT), &prompt, 2000) else {
+    let Ok(raw) = engine.complete_json(Some(SYSTEM_PROMPT), &prompt, 2000) else {
         return Vec::new();
     };
     collapse_taxonomy(parse_taxonomy(&raw, &valid_ids))
@@ -1401,7 +1691,7 @@ pub fn extract_doc_entities(engine: &LlamaEngine, node: &BrainNode) -> Vec<Strin
     }
     let snippet: String = text.chars().take(ENTITY_MAX_CHARS).collect();
     let prompt = entity_prompt(&node.label, &snippet);
-    let Ok(raw) = engine.complete(Some(SYSTEM_PROMPT), &prompt, 300) else {
+    let Ok(raw) = engine.complete_json(Some(SYSTEM_PROMPT), &prompt, 300) else {
         return Vec::new();
     };
     parse_entities(&raw)
@@ -1456,7 +1746,7 @@ fn parse_entities(raw: &str) -> Vec<String> {
 /// halluciné, JSON invalide, décision inattendue → `ParseFailed`, pas `Merge`).
 pub fn decide_group(engine: &LlamaEngine, group: &DuplicateGroup, graph: &BrainGraph) -> GroupOutcome {
     let prompt = decision_prompt(group, graph);
-    let raw = match engine.complete(Some(SYSTEM_PROMPT), &prompt, 200) {
+    let raw = match engine.complete_json(Some(SYSTEM_PROMPT), &prompt, 200) {
         Ok(r) => r,
         Err(e) => return GroupOutcome::ParseFailed { raw_excerpt: format!("(erreur moteur: {e})") },
     };
@@ -1516,7 +1806,7 @@ mod tests {
     /// doit faire le total, sinon la répartition ment.
     #[test]
     fn skip_breakdown_attribue_une_seule_cause_par_document_et_boucle_sur_le_total() {
-        let mut container = |id: &str| node(id, id, "container", Some("root"));
+        let container = |id: &str| node(id, id, "container", Some("root"));
         let nodes = vec![
             node("root", "Cerveau", "root", None),
             // Dossier de scan : reconnu comme tel parce qu'une feuille local-folder vit dessous.
@@ -1550,14 +1840,15 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 6, "6 documents dans la population analysée");
 
-        let b = skip_breakdown(&g, &ids);
+        let b = skip_breakdown(&g, &ids, false);
         assert_eq!(b.duplicate_title, 2, "les deux « Facture »");
         assert_eq!(b.has_children, 1, "le hub, pas sa sous-page");
         assert_eq!(b.outside_scan_scope, 1, "celui rangé sous un conteneur non scanné");
         assert_eq!(b.wrong_kind, 0, "population déjà filtrée sur leaf/note");
         assert_eq!(b.routed_pending, 2, "leaf:a et la sous-page du hub");
         assert_eq!(
-            b.duplicate_title + b.has_children + b.outside_scan_scope + b.wrong_kind + b.routed_pending,
+            b.duplicate_title + b.has_children + b.outside_scan_scope + b.wrong_kind
+                + b.user_filed + b.routed_pending,
             ids.len(),
             "les causes sont exclusives et couvrent tout le total",
         );
@@ -1600,7 +1891,7 @@ mod tests {
             local_leaf("orphan", "Invoice-14545AA1-0052", "downloads"),
         ]);
         assert!(!needs_catchall(&g));
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert_eq!(r.moves.len(), 1);
         assert_eq!(r.moves[0].new_parent_id, "catchall");
         assert!(r.orphans_unresolved.is_empty());
@@ -1617,7 +1908,7 @@ mod tests {
             local_leaf("m2", "medecine_nutrition", "theme"),
             local_leaf("m3", "medecine_maladies", "theme"),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert!(r.moves.is_empty(), "le hub lui-même ne doit jamais être proposé au déplacement");
     }
 
@@ -1631,7 +1922,7 @@ mod tests {
             node(CATCHALL_ID, CATCHALL_LABEL, "note", Some("root")),
             local_leaf("orphan", "Invoice-14545AA1-0052", "downloads"),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert_eq!(r.moves.len(), 1, "seul l'orphelin doit bouger, pas le bac lui-même");
         assert_eq!(r.moves[0].node_id, "orphan");
     }
@@ -1644,7 +1935,7 @@ mod tests {
             local_leaf("orphan", "Invoice-14545AA1-0052", "downloads"),
         ]);
         assert!(needs_catchall(&g));
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert!(r.moves.is_empty());
         assert_eq!(r.orphans_unresolved.len(), 1);
     }
@@ -1659,7 +1950,7 @@ mod tests {
             local_leaf("i3", "Invoice-XG1G5TIQ-0002", "catchall"),
             local_leaf("other", "Repas", "catchall"),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert_eq!(r.theme_clusters.len(), 1);
         assert_eq!(r.theme_clusters[0].label, "Invoice");
         assert_eq!(r.theme_clusters[0].node_ids.len(), 3);
@@ -1677,7 +1968,7 @@ mod tests {
             local_leaf("y2", "301 estimations - webflow-301-redirects-estimation", "catchall"),
             local_leaf("y3", "fs-301-import-template", "catchall"),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         // "6a476f7666e5c" (hash) et "301" (numérique) ne doivent jamais former
         // un thème, même partagés par 3 pages — mais "webflow" (2 pages) non
         // plus (sous le seuil), donc aucun cluster ici du tout.
@@ -1692,7 +1983,7 @@ mod tests {
             local_leaf("c1", "chimie_elements", "catchall"),
             local_leaf("c2", "chimie_reactions", "catchall"),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert!(r.theme_clusters.is_empty(), "2 pages ne suffisent pas (seuil à 3)");
     }
 
@@ -1703,7 +1994,7 @@ mod tests {
             node("a", "RIB", "leaf", Some("root")),
             node("b", "RIB", "leaf", Some("root")),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].node_ids.len(), 2);
     }
@@ -1716,7 +2007,7 @@ mod tests {
             node("c2", "Business", "container", Some("root")),
             node("orphan", "Cybersécurité", "leaf", Some("root")),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert_eq!(r.moves.len(), 1);
         assert_eq!(r.moves[0].new_parent_id, "c1");
     }
@@ -1729,7 +2020,7 @@ mod tests {
             node("c2", "Sport nutrition", "container", Some("root")),
             node("orphan", "Sport général", "leaf", Some("root")),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert!(r.moves.is_empty());
         assert_eq!(r.orphans_unresolved.len(), 1);
     }
@@ -1746,7 +2037,7 @@ mod tests {
             node("c1", "Sécurité & Confiance", "container", Some("root")),
             node("c2", "Business", "container", Some("root")),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert_eq!(r.moves.len(), 1, "le fichier imbriqué doit être proposé au rattachement");
         assert_eq!(r.moves[0].new_parent_id, "c1");
     }
@@ -1761,7 +2052,7 @@ mod tests {
             node("downloads/secu", "Sécurité Info", "container", Some("downloads")),
             local_leaf("leaf1", "Cybersécurité", "downloads"),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert!(r.moves.is_empty());
         assert_eq!(r.orphans_unresolved.len(), 1);
     }
@@ -1772,7 +2063,7 @@ mod tests {
             node("root", "Cerveau", "root", None),
             node("downloads", "Downloads", "container", Some("root")),
         ]);
-        let r = scan(&g);
+        let r = scan(&g, false);
         assert!(r.moves.is_empty());
         assert!(r.orphans_unresolved.is_empty());
     }
@@ -1942,6 +2233,219 @@ mod tests {
             !groups.iter().any(|g| g.len() >= 4),
             "la chaîne hétérogène ne doit pas former un gros groupe : {groups:?}",
         );
+    }
+
+    /// ADR-0022 phase 1.3 — un corpus autonome ne doit pas RECEVOIR. Un dossier
+    /// Obsidian ou un projet Claude Code est une base curée : y verser un PDF venu
+    /// de Téléchargements pollue une structure à forte autorité. Le 2026-08-03,
+    /// aucune contamination ne s'était produite, mais rien ne l'empêchait.
+    #[test]
+    fn seules_les_sources_autorisees_peuvent_recevoir_un_document() {
+        assert!(RECEIVING_SOURCES.contains(&"local-folder"));
+        assert!(RECEIVING_SOURCES.contains(&"google-drive"));
+        for interdit in ["obsidian", "claude-code", "apple-notes", "chatgpt", "claude-ai"] {
+            assert!(!RECEIVING_SOURCES.contains(&interdit),
+                "{interdit} ne doit jamais être une destination d'ancrage");
+        }
+    }
+
+    /// ADR-0022 phase 1.2 : ce que l'humain a rangé ne doit plus être dissous. Le
+    /// vrac posé directement dans un dossier scanné reste candidat, le contenu d'un
+    /// sous-dossier monté à la main ne l'est plus. Et le drapeau doit vraiment
+    /// commander les deux comportements — c'est la marche arrière si la décision
+    /// produit change (ADR-0022 encore `proposé`).
+    #[test]
+    fn respecte_les_sous_dossiers_montes_a_la_main_mais_pas_le_vrac() {
+        let nodes = vec![
+            node("root", "Cerveau", "root", None),
+            node("p:Documents", "Documents", "container", Some("root")),
+            node("p:Documents/Clients", "Clients", "container", Some("p:Documents")),
+            // Rangé à la main dans un sous-dossier → doit être laissé tranquille.
+            local_leaf("leaf:range", "proposition-2026", "p:Documents/Clients"),
+            // Posé en vrac directement dans Documents → doit rester candidat.
+            local_leaf("leaf:vrac", "scan001", "p:Documents"),
+        ];
+        let g = graph(nodes);
+
+        let respecte = scan(&g, true);
+        let touches: Vec<&str> = respecte.moves.iter().map(|m| m.node_id.as_str())
+            .chain(respecte.orphans_unresolved_ids.iter().map(String::as_str))
+            .chain(respecte.theme_clusters.iter().flat_map(|c| c.node_ids.iter().map(String::as_str)))
+            .collect();
+        assert!(touches.contains(&"leaf:vrac"), "le vrac reste candidat : {touches:?}");
+        assert!(!touches.contains(&"leaf:range"),
+            "un document rangé à la main ne doit plus être candidat : {touches:?}");
+
+        // Drapeau à false : ancien comportement, les deux sont candidats.
+        let avant = scan(&g, false);
+        let touches_avant: Vec<&str> = avant.moves.iter().map(|m| m.node_id.as_str())
+            .chain(avant.orphans_unresolved_ids.iter().map(String::as_str))
+            .chain(avant.theme_clusters.iter().flat_map(|c| c.node_ids.iter().map(String::as_str)))
+            .collect();
+        assert!(touches_avant.contains(&"leaf:range"),
+            "drapeau à false = comportement d'avant, donc marche arrière réelle : {touches_avant:?}");
+    }
+
+    /// Bande « certain » (ADR-0022) : deux documents au même texte sont le MÊME
+    /// document, quels que soient leur nom et leur source. Aucune inférence, donc
+    /// aucun modèle — mais c'est une fusion, donc elle doit être exacte.
+    #[test]
+    fn exact_duplicates_reconnait_le_meme_texte_et_garde_le_mieux_range() {
+        let long = "Facture numéro 42 émise le 3 août 2026 pour la prestation de développement, montant total hors taxes de mille deux cents euros.";
+        let mut doc = |id: &str, label: &str, parent: &str, text: &str| {
+            let mut n = node(id, label, "leaf", Some(parent));
+            n.source_text = text.into();
+            n
+        };
+        let nodes = vec![
+            node("root", "Cerveau", "root", None),
+            node("p:Téléchargements", "Téléchargements", "container", Some("root")),
+            node("p:Drive", "Drive", "container", Some("root")),
+            node("p:Drive/Ideeri", "Ideeri", "container", Some("p:Drive")),
+            node("p:Drive/Ideeri/Factures", "Factures", "container", Some("p:Drive/Ideeri")),
+            // Même texte, mais espaces différents : c'est le cas réel de deux
+            // extractions PDF différentes du même fichier.
+            doc("leaf:vrac", "facture-042 (1)", "p:Téléchargements", &long.replace(' ', "\n  ")),
+            doc("leaf:drive", "facture-042", "p:Drive/Ideeri/Factures", long),
+            // Texte différent → jamais groupé.
+            doc("leaf:autre", "facture-043", "p:Téléchargements", "Facture numéro 43 émise le 4 août 2026, montant de deux mille euros hors taxes pour du conseil."),
+            // Texte trop court → pas une preuve d'identité (deux extractions ratées
+            // ne sont pas le même document).
+            doc("leaf:court-a", "vide-a", "p:Téléchargements", "n/a"),
+            doc("leaf:court-b", "vide-b", "p:Téléchargements", "n/a"),
+        ];
+        let groups = exact_duplicates(&graph(nodes));
+        assert_eq!(groups.len(), 1, "un seul groupe : {groups:?}");
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0], "leaf:drive",
+            "le survivant est celui rangé le plus profondément, pas celui du vrac");
+        assert_eq!(groups[0][1], "leaf:vrac");
+    }
+
+    /// Un doublon exact ne doit PAS être soumis en plus à la décision de Gemma, ni
+    /// recevoir un déplacement — sinon la fusion s'applique, sa cible disparaît, et
+    /// le déplacement reste bloqué à vie dans `mcp_pending/`.
+    #[test]
+    fn un_doublon_exact_est_retire_des_groupes_de_titres_et_des_candidats() {
+        let long = "Attestation sur l'honneur établie le trois août deux mille vingt-six certifiant l'exactitude des informations déclarées par le signataire.";
+        let mut doc = |id: &str, text: &str| {
+            let mut n = node(id, "Attestation", "leaf", Some("p:Documents"));
+            n.source_text = text.into();
+            n.connector = Some("local-folder".into());
+            n
+        };
+        let nodes = vec![
+            node("root", "Cerveau", "root", None),
+            node("p:Documents", "Documents", "container", Some("root")),
+            doc("leaf:a", long),
+            doc("leaf:b", long),
+        ];
+        let g = graph(nodes);
+        let r = scan(&g, false);
+        assert_eq!(r.exact_duplicates.len(), 1, "le doublon exact est détecté");
+        assert!(r.groups.is_empty(),
+            "les deux titres identiques ne forment plus un groupe à faire trancher : {:?}",
+            r.groups.iter().map(|x| &x.label).collect::<Vec<_>>());
+        let absorbed = &r.exact_duplicates[0][1];
+        assert!(!r.moves.iter().any(|m| &m.node_id == absorbed),
+            "l'absorbé ne reçoit aucun déplacement");
+        assert!(!r.orphans_unresolved_ids.contains(absorbed),
+            "l'absorbé n'est pas non plus routé vers le bac");
+    }
+
+    #[test]
+    fn filename_family_ne_retient_que_les_noms_structures() {
+        // Numéro d'ordre retiré, code de l'émetteur conservé → deux émetteurs
+        // différents donnent deux familles différentes.
+        assert_eq!(filename_family("Invoice-14545AA1-0036").as_deref(), Some("invoice-14545aa1"));
+        assert_eq!(filename_family("Invoice-14545AA1-0044").as_deref(), Some("invoice-14545aa1"));
+        assert_eq!(filename_family("Invoice-21A6E515-0003").as_deref(), Some("invoice-21a6e515"));
+        assert_eq!(filename_family("dbo-commune_france-41-live.1765355792").as_deref(),
+            Some("dbo-commune-france-41-live"));
+        // De la prose : aucun chiffre → pas une famille, sinon n'importe quel
+        // document « métier » ferait famille avec n'importe quel autre.
+        assert_eq!(filename_family("Contenu site business"), None);
+        assert_eq!(filename_family("Village Immobilier Mions"), None);
+        // Réduit à un seul segment après retrait des chiffres de fin → trop pauvre.
+        assert_eq!(filename_family("Document-20-01"), None);
+        assert_eq!(filename_family("RIB"), None);
+    }
+
+    /// La fusion doit se déclencher sur une PREUVE et jamais au-delà — c'est ce qui
+    /// la distingue de la passe de taxonomie qu'on a coupée (2026-08-03).
+    #[test]
+    fn folder_merges_fusionne_les_redondances_et_epargne_le_reste() {
+        let mut nodes = vec![node("root", "Cerveau", "root", None)];
+        let mut domains: HashMap<String, String> = HashMap::new();
+        let add = |nodes: &mut Vec<BrainNode>, domains: &mut HashMap<String, String>,
+                       folder: &str, label: &str, docs: &[&str], dom: &str| {
+            nodes.push(node(folder, label, "note", Some("root")));
+            for (i, d) in docs.iter().enumerate() {
+                let id = format!("{folder}::{i}");
+                nodes.push(node(&id, d, "leaf", Some(folder)));
+                domains.insert(id, dom.to_string());
+            }
+        };
+        // Trois dossiers de communes aux noms proches, même domaine → un seul.
+        add(&mut nodes, &mut domains, "arch-theme-a", "Données Communales France",
+            &["dbo-commune_france-41-live.1765355792", "dbo-commune_france-41-live.1766567021"], "Technique & Data");
+        add(&mut nodes, &mut domains, "arch-theme-b", "Données Communes France",
+            &["communes_location_only", "communes_location_only_v2"], "Technique & Data");
+        add(&mut nodes, &mut domains, "arch-theme-c", "Données Géographiques Communes",
+            &["api-transaction - Communes - 6620d8", "api-transaction - Communes - 6620d9"], "Technique & Data");
+        // Deux dossiers de factures du MÊME émetteur : noms trop éloignés (0,33),
+        // mais même famille de nom de fichier → fusionnés par le 2ᵉ signal.
+        add(&mut nodes, &mut domains, "arch-theme-d", "Factures Services",
+            &["Invoice-14545AA1-0044", "Invoice-14545AA1-0046"], "Facturation");
+        add(&mut nodes, &mut domains, "arch-theme-e", "Factures Parabola",
+            &["Invoice-14545AA1-0036", "Invoice-14545AA1-0038"], "Facturation");
+        // Émetteur DIFFÉRENT : même préfixe « Invoice » mais autre code → intact.
+        add(&mut nodes, &mut domains, "arch-theme-f", "Factures Xano",
+            &["Invoice-21A6E515-0003", "Invoice-21A6E515-0004"], "Facturation");
+        // Même premier mot, sujets distincts → jamais fusionnés (recouvrement 0,25).
+        add(&mut nodes, &mut domains, "arch-theme-g", "Immobilier Saint-Jean",
+            &["webflow-301-redirects", "webflow-301-redirects-v2"], "Immobilier");
+        add(&mut nodes, &mut domains, "arch-theme-h", "Immobilier Lyon",
+            &["Lyon_8e_Arrondissement", "Mions"], "Immobilier");
+
+        let g = graph(nodes);
+        let merges = folder_merges(&g, &domains);
+        let groups: Vec<HashSet<&str>> = merges.iter()
+            .map(|m| {
+                let mut s: HashSet<&str> = m.absorbed_ids.iter().map(String::as_str).collect();
+                s.insert(m.survivor_id.as_str());
+                s
+            })
+            .collect();
+
+        assert!(groups.iter().any(|s| s.len() == 3
+            && s.contains("arch-theme-a") && s.contains("arch-theme-b") && s.contains("arch-theme-c")),
+            "les trois dossiers de communes fusionnent : {groups:?}");
+        assert!(groups.iter().any(|s| s.len() == 2
+            && s.contains("arch-theme-d") && s.contains("arch-theme-e")),
+            "les deux dossiers du même émetteur fusionnent : {groups:?}");
+        let touched: HashSet<&str> = groups.iter().flatten().copied().collect();
+        for intact in ["arch-theme-f", "arch-theme-g", "arch-theme-h"] {
+            assert!(!touched.contains(intact), "{intact} ne doit PAS être fusionné");
+        }
+        assert_eq!(groups.len(), 2, "exactement deux fusions : {groups:?}");
+    }
+
+    /// La garde de domaine doit primer : deux noms identiques mais deux domaines
+    /// différents restent séparés (c'est le garde-fou anti-devinette).
+    #[test]
+    fn folder_merges_refuse_de_traverser_deux_domaines() {
+        let mut domains: HashMap<String, String> = HashMap::new();
+        let nodes = vec![
+            node("root", "Cerveau", "root", None),
+            node("arch-theme-x", "Dossier Estimation", "note", Some("root")),
+            node("arch-theme-x::0", "estimation_a", "leaf", Some("arch-theme-x")),
+            node("arch-theme-y", "Dossier Estimations", "note", Some("root")),
+            node("arch-theme-y::0", "estimation_b", "leaf", Some("arch-theme-y")),
+        ];
+        domains.insert("arch-theme-x::0".into(), "Immobilier".into());
+        domains.insert("arch-theme-y::0".into(), "Devis & Commercial".into());
+        assert!(folder_merges(&graph(nodes), &domains).is_empty());
     }
 
     #[test]

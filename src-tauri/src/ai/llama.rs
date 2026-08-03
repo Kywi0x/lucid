@@ -23,6 +23,9 @@ const LEGACY_APP_DIR: &str = "fr.ideeri.brainlink";
 /// (bug remonté par Liam le 2026-07-28). 16k laisse voir tout le lot d'un coup
 /// (meilleur clustering) ; Gemma 3/4 supporte bien plus, coût KV cache modéste.
 pub const CONTEXT_TOKENS: u32 = 16384;
+/// Température de l'assistant conversationnel. Les extractions structurées de
+/// l'Archiviste passent par `complete_json` (température 0) — cf. son doc.
+const CHAT_TEMPERATURE: f32 = 0.2;
 /// Catalogue GPT4All officiel — URLs vérifiées et maintenues par l'équipe GPT4All.
 const CATALOG_URL: &str =
     "https://raw.githubusercontent.com/nomic-ai/gpt4all/main/gpt4all-chat/metadata/models3.json";
@@ -921,11 +924,11 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-fn complete_via_server(token: &str, prompt: &str, max_tokens: u32) -> Result<String, String> {
+fn complete_via_server(token: &str, prompt: &str, max_tokens: u32, temperature: f32) -> Result<String, String> {
     let body = serde_json::json!({
         "prompt": prompt,
         "n_predict": max_tokens,
-        "temperature": 0.2,
+        "temperature": temperature,
         "top_p": 0.9,
         "cache_prompt": true,
     });
@@ -988,18 +991,42 @@ impl LlamaEngine {
         resolve_binary().is_some() && resolve_model().is_some()
     }
 
+    /// Génération conversationnelle (assistant) — un peu d'échantillonnage rend
+    /// les réponses moins mécaniques.
+    pub fn complete(&self, system: Option<&str>, user: &str, max_tokens: u32) -> Result<String, String> {
+        self.complete_at(system, user, max_tokens, CHAT_TEMPERATURE)
+    }
+
+    /// Extraction STRUCTURÉE (JSON) — température 0, donc même entrée, même sortie.
+    ///
+    /// À 0,2, deux passes à froid sur les MÊMES fichiers donnaient des étiquettes
+    /// de domaine différentes : 19 documents avaient changé de domaine entre deux
+    /// runs, « Études & Cours » passant de 19 à 3 (mesuré le 2026-08-03). Or le
+    /// domaine est la clé de regroupement du clustering : un paquet qui gagne 8
+    /// documents produit d'autres clusters. Conséquence, aucun changement de
+    /// réglage n'était mesurable — l'écart entre deux runs identiques dépassait
+    /// l'effet cherché. Même cause pour les noms de dossiers qui changeaient d'une
+    /// passe à l'autre.
+    ///
+    /// Ne rend pas la passe bit-à-bit reproductible : le serveur traite plusieurs
+    /// embeddings dans un même lot et les sommes flottantes dépendent de sa
+    /// composition. Mais ça supprime la source dominante.
+    pub fn complete_json(&self, system: Option<&str>, user: &str, max_tokens: u32) -> Result<String, String> {
+        self.complete_at(system, user, max_tokens, 0.0)
+    }
+
     /// Point de passage unique de TOUS les appels de génération de l'app — d'où
     /// le comptage des échecs ici plutôt que sur chaque site appelant.
-    pub fn complete(&self, system: Option<&str>, user: &str, max_tokens: u32) -> Result<String, String> {
+    fn complete_at(&self, system: Option<&str>, user: &str, max_tokens: u32, temperature: f32) -> Result<String, String> {
         TOTAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let out = self.complete_inner(system, user, max_tokens);
+        let out = self.complete_inner(system, user, max_tokens, temperature);
         if out.is_err() {
             FAILED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         out
     }
 
-    fn complete_inner(&self, system: Option<&str>, user: &str, max_tokens: u32) -> Result<String, String> {
+    fn complete_inner(&self, system: Option<&str>, user: &str, max_tokens: u32, temperature: f32) -> Result<String, String> {
         // Embed the chat template directly dans le prompt selon la famille de modèle.
         // Sans ça, les modèles instruction-tuned (Llama 3, Mistral…) se comportent
         // comme des modèles de complétion brute et hallucinent librement.
@@ -1008,7 +1035,7 @@ impl LlamaEngine {
 
         if let Some(server_bin) = resolve_server_binary() {
             if let Some(token) = ensure_server(&server_bin, &self.model) {
-                match complete_via_server(&token, &formatted, max_tokens) {
+                match complete_via_server(&token, &formatted, max_tokens, temperature) {
                     Ok(out) => return Ok(out),
                     Err(e) => crate::elog!("⚠️ llama-server en échec ({e}), retour au mode one-shot."),
                 }
@@ -1021,7 +1048,7 @@ impl LlamaEngine {
             .args(["-t", &worker_threads().to_string()])
             .args(["-c", &CONTEXT_TOKENS.to_string()])
             .args(["-n", &max_tokens.to_string()])
-            .args(["--temp", "0.2"])
+            .args(["--temp", &temperature.to_string()])
             .args(["--top-p", "0.9"])
             .arg("-no-cnv")
             .arg("--no-display-prompt");
