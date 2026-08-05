@@ -1,4 +1,5 @@
-import { supabase } from "./supabase";
+import { supabase, SUPABASE_URL } from "./supabase";
+import { DEFAULT_SHARE_URL } from "./supabase-config";
 import { readBrainGraph } from "./api";
 import type { BrainGraph, Space } from "./types";
 
@@ -23,15 +24,17 @@ export interface ShareOptions {
 }
 
 function shareUrl(id: string): string {
-  const base = import.meta.env.VITE_SHARE_URL as string | undefined;
+  const env = import.meta.env.VITE_SHARE_URL as string | undefined;
+  const base = env || DEFAULT_SHARE_URL;
   return base ? `${base.replace(/\/+$/, "")}/?id=${id}` : id;
 }
 
 /** URL du connecteur MCP distant — construite sur le TOKEN MCP (capability
  *  séparée du lien de partage : le lien public ne donne pas accès au MCP). */
 export function mcpUrl(token: string): string | null {
-  const base = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-  return base ? `${base.replace(/\/+$/, "")}/functions/v1/lucid-mcp?token=${token}` : null;
+  return SUPABASE_URL
+    ? `${SUPABASE_URL.replace(/\/+$/, "")}/functions/v1/lucid-mcp?token=${token}`
+    : null;
 }
 
 /** Récupère (ou crée) le token MCP d'un space publié. Nul si la table n'existe
@@ -155,20 +158,20 @@ export async function ensurePersonalMcpSpace(): Promise<void> {
 
 /** URL MCP personnelle (crée le space + son token au besoin). Nul si Supabase
  *  n'est pas configuré ou si la migration SQL n'est pas encore appliquée. */
+// Ne rattrape RIEN : le try/catch qui renvoyait null ici transformait toute
+// erreur réelle (RLS, session expirée, table manquante) en un message générique
+// « applique les migrations SQL » — fausse piste coûteuse (2026-08-05).
 export async function ensurePersonalMcpUrl(): Promise<string | null> {
   if (!supabase) return null;
-  try {
-    await ensurePersonalMcpSpace();
-    const owner = await uid();
-    const { data } = await supabase
-      .from("shared_spaces").select("id")
-      .eq("owner", owner).eq("title", PERSONAL_SPACE_TITLE).maybeSingle();
-    if (!data) return null;
-    const token = await ensureMcpToken(data.id as string);
-    return token ? mcpUrl(token) : null;
-  } catch {
-    return null;
-  }
+  await ensurePersonalMcpSpace();
+  const owner = await uid();
+  const { data, error } = await supabase
+    .from("shared_spaces").select("id")
+    .eq("owner", owner).eq("title", PERSONAL_SPACE_TITLE).maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) return null;
+  const token = await ensureMcpToken(data.id as string);
+  return token ? mcpUrl(token) : null;
 }
 
 export interface SharedWithMe {

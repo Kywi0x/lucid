@@ -12,4 +12,9 @@ const key = envKey && !envKey.includes("VOTRE") && !envKey.includes("A_REMPLIR")
 export const supabase: SupabaseClient | null =
   url && key ? createClient(url, key) : null;
 
+/** URL Supabase effective (env ou fallback commité) — à utiliser partout ailleurs
+ *  plutôt que `import.meta.env.VITE_SUPABASE_URL` : un build CI sans .env avait
+ *  ainsi une URL MCP nulle alors que le client, lui, fonctionnait (bug .dmg 2026-08-05). */
+export const SUPABASE_URL = url;
+
 export const BACKUP_BUCKET = "backups";

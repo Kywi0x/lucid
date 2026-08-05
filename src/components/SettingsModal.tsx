@@ -1445,7 +1445,7 @@ export function AiClientsSection() {
     try {
       const url = await ensurePersonalMcpUrl();
       if (!url) {
-        setError("Indisponible — connecte-toi à ton compte Lucid, ou applique les migrations docs/supabase-mcp-personal.sql et docs/supabase-mcp-proposals-v2.sql dans Supabase.");
+        setError("Indisponible — ton cerveau est vide (lance une analyse d'abord). Si le problème persiste, applique docs/supabase-mcp-personal.sql dans Supabase.");
         return;
       }
       setMcpUrl(url);
