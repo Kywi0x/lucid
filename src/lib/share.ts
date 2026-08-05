@@ -23,6 +23,16 @@ export interface ShareOptions {
   includeSources?: boolean;
 }
 
+/** Postgres refuse `\u0000` dans une colonne `jsonb` (« unsupported Unicode
+ *  escape sequence », 22P05). Un fichier UTF-16 lu en lossy (`read_lossy`, Rust)
+ *  en sème dans les contenus extraits → TOUT l'upsert échouait, visible à la
+ *  copie de l'URL MCP (`ensurePersonalMcpSpace`). On nettoie à l'envoi, pas
+ *  seulement à l'extraction : les brain.json déjà sur disque sont réparés sans
+ *  re-scan (bug remonté 2026-08-05, contourné jusqu'ici par une réinstallation). */
+function stripNul<T>(payload: T): T {
+  return JSON.parse(JSON.stringify(payload).replace(/\\u0000/g, "")) as T;
+}
+
 function shareUrl(id: string): string {
   const env = import.meta.env.VITE_SHARE_URL as string | undefined;
   const base = env || DEFAULT_SHARE_URL;
@@ -100,7 +110,7 @@ export async function publishSpace(
       {
         owner,
         title: space.name,
-        data: payload,
+        data: stripNul(payload),
         visibility: opts.visibility,
         allowed_emails: opts.allowedEmails.map((e) => e.trim().toLowerCase()).filter(Boolean),
         updated_at: new Date().toISOString(),
@@ -150,7 +160,7 @@ export async function ensurePersonalMcpSpace(): Promise<void> {
   const { error } = await supabase
     .from("shared_spaces")
     .upsert(
-      { owner, title: PERSONAL_SPACE_TITLE, data: payload, visibility: "personal", updated_at: new Date().toISOString() },
+      { owner, title: PERSONAL_SPACE_TITLE, data: stripNul(payload), visibility: "personal", updated_at: new Date().toISOString() },
       { onConflict: "owner,title" },
     );
   if (error) throw new Error(error.message);

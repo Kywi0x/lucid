@@ -3798,9 +3798,12 @@ fn save_pasted_image(bytes: Vec<u8>, ext: String) -> Result<String, String> {
 }
 
 /// Lecture tolérante aux encodages non-UTF-8 (latin-1…).
+/// Les octets nuls sont retirés : un fichier UTF-16 lu ici en sème un sur deux,
+/// et Postgres refuse `\0` en jsonb (l'upload du space MCP échouait en bloc,
+/// cf. `stripNul` côté front).
 fn read_lossy(p: &std::path::Path) -> Result<String, String> {
     std::fs::read(p)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .map(|b| String::from_utf8_lossy(&b).replace('\0', ""))
         .map_err(|e| e.to_string())
 }
 
