@@ -28,9 +28,16 @@ export interface ShareOptions {
  *  en sème dans les contenus extraits → TOUT l'upsert échouait, visible à la
  *  copie de l'URL MCP (`ensurePersonalMcpSpace`). On nettoie à l'envoi, pas
  *  seulement à l'extraction : les brain.json déjà sur disque sont réparés sans
- *  re-scan (bug remonté 2026-08-05, contourné jusqu'ici par une réinstallation). */
+ *  re-scan (bug remonté 2026-08-05, contourné jusqu'ici par une réinstallation).
+ *
+ *  Le nettoyage se fait sur les valeurs (replacer), PAS sur le JSON sérialisé :
+ *  un contenu qui mentionne la séquence `\u0000` en texte devenait `...\` après
+ *  un replace textuel → « JSON Parse error: Invalid escape character » au reparse
+ *  (et un chemin `C:\u0000x` était silencieusement tronqué en `C:\x`). */
 function stripNul<T>(payload: T): T {
-  return JSON.parse(JSON.stringify(payload).replace(/\\u0000/g, "")) as T;
+  return JSON.parse(
+    JSON.stringify(payload, (_k, v) => (typeof v === "string" ? v.replace(/\u0000/g, "") : v)),
+  ) as T;
 }
 
 function shareUrl(id: string): string {
