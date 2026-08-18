@@ -31,6 +31,8 @@ import {
   googleDriveConnect,
   googleDriveDisconnect,
   googleDriveSync,
+  googleDriveSelection,
+  type DriveSelection,
   importClaudeAi,
   importChatGpt,
   localFolderConnect,
@@ -65,6 +67,7 @@ import {
   aiDiagnostics,
   type ModelInfo,
 } from "@/lib/api";
+import { DriveFolderPicker } from "@/components/DriveFolderPicker";
 import { supabase, BACKUP_BUCKET } from "@/lib/supabase";
 import { notify } from "@/lib/notify";
 import type { ConnectorStatus, Space } from "@/lib/types";
@@ -199,6 +202,8 @@ interface ModalProps {
   msg: string;
   obsidianVault?: string | null;
   localFolders?: string[];
+  driveSelectionLabel?: string;
+  onPickDriveFolders?: () => void;
   onAddFolder?: () => void;
   onRemoveFolder?: (path: string) => void;
   onClose: () => void;
@@ -208,8 +213,22 @@ interface ModalProps {
   onImport: () => void;
 }
 
-function ConnectorModal({ c, busy, msg, obsidianVault, localFolders, onAddFolder, onRemoveFolder, onClose, onConnect, onSync, onDisconnect, onImport }: ModalProps) {
-  const isSoon = c.id === "cowork";
+// `onImport` reste dans les props sans être utilisé : le stand-by du 2026-08-06 a retiré le
+// bouton d'import ZIP, pas le circuit. Le garder rend le rallumage immédiat si une API
+// s'ouvre. ponytail: à supprimer pour de bon si le stand-by devient un abandon.
+function ConnectorModal({ c, busy, msg, obsidianVault, localFolders, driveSelectionLabel, onPickDriveFolders, onAddFolder, onRemoveFolder, onClose, onConnect, onSync, onDisconnect, onImport: _onImport }: ModalProps) {
+  /** D'où viennent les données, affiché sous « Compte associé ». Les sources lues sur disque
+ *  disent leur chemin : sans ça la modale affiche « Connecté » sans dire connecté à quoi. */
+const SOURCE_ORIGIN: Record<string, string> = {
+  "claude-code": "~/.claude/projects/",
+  cowork: "Claude Desktop → sessions Cowork locales",
+  "claude-ai": "Import ZIP",
+  chatgpt: "Import ZIP",
+};
+
+// ponytail: plus aucun connecteur « bientôt » depuis que Cowork est réel (2026-08-06).
+  // Le mécanisme `soon` reste en place pour le prochain placeholder.
+  const isSoon = false;
 
   // Échap ferme cette sous-modale AVANT la modale Paramètres : écouteur en phase
   // capture + stopPropagation pour court-circuiter celui de SettingsModal.
@@ -252,7 +271,7 @@ function ConnectorModal({ c, busy, msg, obsidianVault, localFolders, onAddFolder
           </p>
           {c.connected ? (
             <p className="text-xs text-[var(--color-text)]">
-              {c.id === "claude-code" ? "~/.claude/projects/" : c.id === "claude-ai" || c.id === "chatgpt" ? "Import ZIP" : "Connecté"}
+              {SOURCE_ORIGIN[c.id] ?? "Connecté"}
             </p>
           ) : (
             <p className="text-xs text-[var(--color-muted)] italic">Aucun compte connecté</p>
@@ -284,6 +303,17 @@ function ConnectorModal({ c, busy, msg, obsidianVault, localFolders, onAddFolder
               <p className="text-center text-[11px] text-[var(--color-muted)]">{msg}</p>
             )}
 
+            {/* Cowork est détecté seul (le dossier existe ou non) : il n'y a rien à
+                connecter, mais laisser la zone d'actions VIDE donnait une modale qui
+                semblait cassée. On dit ce qui se passe. */}
+            {c.id === "cowork" && (
+              <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
+                {c.connected
+                  ? `Détecté automatiquement — ${c.conversation_count} session${c.conversation_count > 1 ? "s" : ""} lue${c.conversation_count > 1 ? "s" : ""}. Régénère le cerveau pour les y faire entrer.`
+                  : "Aucune session Cowork trouvée. Lance une session dans Claude Desktop, elle sera détectée toute seule."}
+              </p>
+            )}
+
             {c.id === "claude-code" && (
               c.connected ? (
                 <ActionBtn busy={busy} icon={<LogOut className="size-3.5" />} onClick={onDisconnect} danger>
@@ -296,17 +326,18 @@ function ConnectorModal({ c, busy, msg, obsidianVault, localFolders, onAddFolder
               )
             )}
 
+            {/* Import ZIP retiré (stand-by du 2026-08-06) : aucune API ne permet de lire
+                l'historique d'un compte ChatGPT/claude.ai, et redemander un export à chaque
+                mise à jour ne vaut pas la friction. La carte n'apparaît plus que si des
+                conversations ont déjà été importées — on dit d'où elles viennent, sans
+                proposer d'en réimporter. Rallumer = restaurer ce bloc, `onImport` et les
+                handlers existent toujours. */}
             {(c.id === "claude-ai" || c.id === "chatgpt") && (
-              <>
-                {c.id === "chatgpt" && !c.connected && (
-                  <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
-                    chatgpt.com → Réglages → Contrôle des données → Exporter les données, puis importe le ZIP reçu par mail.
-                  </p>
-                )}
-                <ActionBtn busy={busy} icon={<FileText className="size-3.5" />} onClick={onImport}>
-                  {c.connected ? "Réimporter un ZIP" : "Importer export ZIP"}
-                </ActionBtn>
-              </>
+              <p className="text-[10px] leading-relaxed text-[var(--color-muted)]">
+                Import d'historique arrêté — {c.conversation_count} conversation
+                {c.conversation_count > 1 ? "s" : ""} déjà importée
+                {c.conversation_count > 1 ? "s" : ""} restent dans ton cerveau.
+              </p>
             )}
 
             {c.id === "google-drive" && !c.connected && (
@@ -317,6 +348,14 @@ function ConnectorModal({ c, busy, msg, obsidianVault, localFolders, onAddFolder
 
             {c.id === "google-drive" && c.connected && (
               <>
+                {driveSelectionLabel && (
+                  <p className="rounded-lg bg-[var(--color-surface-2)] px-2.5 py-1.5 text-[10px] text-[var(--color-muted)]">
+                    {driveSelectionLabel}
+                  </p>
+                )}
+                <ActionBtn busy={busy} icon={<Folder className="size-3.5" />} onClick={() => onPickDriveFolders?.()}>
+                  Choisir les dossiers
+                </ActionBtn>
                 <ActionBtn busy={busy} icon={<RefreshCw className="size-3.5" />} onClick={onSync} primary>
                   Synchroniser
                 </ActionBtn>
@@ -500,12 +539,30 @@ function ConnectorsSection({
     finally { set("chatgpt", false); }
   }
 
+  // Sélection Drive : `folders` vide = tout le Drive (défaut des comptes connectés
+  // avant cette feature — sinon la mise à jour viderait leur Drive au sync suivant).
+  const [driveSel, setDriveSel] = useState<DriveSelection | null>(null);
+  const [drivePicker, setDrivePicker] = useState(false);
+  const refreshDriveSel = useCallback(() => {
+    googleDriveSelection().then(setDriveSel).catch(() => {});
+  }, []);
+  useEffect(() => { refreshDriveSel(); }, [refreshDriveSel]);
+
+  const driveSelectionLabel = !driveSel
+    ? undefined
+    : driveSel.folders.length === 0
+      ? "Tout le Drive est indexé."
+      : `${driveSel.folders.length} dossier${driveSel.folders.length > 1 ? "s" : ""} indexé${driveSel.folders.length > 1 ? "s" : ""}${driveSel.include_orphans ? " + fichiers sans dossier" : ""}.`;
+
   async function handleGoogleConnect() {
     set("google-drive", true); msg("google-drive", "En attente du navigateur…");
     try {
       await googleDriveConnect();
-      msg("google-drive", "Connecté !");
+      msg("google-drive", "Connecté ! Choisis les dossiers à indexer.");
       onRefresh();
+      // Le choix se fait maintenant, pas enterré dans les réglages : c'est le
+      // moment où l'utilisateur sait ce qu'il veut donner à Lucid.
+      setDrivePicker(true);
     } catch (e) { msg("google-drive", `Erreur : ${e}`); }
     finally { set("google-drive", false); }
   }
@@ -677,7 +734,7 @@ function ConnectorsSection({
       <div className="flex-1 overflow-y-auto px-5 py-4">
         <div className="grid grid-cols-2 gap-2">
           {connectors.map((c) => {
-            const isSoon = c.id === "cowork";
+            const isSoon = false;
             return (
               <button
                 key={c.id}
@@ -710,6 +767,8 @@ function ConnectorsSection({
           msg={msgs[openModal.id] ?? ""}
           obsidianVault={obsidianVault}
           localFolders={localFolders}
+          driveSelectionLabel={driveSelectionLabel}
+          onPickDriveFolders={() => setDrivePicker(true)}
           onAddFolder={handleLocalFolderAddFolder}
           onRemoveFolder={handleLocalFolderRemoveFolder}
           onClose={() => setModalId(null)}
@@ -733,6 +792,13 @@ function ConnectorsSection({
             handleGoogleDisconnect
           }
           onImport={openModal.id === "chatgpt" ? handleImportChatGpt : handleImportClaudeAi}
+        />
+      )}
+
+      {drivePicker && (
+        <DriveFolderPicker
+          onClose={() => setDrivePicker(false)}
+          onSaved={(m) => { msg("google-drive", m); refreshDriveSel(); }}
         />
       )}
     </div>

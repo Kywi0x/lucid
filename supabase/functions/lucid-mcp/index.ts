@@ -34,6 +34,129 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max) + "\n\n*[… tronqué]*";
 }
 
+// ── Lecture ciblée d'une page ─────────────────────────────────────────────────
+// `brain_node` renvoyait `truncate(content, 24_000)` ≈ 7 000 tokens PAR page.
+// Mesuré le 2026-08-03 sur une question type (1 overview + 3 search + 2 lectures) :
+// la lecture de page pèse 93 % du coût en tokens — très au-delà de ce que la
+// méthode de recherche peut économiser. On renvoie donc les passages qui matchent
+// la requête ; `full: true` reste l'échappatoire vers l'ancien comportement.
+const TARGETED_BUDGET = 3_000; // avec `query` : passages retenus
+const BLIND_BUDGET = 8_000; // sans `query` : début de page, moins agressif
+const FULL_MAX = 24_000; // `full: true` : plafond historique
+const BLOCK_SIZE = 800; // granularité d'un passage
+const SEARCH_EXCERPT = 500; // extrait par résultat de recherche
+const CHILD_EXCERPT = 400; // aperçu par sous-page dans une page-conteneur
+const CHILDREN_BUDGET = 8_000; // ≈ 2 000 tokens : 20 sous-pages servies, le reste listé
+
+/// Un montant, symbole AVANT (`$25.00`, facture américaine) ou APRÈS (`16,19 €`).
+/// N'accepter que la seconde forme laissait les factures Xano sans montant alors
+/// que Parabola passait, son OCR portant « USD » derrière le nombre (2026-08-06).
+/// Volontairement large : c'est un indice de position dans le document, pas un
+/// extracteur de montant.
+const MONEY = /[€$£]\s?\d|\d[\d\s.,]*(?:€|£|\$|eur|usd|chf|ttc|\bht\b)/i;
+
+/// Aperçu d'un document quand le client ne passe pas de `query` — le cas réel,
+/// ChatGPT n'en passe pas. Le fournisseur et la date sont en tête, mais le total
+/// est au MILIEU, suivi des mentions légales : ni « les N premiers caractères »
+/// ni « début + fin » ne l'attrapent (mesuré le 2026-08-06 — trois fournisseurs
+/// identifiés, un seul montant). On sert donc le début + le passage qui porte un
+/// montant, et on retombe sur début + fin quand il n'y en a pas.
+function blindPeek(s: string, budget: number): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  if (t.length <= budget) return t;
+  const head = Math.ceil(budget * 0.5);
+  const rest = budget - head;
+  const m = t.slice(head).match(MONEY);
+  const from = m?.index === undefined
+    ? t.length - rest // pas de montant : la fin, faute de mieux
+    : Math.max(head, head + m.index - 40); // un peu de contexte avant le chiffre
+  return `${t.slice(0, head)} […] ${t.slice(from, from + rest)}`;
+}
+// Plafond de résultats : c'était un `8` en dur, sans justification écrite. Le coût
+// d'un cran de plus vaut MAX_RESULTS × SEARCH_EXCERPT caractères — à rouvrir si une
+// campagne montre la bonne page systématiquement en 9ᵉ position.
+const MAX_RESULTS = 8;
+
+/** Minuscules + accents pliés : « geographique » doit matcher « géographique ».
+ *  ponytail: `brain_search` gagnerait à s'en servir aussi (pas de tokenisation ni
+ *  de pliage aujourd'hui) — chantier séparé, il change le classement des résultats. */
+function fold(s: string): string {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+/// Découpe en blocs d'environ `size` caractères, aux sauts de ligne quand c'est
+/// possible. Une ligne plus longue que la fenêtre (export CSV, JSON minifié) est
+/// coupée en dur : sans ça un tableur entier ne formerait qu'un seul bloc.
+function blocks(s: string, size: number): string[] {
+  const lines: string[] = [];
+  for (const line of s.split("\n")) {
+    if (line.length <= size) lines.push(line);
+    else for (let i = 0; i < line.length; i += size) lines.push(line.slice(i, i + size));
+  }
+  const out: string[] = [];
+  let cur = "";
+  for (const line of lines) {
+    if (cur && cur.length + line.length + 1 > size) { out.push(cur); cur = ""; }
+    cur += (cur ? "\n" : "") + line;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+
+/// Passages de `content` qui matchent `query`, dans l'ordre du document, sous le
+/// budget de caractères. `null` = rien ne matche (l'appelant renvoie le début de
+/// page). Pur — vérifié par `scripts/check-mcp-passages.ts`.
+export function relevantPassages(content: string, query: string, budget = TARGETED_BUDGET): string | null {
+  const terms = fold(query).split(/[^\p{L}\p{N}]+/u).filter((t) => t.length > 2);
+  if (!terms.length) return null;
+  const scored = blocks(content, BLOCK_SIZE)
+    .map((text, i) => {
+      const f = fold(text);
+      let score = 0;
+      for (const t of terms) score += f.split(t).length - 1;
+      return { i, text, score };
+    })
+    .filter((b) => b.score > 0)
+    .sort((a, b) => b.score - a.score || a.i - b.i);
+  if (!scored.length) return null;
+
+  const kept: typeof scored = [];
+  let used = 0;
+  for (const b of scored) {
+    if (kept.length && used + b.text.length > budget) break;
+    kept.push(b);
+    used += b.text.length;
+  }
+  kept.sort((a, b) => a.i - b.i);
+
+  let out = "";
+  let prev = -1;
+  for (const b of kept) {
+    if (prev >= 0) out += b.i === prev + 1 ? "\n" : "\n\n*[…]*\n\n";
+    out += b.text.trim();
+    prev = b.i;
+  }
+  return out;
+}
+
+/// Rend la section « Contenu » : passages ciblés si `query`, début de page sinon,
+/// page entière (plafonnée) si `full`. Une page déjà courte part telle quelle —
+/// il n'y a rien à économiser.
+function contentSection(content: string, opts: { query?: string; full?: boolean }): string {
+  if (opts.full) return `\n${truncate(content, FULL_MAX)}`;
+  if (content.length <= TARGETED_BUDGET) return `\n${content}`;
+  const passages = opts.query ? relevantPassages(content, opts.query) : null;
+  if (passages) {
+    return ` — passages pertinents (${passages.length} des ${content.length} caractères)\n${passages}\n\n` +
+      `*Extraits ciblés sur « ${opts.query} ». S'il te manque du contexte, rappelle \`brain_node\` avec \`full: true\`.*`;
+  }
+  const why = opts.query
+    ? `Aucun passage ne matche « ${opts.query} » — début de page renvoyé.`
+    : "Passe `query` (les mots de ta recherche) pour recevoir les passages pertinents au lieu du début de page.";
+  return ` — début de page (${Math.min(content.length, BLIND_BUDGET)} des ${content.length} caractères)\n` +
+    `${truncate(content, BLIND_BUDGET)}\n\n*${why} \`full: true\` pour la page entière.*`;
+}
+
 export function toolOverview(p: Payload): string {
   const ids = new Set(p.nodes.map((n) => n.id));
   const tops = p.nodes.filter((n) => !n.parent_id || !ids.has(n.parent_id));
@@ -55,48 +178,114 @@ export function toolOverview(p: Payload): string {
 }
 
 export function toolSearch(p: Payload, query: string): string {
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  // Tokenisation sur les non-alphanumériques (« l'assurance », « loyer, » →
+  // « assurance », « loyer ») + accents pliés. Avant, `split(/\s+/)` gardait la
+  // ponctuation collée au mot et « geographique » ne trouvait pas « géographique ».
+  const terms = [...new Set(fold(query).split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 2))];
   if (!terms.length) throw new Error("query vide");
   const byId = new Map(p.nodes.map((n) => [n.id, n]));
-  const scored = p.nodes.flatMap((n) => {
-    const label = n.label.toLowerCase();
-    const kw = (n.keywords ?? []).join(" ").toLowerCase();
-    const summary = (n.summary ?? "").toLowerCase();
-    const content = (n.content ?? "").toLowerCase();
+
+  const docs = p.nodes.map((n) => ({
+    n,
+    label: fold(n.label),
+    kw: fold((n.keywords ?? []).join(" ")),
+    summary: fold(n.summary ?? ""),
+    content: fold(n.content ?? ""),
+  }));
+
+  // IDF : un mot pèse selon sa RARETÉ. « document » est dans des centaines de
+  // pages et ne décide rien ; « vaccination » n'est que dans une et décide tout.
+  // Sans ça, l'aiguille se retrouvait à égalité avec le bruit et sortait du top 8
+  // (mesuré le 2026-08-05, `cargo run --example retrieval`). Effet de bord utile :
+  // les mots vides (« de », « pour », « sur ») s'annulent tout seuls, plus besoin
+  // d'une liste à maintenir.
+  const idf = new Map(terms.map((t) => {
+    const df = docs.filter((d) =>
+      d.label.includes(t) || d.kw.includes(t) || d.summary.includes(t) || d.content.includes(t)
+    ).length;
+    return [t, df === 0 ? 0 : Math.log(1 + p.nodes.length / df)];
+  }));
+
+  const scored = docs.flatMap((d) => {
     let score = 0;
     for (const t of terms) {
-      if (label.includes(t)) score += 5;
-      if (kw.includes(t)) score += 3;
-      if (summary.includes(t)) score += 2;
-      if (content.includes(t)) score += 1;
+      const w = idf.get(t) ?? 0;
+      if (w === 0) continue;
+      if (d.label.includes(t)) score += 5 * w;
+      if (d.kw.includes(t)) score += 3 * w;
+      if (d.summary.includes(t)) score += 2 * w;
+      if (d.content.includes(t)) score += 1 * w;
     }
-    return score > 0 ? [{ score, n }] : [];
+    return score > 0 ? [{ score, n: d.n }] : [];
   }).sort((a, b) => b.score - a.score);
 
-  if (!scored.length) return `Aucun résultat pour « ${query} ».`;
+  // Réponse d'absence EXPLICITE : « Aucun résultat pour X » invitait à réessayer,
+  // et les clients enchaînaient jusqu'à 8 recherches de synonymes avant d'oser
+  // dire « je ne trouve pas » (mesuré le 2026-08-05 : 21 recherches pour 3
+  // questions d'absence). Chaque tour coûte un aller-retour complet à
+  // l'utilisateur — le pire poste de tout le parcours.
+  if (!scored.length) {
+    return `Aucune des ${p.nodes.length} pages du cerveau ne contient « ${query} » — la recherche a couvert les titres, les mots-clés, les résumés et le contenu de chaque page.\n\n` +
+      `Si tu as déjà essayé une ou deux reformulations, arrête là : l'information n'est pas dans ce cerveau. Dis-le franchement plutôt que d'énumérer d'autres synonymes.\n`;
+  }
   let out = `Résultats pour « ${query} » :\n`;
-  for (const { n } of scored.slice(0, 8)) {
-    const excerpt = truncate(n.summary || n.content || "", 200).replace(/\n/g, " ");
-    out += `\n- **${n.label}** (\`${n.id}\`, ${n.kind}) — ${pathOf(n, byId) || "racine"}\n  ${excerpt}\n`;
+  for (const { n } of scored.slice(0, MAX_RESULTS)) {
+    // Extrait CIBLÉ sur la requête, pas les 200 premiers caractères : un client
+    // faible s'arrête à la recherche et conclut « l'information n'est pas
+    // visible » sans jamais appeler brain_node (constaté avec ChatGPT le
+    // 2026-08-05 : 2/5 contre 5/5 pour Claude, uniquement faute de chaînage).
+    // L'extrait doit donc porter la réponse, pas seulement le début de la page.
+    const body = n.content ?? "";
+    const excerpt = (relevantPassages(body, query, SEARCH_EXCERPT) ??
+      truncate(n.summary || body, SEARCH_EXCERPT)).replace(/\n+/g, " ");
+    out += `\n- **${n.label}** (\`${n.id}\`, ${n.kind})${n.date ? ` · ${n.date}` : ""} — ${pathOf(n, byId) || "racine"}\n  ${excerpt}\n`;
   }
   out += "\nLis une page complète avec `brain_node`.\n";
   return out;
 }
 
-export function toolNode(p: Payload, nodeId: string): string {
+export function toolNode(p: Payload, nodeId: string, opts: { query?: string; full?: boolean } = {}): string {
   const byId = new Map(p.nodes.map((n) => [n.id, n]));
   const n = byId.get(nodeId);
   if (!n) throw new Error(`nœud \`${nodeId}\` introuvable (utilise brain_search pour trouver un id)`);
   let out = `# ${n.label}\n\n- id : \`${n.id}\` · type : ${n.kind}\n`;
   const path = pathOf(n, byId);
   if (path) out += `- chemin : ${path}\n`;
+  if (n.date) out += `- date : ${n.date}\n`;
   if (n.keywords?.length) out += `- mots-clés : ${n.keywords.join(", ")}\n`;
   if (n.summary) out += `\n## Résumé\n${n.summary}\n`;
-  if (n.content) out += `\n## Contenu\n${truncate(n.content, 24_000)}\n`;
+  if (n.content) out += `\n## Contenu${contentSection(n.content, opts)}\n`;
   const kids = p.nodes.filter((c) => c.parent_id === n.id);
   if (kids.length) {
+    // Une page-conteneur ne listait que des titres : « sur quelle période ? » sur un
+    // dossier de 16 factures demandait 16 appels `brain_node`, et « ce que je paie à
+    // chacun » sur deux dossiers, 29. Un client à quota renonce avant (ChatGPT,
+    // 2026-08-06 : s'arrête à l'index et déclare l'information inaccessible — il
+    // avait raison, elle n'y était pas). On descend donc date + passage ciblé de
+    // chaque enfant : la question d'agrégation tient en UN appel.
     out += "\n## Sous-pages\n";
-    for (const c of kids) out += `- ${c.label} (\`${c.id}\`)\n`;
+    let budget = CHILDREN_BUDGET;
+    let skipped = 0;
+    for (const c of kids) {
+      out += `- **${c.label}** (\`${c.id}\`)${c.date ? ` · ${c.date}` : ""}\n`;
+      if (budget <= 0) { skipped++; continue; }
+      // L'aperçu ne peut PAS dépendre de `query` : mesuré le 2026-08-06, ChatGPT
+      // appelle `brain_node` sans, et repartait avec « je n'ai accès qu'à
+      // l'organisation, pas au contenu » — alors que les dates, elles,
+      // remontaient. Avec `query` on cible ; sinon on descend quand même le
+      // résumé, ou le début du document. Budget 1 → `relevantPassages` garde son
+      // meilleur bloc. ponytail: coupe au caractère, un montant peut tomber en
+      // bordure — l'id est là, `brain_node` donne la page entière.
+      // `||` et pas `??` : le payload sérialise les champs Rust vides en `""`, pas
+      // en `null` (cf. `share.ts`, `summary: n.summary`). Avec `??` la chaîne vide
+      // passait pour une valeur et bloquait le repli — aperçu vide, sous-page nue.
+      const targeted = opts.query ? relevantPassages(c.content ?? "", opts.query, 1) : null;
+      const peek = targeted
+        ? targeted.slice(0, CHILD_EXCERPT).replace(/\s+/g, " ").trim()
+        : blindPeek(c.summary || c.content || "", CHILD_EXCERPT);
+      if (peek) { budget -= peek.length; out += `  ${peek}\n`; }
+    }
+    if (skipped) out += `\n*${skipped} sous-pages listées sans extrait (budget atteint) — lis-les avec \`brain_node\`.*\n`;
   }
   return out;
 }
@@ -292,14 +481,22 @@ const TOOLS = [
   },
   {
     name: "brain_search",
-    description: "Recherche des pages par mots-clés dans le cerveau de l'utilisateur. Renvoie les 8 meilleures avec extraits. Utilise-le systématiquement dès qu'une question touche un sujet précis, avant de répondre depuis ta seule mémoire.",
+    description: "Recherche des pages dans le cerveau de l'utilisateur. Renvoie les 8 meilleures avec un extrait ciblé sur ta requête (pas le début de la page). Utilise-le systématiquement dès qu'une question touche un sujet précis. Si l'extrait ne suffit pas — un montant, une date, un détail —, appelle `brain_node` avec l'id ET ta requête : ne réponds JAMAIS que l'information « n'est pas visible » sans avoir lu la page, la recherche ne renvoie qu'un aperçu.",
     inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     annotations: { title: "Recherche", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "brain_node",
-    description: "Lit une page complète (contenu, chemin, sous-pages) à partir de son id. À appeler après brain_overview/brain_search dès qu'une page semble pertinente, pour lire son contenu réel avant de répondre.",
-    inputSchema: { type: "object", properties: { node_id: { type: "string" } }, required: ["node_id"] },
+    description: "Lit une page (contenu, chemin, sous-pages) à partir de son id. À appeler après brain_overview/brain_search dès qu'une page semble pertinente, pour lire son contenu réel avant de répondre. Passe TOUJOURS `query` (les mots que tu cherches) : la page est alors réduite aux passages utiles au lieu de son début — une page peut peser plusieurs milliers de mots. Utilise `full` seulement s'il te manque du contexte.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node_id: { type: "string" },
+        query: { type: "string", description: "ce que tu cherches dans cette page (mots-clés ou question) — renvoie les passages pertinents" },
+        full: { type: "boolean", description: "true = page entière (coûteux, à réserver aux cas où les passages ne suffisent pas)" },
+      },
+      required: ["node_id"],
+    },
     annotations: { title: "Lire une page", readOnlyHint: true, openWorldHint: false },
   },
   {
@@ -486,7 +683,7 @@ export async function handler(req: Request): Promise<Response> {
         const text =
           name === "brain_overview" ? toolOverview(payload) :
           name === "brain_search" ? toolSearch(payload, args.query ?? "") :
-          name === "brain_node" ? toolNode(payload, args.node_id ?? "") :
+          name === "brain_node" ? toolNode(payload, args.node_id ?? "", { query: args.query, full: args.full === true || args.full === "true" }) :
           (() => { throw new Error(`tool inconnu : ${name}`); })();
         return rpcResult(id, { content: [{ type: "text", text }] });
       } catch (e) {

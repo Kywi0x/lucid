@@ -62,6 +62,7 @@ pub fn list_conversations_pub() -> Vec<ConversationSummary> {
     connectors::claude_code::list_conversations()
 }
 
+
 /// Insère (ou met à jour) une note « Parcours de démo » à la racine du cerveau —
 /// utilisée par `examples/seed_note.rs` pour déposer une note pédagogique dans
 /// l'app réelle. Id stable (`note-tour`) : ré-exécutable sans créer de doublon.
@@ -2179,6 +2180,7 @@ async fn run_archivist(app: tauri::AppHandle) -> Result<String, String> {
 /// Agrège toutes les sources connues.
 fn load_all_conversations() -> Vec<Conversation> {
     let mut convs = connectors::claude_code::load_all_conversations();
+    convs.extend(connectors::cowork::load_all_conversations());
     convs.extend(connectors::claude_ai::load_conversations());
     convs.extend(connectors::chatgpt::load_conversations());
     convs.extend(connectors::google_drive::load_conversations());
@@ -2334,6 +2336,7 @@ fn list_conversations() -> Vec<ConversationSummary> {
 #[tauri::command]
 fn load_conversation(project_slug: String, id: String, source: Option<String>) -> Option<Conversation> {
     match source.as_deref() {
+        Some("cowork")       => connectors::cowork::load_by_id(&id),
         Some("claude-ai")    => connectors::claude_ai::load_by_id(&id),
         Some("chatgpt")      => connectors::chatgpt::load_by_id(&id),
         Some("google-drive") => connectors::google_drive::load_by_id(&id),
@@ -2387,33 +2390,25 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             conversation_count: cc_convs.len(),
             needs_setup: false,
         },
-        ConnectorStatus {
-            id: "claude-ai".into(),
-            name: "Claude".into(),
-            connected: ai_connected,
-            last_sync: ai_sync,
-            conversation_count: ai_convs.len(),
-            needs_setup: false,
-        },
         {
-            let cg_convs = connectors::chatgpt::load_conversations();
-            let cg_sync = cg_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max();
+            // Cowork (Claude Desktop, mode agent local) : détecté tout seul comme Claude
+            // Code — le dossier existe ou n'existe pas, il n'y a rien à connecter.
+            let cw_convs = connectors::cowork::list_conversations();
+            let cw_sync = cw_convs.iter().filter_map(|c| c.last_timestamp.clone()).max();
+            // Le dossier existe mais aucune session lisible : le cas mérite une trace,
+            // c'est le symptôme d'un changement de format côté Anthropic. On ne journalise
+            // pas le cas nominal, `connectors_status` est appelé très souvent.
+            if cw_convs.is_empty() && connectors::cowork::sessions_dir().is_some() {
+                crate::elog!("🔎 cowork: dossier présent mais 0 session lisible");
+            }
             ConnectorStatus {
-                id: "chatgpt".into(),
-                name: "ChatGPT".into(),
-                connected: !cg_convs.is_empty(),
-                last_sync: cg_sync,
-                conversation_count: cg_convs.len(),
+                id: "cowork".into(),
+                name: "Cowork".into(),
+                connected: connectors::cowork::sessions_dir().is_some(),
+                last_sync: cw_sync,
+                conversation_count: cw_convs.len(),
                 needs_setup: false,
             }
-        },
-        ConnectorStatus {
-            id: "cowork".into(),
-            name: "Cowork".into(),
-            connected: false,
-            last_sync: None,
-            conversation_count: 0,
-            needs_setup: false,
         },
         {
             let gd_convs = connectors::google_drive::load_conversations();
@@ -2448,6 +2443,38 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             }
         },
     ];
+
+    // claude.ai et ChatGPT en STAND-BY comme sources (décision 2026-08-06) : ni OpenAI ni
+    // Anthropic n'expose d'API pour lire l'historique d'un compte, et le seul chemin —
+    // l'export ZIP à redemander manuellement à chaque mise à jour — sert l'ancien
+    // positionnement « agrégateur de conversations IA ». ChatGPT reste dans le produit,
+    // mais comme CLIENT du cerveau via le MCP. Le code des connecteurs reste en place :
+    // si une API s'ouvre, il suffit de retirer la condition.
+    //
+    // La carte reste affichée à qui a DÉJÀ importé : masquer les cartes ferait disparaître
+    // ses conversations de l'écran Sources sans un mot, alors qu'elles sont toujours dans
+    // son cerveau — exactement l'échec silencieux qu'interdit l'ADR-0015.
+    if ai_connected {
+        list.push(ConnectorStatus {
+            id: "claude-ai".into(),
+            name: "Claude".into(),
+            connected: true,
+            last_sync: ai_sync,
+            conversation_count: ai_convs.len(),
+            needs_setup: false,
+        });
+    }
+    let cg_convs = connectors::chatgpt::load_conversations();
+    if !cg_convs.is_empty() {
+        list.push(ConnectorStatus {
+            id: "chatgpt".into(),
+            name: "ChatGPT".into(),
+            connected: true,
+            last_sync: cg_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max(),
+            conversation_count: cg_convs.len(),
+            needs_setup: false,
+        });
+    }
 
     // Mac uniquement : Notes.app n'existe pas sur Windows, la carte n'a rien à
     // faire dans la grille là-bas plutôt que d'afficher un connecteur inerte.
@@ -2509,6 +2536,35 @@ fn google_drive_has_credentials() -> bool {
 #[tauri::command]
 fn google_drive_disconnect() {
     connectors::google_drive::disconnect();
+}
+
+/// Arbre des dossiers Drive pour l'écran de sélection. Ne liste QUE les dossiers
+/// (quelques secondes même sur un Drive de 1 To).
+#[tauri::command]
+async fn google_drive_folders() -> Result<Vec<connectors::google_drive::DriveFolder>, String> {
+    tauri::async_runtime::spawn_blocking(connectors::google_drive::list_folders)
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Nombre de documents ingérables par dossier (clé "" = fichiers sans dossier).
+/// Demande l'énumération complète → appelé en arrière-plan, jamais bloquant.
+#[tauri::command]
+async fn google_drive_folder_counts() -> Result<std::collections::HashMap<String, usize>, String> {
+    tauri::async_runtime::spawn_blocking(connectors::google_drive::folder_doc_counts)
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Sélection actuelle. `folders` vide = tout le Drive.
+#[tauri::command]
+fn google_drive_selection() -> connectors::google_drive::Selection {
+    connectors::google_drive::selection()
+}
+
+#[tauri::command]
+fn google_drive_set_selection(folders: Vec<String>, include_orphans: bool) -> Result<(), String> {
+    connectors::google_drive::set_selection(folders, include_orphans)
 }
 
 /// Importe un export ZIP claude.ai. Renvoie le nombre de conversations importées.
@@ -2602,32 +2658,179 @@ fn ai_diagnostics() -> AiDiagnostics {
 /// pertinentes à la question (récupération par mots-clés). Injecter tout brain.md
 /// dépasse la fenêtre du modèle (8192 tokens) → llama plante. Ici on borne à
 /// `budget` octets, quelle que soit la taille du cerveau.
-fn ask_context(graph: &BrainGraph, question: &str, report: &str) -> String {
-    const BUDGET: usize = 16_000; // ~4000 tokens, laisse la place au report + réponse
-    let terms: Vec<String> = question
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.chars().count() >= 3)
-        .map(str::to_string)
+/// Minuscules + accents pliés, sans dépendance : « geographique » doit trouver
+/// « géographique ». Table volontairement limitée au français (parité Windows :
+/// aucun binaire, aucun crate en plus).
+fn fold(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| c.to_lowercase())
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            'ÿ' | 'ý' => 'y',
+            other => other,
+        })
+        .collect()
+}
+
+/// Passages de `text` contenant les mots de la question, dans l'ordre du document,
+/// sous `budget` caractères. `None` si aucun mot n'apparaît.
+///
+/// Miroir Rust de `relevantPassages` (MCP) et même raison d'être : injecter le
+/// RÉSUMÉ d'une page ne fait jamais arriver un montant, une date ou une référence
+/// jusqu'au modèle — l'assistant local répondait « ce n'est pas visible » sur des
+/// informations bel et bien présentes dans le document (constaté le 2026-08-05).
+fn relevant_passage(text: &str, terms: &[String], budget: usize) -> Option<String> {
+    const BLOCK: usize = 250; // fenêtre courte : jusqu'à 40 pages partagent 16 000 car.
+    // Plafond de balayage : le cerveau contient des documents de 3,2 MILLIONS de
+    // caractères (exports CSV). Découper 40 pages de cette taille à chaque question
+    // se paie cher, surtout en build debug (`tauri dev`), et une réponse qui vit
+    // au-delà de 100 k caractères est rare. Le SCORE, lui, continue de voir tout le
+    // document : on ne perd que l'extraction du passage, qui se rabat sur le résumé.
+    const SCAN_CAP: usize = 100_000;
+    if terms.is_empty() || text.trim().is_empty() { return None; }
+    let text: &str = match text.char_indices().nth(SCAN_CAP) {
+        Some((byte, _)) => &text[..byte],
+        None => text,
+    };
+
+    // Blocs d'environ BLOCK caractères, coupés aux sauts de ligne quand c'est
+    // possible ; une ligne géante (export CSV) est coupée en dur, sinon un tableur
+    // entier ne formerait qu'un seul bloc.
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        for piece in chars.chunks(BLOCK) {
+            let piece: String = piece.iter().collect();
+            if !cur.is_empty() && cur.chars().count() + piece.chars().count() > BLOCK {
+                blocks.push(std::mem::take(&mut cur));
+            }
+            if !cur.is_empty() { cur.push(' '); }
+            cur.push_str(&piece);
+        }
+    }
+    if !cur.trim().is_empty() { blocks.push(cur); }
+
+    let mut scored: Vec<(usize, usize, &String)> = blocks.iter().enumerate()
+        .map(|(i, b)| {
+            let f = fold(b);
+            (terms.iter().map(|t| f.matches(t.as_str()).count()).sum::<usize>(), i, b)
+        })
+        .filter(|(s, _, _)| *s > 0)
         .collect();
+    if scored.is_empty() { return None; }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    let mut kept: Vec<(usize, &String)> = Vec::new();
+    let mut used = 0usize;
+    for (_, i, b) in scored {
+        let n = b.chars().count();
+        if !kept.is_empty() && used + n > budget { break; }
+        kept.push((i, b));
+        used += n;
+    }
+    kept.sort_by_key(|(i, _)| *i);
+
+    let mut out = String::new();
+    let mut prev: Option<usize> = None;
+    for (i, b) in kept {
+        if let Some(p) = prev { out.push_str(if i == p + 1 { " " } else { " […] " }); }
+        out.push_str(b.trim());
+        prev = Some(i);
+    }
+    Some(out)
+}
+
+fn ask_context(graph: &BrainGraph, question: &str, report: &str, semantic: &[String]) -> String {
+    const BUDGET: usize = 16_000; // ~4000 tokens, laisse la place au report + réponse
+    const DEEP: usize = 8; // pages qui reçoivent un passage complet
+    // 3 places, et pas plus : à 5, les candidats vectoriels poussaient la queue du
+    // classement mots-clés hors de la fenêtre de 40 et le score retombait de 10/12
+    // à 9/12 (mesuré le 2026-08-05).
+    const SEM_SLOTS: usize = 3;
+    let terms: Vec<String> = {
+        let mut v: Vec<String> = fold(question)
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 2)
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
 
     let label_of: std::collections::HashMap<&str, &str> =
         graph.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
 
-    // Score = correspondances des mots de la question (titre pondéré fort).
-    let mut scored: Vec<(usize, &BrainNode)> = graph.nodes.iter()
+    // Nombre d'enfants par nœud : sans lui, le modèle COMPTE CE QU'IL VOIT. Sur
+    // « combien de factures Xano ai-je ? », Gemma a répondu « trois » (les trois
+    // injectées) alors que le dossier en contient 16 — le montant était juste, le
+    // compte faux, et rien dans le contexte ne pouvait le lui dire (2026-08-05).
+    // `brain_overview` donne cette information côté MCP ; l'injection locale non.
+    let child_count = graph.nodes.iter().fold(
+        std::collections::HashMap::<&str, usize>::new(),
+        |mut m, n| {
+            if let Some(p) = n.parent_id.as_deref() { *m.entry(p).or_insert(0) += 1; }
+            m
+        },
+    );
+
+    // Champs pliés une fois pour toutes (deux passes : IDF, puis score).
+    let docs: Vec<(&BrainNode, String, String, String, String)> = graph.nodes.iter()
         .filter(|n| n.kind != "root")
-        .map(|n| {
-            let title = n.label.to_lowercase();
-            let hay = format!("{} {} {} {}", n.summary, n.keywords.join(" "), n.content, n.source_text).to_lowercase();
-            let score = terms.iter().map(|t|
-                if title.contains(t.as_str()) { 5 } else { 0 } + hay.matches(t.as_str()).count()
-            ).sum();
-            (score, n)
-        })
-        .filter(|(s, _)| *s > 0)
+        .map(|n| (
+            n,
+            fold(&n.label),
+            fold(&n.keywords.join(" ")),
+            fold(&n.summary),
+            fold(&format!("{} {}", n.content, n.source_text)),
+        ))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.weight.cmp(&a.1.weight)));
+
+    // Score BINAIRE par champ (titre 5 / mots-clés 3 / résumé 2 / corps 1), pondéré
+    // par la RARETÉ du mot (IDF). Deux corrections mesurées le 2026-08-05 avec
+    // `cargo run --example retrieval` :
+    //  - compter les occurrences rendait le score proportionnel à la TAILLE du
+    //    document (« sur » comptait 499 fois dans un export immobilier via
+    //    « surface »/« assurance ») : les 4 plus gros documents gagnaient tout — 4/12 ;
+    //  - sans IDF, un mot rare comme « vaccination » pesait autant que « document »,
+    //    présent partout, et l'aiguille restait noyée dans les ex aequo — 9/12.
+    // L'IDF rend aussi la liste de mots vides inutile : ils s'annulent d'eux-mêmes.
+    let n_docs = docs.len().max(1) as f32;
+    let idf: std::collections::HashMap<&str, f32> = terms.iter()
+        .map(|t| {
+            let df = docs.iter()
+                .filter(|(_, ti, kw, su, bo)| ti.contains(t) || kw.contains(t) || su.contains(t) || bo.contains(t))
+                .count();
+            (t.as_str(), if df == 0 { 0.0 } else { (1.0 + n_docs / df as f32).ln() })
+        })
+        .collect();
+
+    // ponytail: un bonus de « couverture » (favoriser les pages qui matchent
+    // plusieurs mots de la question) a été essayé le 2026-08-05 et MESURÉ PIRE
+    // — 8/12 contre 9/12. Ne pas le réintroduire sans le remesurer.
+    let mut scored: Vec<(f32, &BrainNode)> = docs.iter()
+        .map(|(n, title, kw, summary, body)| {
+            let score: f32 = terms.iter().map(|t| {
+                let w = idf.get(t.as_str()).copied().unwrap_or(0.0);
+                if w == 0.0 { return 0.0; }
+                let t = t.as_str();
+                w * ((if title.contains(t) { 5.0 } else { 0.0 })
+                    + (if kw.contains(t) { 3.0 } else { 0.0 })
+                    + (if summary.contains(t) { 2.0 } else { 0.0 })
+                    + (if body.contains(t) { 1.0 } else { 0.0 }))
+            }).sum();
+            (score, *n)
+        })
+        .filter(|(s, _)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.weight.cmp(&a.1.weight)));
 
     // Aucun match (question vague) → replie sur les nœuds les plus « lourds ».
     let mut selected: Vec<&BrainNode> = if scored.is_empty() {
@@ -2637,44 +2840,171 @@ fn ask_context(graph: &BrainGraph, question: &str, report: &str) -> String {
     } else {
         scored.into_iter().map(|(_, n)| n).collect()
     };
-    selected.truncate(40);
+    // HYBRIDE : les vecteurs ne font qu'AJOUTER des candidats que les mots-clés
+    // n'ont pas vus, dans des places réservées de l'étage profond. Mesuré le
+    // 2026-08-05 sur 12 questions : mots-clés 9/12, vecteurs 5/12, mais les deux
+    // échouent sur des ensembles DISJOINTS (les vecteurs sont nuls sur les
+    // identifiants — « Xano » en rang 173, « ADR-0019 » en rang 83 — et bons sur le
+    // fossé de vocabulaire) ; l'union monte à 11/12.
+    //
+    // Les vecteurs ne décident JAMAIS d'une absence : la similarité du bruit pur
+    // (0,690–0,747 sur les contrôles négatifs) dépasse celle des vraies réponses
+    // (0,674–0,703), donc aucun seuil ne les sépare. Le « je ne trouve rien » reste
+    // au classement par mots-clés, où il est gratuit et fiable.
+    if !semantic.is_empty() && !selected.is_empty() {
+        let known: std::collections::HashSet<&str> =
+            selected.iter().take(40).map(|n| n.id.as_str()).collect();
+        let fresh: Vec<&BrainNode> = semantic.iter()
+            .filter(|id| !known.contains(id.as_str()))
+            .filter_map(|id| graph.nodes.iter().find(|n| &n.id == id))
+            .take(SEM_SLOTS)
+            .collect();
+        if !fresh.is_empty() {
+            let cut = DEEP.saturating_sub(fresh.len()).min(selected.len());
+            let tail = selected.split_off(cut);
+            selected.extend(fresh);
+            selected.extend(tail);
+        }
+    }
+    // 48 et non 40 : le budget de caractères s'arrête de lui-même avant, donc ce
+    // plafond n'est qu'une ceinture. À 40 pile, une page utile en queue de liste
+    // (Q13, rang 40) sortait du contexte au moindre allongement des lignes.
+    selected.truncate(48);
+
+    // Injection en DEUX ÉTAGES sous le même budget : les premières pages du
+    // classement portent un vrai passage (là où vivent les montants, dates et
+    // références), la queue reste en une ligne pour garder de la largeur. Tout
+    // donner à 500 caractères tombait à 28 pages injectées au lieu de 40 et
+    // faisait sortir du contexte des pages utiles (mesuré le 2026-08-05).
+    const PASSAGE: usize = 500;
+    const SHALLOW: usize = 150;
 
     let mut ctx = format!("APERÇU :\n{report}\n\nPAGES PERTINENTES :\n");
-    for n in selected {
+    for (rank, n) in selected.iter().enumerate() {
         if ctx.len() > BUDGET { ctx.push_str("[…autres pages omises…]\n"); break; }
         let parent = n.parent_id.as_deref().and_then(|p| label_of.get(p)).copied().unwrap_or("");
-        let body = if !n.summary.trim().is_empty() {
-            n.summary.trim().to_string()
-        } else if !n.content.trim().is_empty() {
-            n.content.chars().take(300).collect::<String>()
-        } else {
-            n.source_text.chars().take(300).collect::<String>()
+        let budget = if rank < DEEP { PASSAGE } else { SHALLOW };
+        let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
+        let body = relevant_passage(raw, &terms, budget).unwrap_or_else(|| {
+            if !n.summary.trim().is_empty() {
+                n.summary.trim().chars().take(budget).collect::<String>()
+            } else {
+                raw.chars().take(budget.min(300)).collect::<String>()
+            }
+        });
+        // Annotations de comptage : « ce dossier contient N pages » et « cette page
+        // vient d'un dossier qui en contient N » — de quoi répondre à un « combien »
+        // sans avoir les N pages sous les yeux.
+        // UN SEUL chiffre par ligne, sinon le modèle prend le mauvais : la première
+        // version annonçait « dans Lucid, qui contient 37 pages · 16 sous-pages » et
+        // Gemma a répondu 37. Un dossier annonce son propre compte ; une page
+        // annonce celui de son dossier.
+        let own = child_count.get(n.id.as_str()).copied();
+        let ann = match (own, parent.is_empty()) {
+            (Some(c), _) => format!(" (dossier de {c} pages)"),
+            (None, false) => match n.parent_id.as_deref().and_then(|p| child_count.get(p)).copied() {
+                Some(c) if c > 1 => format!(" (dans « {parent} », dossier de {c} pages)"),
+                _ => format!(" (dans « {parent} »)"),
+            },
+            (None, true) => String::new(),
         };
-        if parent.is_empty() {
-            ctx.push_str(&format!("- {} : {body}\n", n.label));
-        } else {
-            ctx.push_str(&format!("- {} (dans {parent}) : {body}\n", n.label));
-        }
+        ctx.push_str(&format!("- {}{ann} : {body}\n", n.label));
     }
     ctx
 }
 
-#[tauri::command]
-async fn ask_brain(question: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-        let graph: BrainGraph = backup::load_brain_cached(&dir)
-            .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
-        let report = std::fs::read_to_string(dir.join("brain_report.md")).unwrap_or_default();
-        let engine = LlamaEngine::detect()?;
-        let system = "Tu es l'assistant du second cerveau de l'utilisateur. Réponds en \
+/// Recherche VECTORIELLE expérimentale, pour comparer au classement par mots-clés
+/// (`cargo run --example retrieval`). La question est embeddée avec BGE-M3, puis
+/// comparée aux vecteurs DÉJÀ en cache : aucun document n'est ré-embeddé, une
+/// mesure ne doit pas coûter 6 minutes de GPU à fond. Les pages sans vecteur sont
+/// donc absentes du résultat — c'est justement une donnée de la mesure.
+/// Renvoie `(similarité, id, label)` trié du plus proche au plus loin.
+pub fn semantic_candidates(question: &str, top: usize) -> Result<Vec<(f32, String, String)>, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let graph: BrainGraph =
+        backup::load_brain_cached(&dir).map_err(|_| "Génère d'abord ta mind map.".to_string())?;
+    let cache: std::collections::HashMap<String, EmbedEntry> =
+        std::fs::read_to_string(embed_cache_path(&dir)).ok()
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default();
+    if cache.is_empty() {
+        return Err("aucun vecteur en cache — lance une passe de l'Archiviste d'abord".into());
+    }
+    let q = ai::llama::embed_texts(&[question.to_string()])?
+        .pop()
+        .ok_or("embedding de la question vide")?;
+    let mut out: Vec<(f32, String, String)> = graph.nodes.iter()
+        .filter(|n| n.kind != "root")
+        .filter_map(|n| {
+            let e = cache.get(&n.id)?;
+            if e.vec.is_empty() { return None; }
+            Some((ai::llama::cosine(&q, &e.vec), n.id.clone(), n.label.clone()))
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    out.truncate(top);
+    Ok(out)
+}
+
+/// Le contexte RÉELLEMENT injecté dans le modèle local pour une question, sans
+/// appeler le modèle. Exposé pour `cargo run --example retrieval` : ça permet de
+/// scorer la récupération seule, sans qu'un modèle faible brouille le résultat.
+pub fn ask_context_for(question: &str, hybrid: bool) -> Result<String, String> {
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let graph: BrainGraph =
+        backup::load_brain_cached(&dir).map_err(|_| "Génère d'abord ta mind map.".to_string())?;
+    let report = std::fs::read_to_string(dir.join("brain_report.md")).unwrap_or_default();
+    let sem = if hybrid { semantic_ids(question) } else { Vec::new() };
+    Ok(ask_context(&graph, question, &report, &sem))
+}
+
+/// Candidats vectoriels pour une question, en BEST-EFFORT : moteur d'embedding
+/// absent, cache vide, modèle non téléchargé → liste vide, et la recherche par
+/// mots-clés répond seule. L'assistant ne doit jamais échouer à cause de ça.
+fn semantic_ids(question: &str) -> Vec<String> {
+    const CANDIDATES: usize = 10;
+    semantic_candidates(question, CANDIDATES)
+        .map(|v| v.into_iter().map(|(_, id, _)| id).collect())
+        .unwrap_or_default()
+}
+
+/// Corps de `ask_brain`, synchrone et exposé : chaque étape est chronométrée dans
+/// `lucid.log`, et `cargo run --example ask -- "<question>"` rejoue exactement le
+/// même chemin hors de l'app (un « réflexion » qui ne rend jamais la main n'est
+/// diagnosticable qu'en voyant laquelle des étapes ne finit pas).
+pub fn answer_question(question: &str) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
+    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+    let graph: BrainGraph = backup::load_brain_cached(&dir)
+        .map_err(|_| "Génère d'abord ta mind map.".to_string())?;
+    let report = std::fs::read_to_string(dir.join("brain_report.md")).unwrap_or_default();
+    let engine = LlamaEngine::detect()?;
+    elog!("💬 ask_brain : moteur prêt en {:.1}s", t0.elapsed().as_secs_f32());
+
+    // Hybride mots-clés + vecteurs (best-effort : sans moteur d'embedding, les
+    // mots-clés répondent seuls).
+    let t_sem = std::time::Instant::now();
+    let sem = semantic_ids(question);
+    elog!("💬 ask_brain : {} candidat(s) vectoriel(s) en {:.1}s", sem.len(), t_sem.elapsed().as_secs_f32());
+
+    let system = "Tu es l'assistant du second cerveau de l'utilisateur. Réponds en \
 français, de façon concise, en te basant UNIQUEMENT sur le contexte fourni. Cite les pages \
 par leur titre. Si l'information n'y figure pas, dis-le clairement.";
-        let user = format!("CONTEXTE :\n{}\n\nQUESTION : {question}", ask_context(&graph, &question, &report));
-        engine.complete(Some(system), &user, 512)
-    })
-    .await
-    .map_err(|e| format!("Tâche interrompue : {e}"))?
+    let user = format!("CONTEXTE :\n{}\n\nQUESTION : {question}", ask_context(&graph, question, &report, &sem));
+    elog!("💬 ask_brain : contexte de {} car., génération…", user.len());
+
+    let t_gen = std::time::Instant::now();
+    let out = engine.complete(Some(system), &user, 512);
+    elog!("💬 ask_brain : génération {} en {:.1}s (total {:.1}s)",
+        if out.is_ok() { "OK" } else { "ÉCHEC" }, t_gen.elapsed().as_secs_f32(), t0.elapsed().as_secs_f32());
+    out
+}
+
+#[tauri::command]
+async fn ask_brain(question: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || answer_question(&question))
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
 /// Chat contextuel sur une page : contexte = contenu de la page (+ sous-pages si demandé).
@@ -6590,6 +6920,10 @@ pub fn run() {
             google_drive_connect,
             google_drive_sync,
             google_drive_disconnect,
+            google_drive_folders,
+            google_drive_folder_counts,
+            google_drive_selection,
+            google_drive_set_selection,
             ask_brain,
             ask_node,
             generate_content,
@@ -6681,6 +7015,25 @@ mod ask_tests {
     use super::*;
 
     #[test]
+    fn relevant_passage_renvoie_le_passage_utile_pas_le_debut_de_page() {
+        let text = format!("{}\nLe montant du loyer est de 850 euros.\n{}", "bla ".repeat(200), "fin ".repeat(200));
+        let terms = vec!["loyer".to_string(), "montant".to_string()];
+        let p = relevant_passage(&text, &terms, 500).expect("un passage attendu");
+        assert!(p.contains("850 euros"), "le passage doit porter la réponse : {p}");
+        assert!(p.chars().count() <= 800, "budget dépassé : {} car.", p.chars().count());
+        // Accents pliés dans les deux sens, et rien à trouver → None (l'appelant
+        // se rabat alors sur le résumé).
+        assert!(relevant_passage("Le relevé géographique.", &["geographique".to_string()], 500).is_some());
+        assert!(relevant_passage(&text, &["zzzz".to_string()], 500).is_none());
+        // Ligne géante sans saut de ligne (export CSV) : la valeur cherchée est
+        // quand même isolée au lieu de noyer tout le tableur.
+        let csv = format!("{};PLOMBERIE;1240", (0..300).map(|i| format!("{i},client{i}")).collect::<Vec<_>>().join(";"));
+        let p = relevant_passage(&csv, &["plomberie".to_string()], 500).expect("un passage attendu");
+        assert!(p.contains("PLOMBERIE"));
+        assert!(p.chars().count() <= 600, "{} car.", p.chars().count());
+    }
+
+    #[test]
     fn ask_context_selectionne_les_pages_pertinentes_et_reste_borne() {
         let mut nodes = vec![
             BrainNode { updated_at: None,
@@ -6701,7 +7054,7 @@ mod ask_tests {
             report: String::new(), generated_at: String::new(),
         };
 
-        let ctx = ask_context(&graph, "Quelles pages parlent de Jaon ?", "APERCU");
+        let ctx = ask_context(&graph, "Quelles pages parlent de Jaon ?", "APERCU", &[]);
         assert!(ctx.contains("Notes Jaon"), "la page pertinente doit être incluse");
         assert!(!ctx.contains("Recette"), "les pages hors sujet sont exclues");
         assert!(ctx.len() < 20_000, "le contexte doit rester borné, pas tout le cerveau");

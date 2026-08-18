@@ -128,7 +128,7 @@ fn tool_summary(name: &str, input: Option<&Value>) -> String {
 
 /// Parse un fichier `.jsonl` en une conversation complète.
 /// Tolérant : les lignes vides ou invalides sont ignorées.
-fn parse_file(path: &Path, project_slug: &str) -> Option<Conversation> {
+pub(super) fn parse_file(path: &Path, project_slug: &str, source: &str) -> Option<Conversation> {
     let raw = fs::read_to_string(path).ok()?;
     let id = path.file_stem()?.to_string_lossy().to_string();
 
@@ -215,7 +215,7 @@ fn parse_file(path: &Path, project_slug: &str) -> Option<Conversation> {
         title,
         project,
         project_slug: project_slug.to_string(),
-        source: super::SOURCE_CLAUDE_CODE.to_string(),
+        source: source.to_string(),
         container_path: vec![repo_name],
         message_count: messages.len(),
         first_timestamp: first_ts,
@@ -258,7 +258,7 @@ pub fn list_conversations() -> Vec<ConversationSummary> {
             if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(conv) = parse_file(&p, &slug) {
+            if let Some(conv) = parse_file(&p, &slug, super::SOURCE_CLAUDE_CODE) {
                 out.push(conv.summary);
             }
         }
@@ -273,7 +273,7 @@ pub fn list_conversations() -> Vec<ConversationSummary> {
 pub fn load_conversation(project_slug: &str, id: &str) -> Option<Conversation> {
     let root = projects_dir()?;
     let path = root.join(project_slug).join(format!("{id}.jsonl"));
-    parse_file(&path, project_slug)
+    parse_file(&path, project_slug, super::SOURCE_CLAUDE_CODE)
 }
 
 /// Charge toutes les conversations complètes (messages inclus) — pour le pipeline IA.
@@ -299,7 +299,7 @@ pub fn load_all_conversations() -> Vec<Conversation> {
             if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(conv) = parse_file(&p, &slug) {
+            if let Some(conv) = parse_file(&p, &slug, super::SOURCE_CLAUDE_CODE) {
                 out.push(conv);
             }
         }

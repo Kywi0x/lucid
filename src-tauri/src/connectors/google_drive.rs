@@ -114,6 +114,80 @@ pub fn is_connected() -> bool {
     load_tokens().is_some()
 }
 
+// ─── Sélection de dossiers ───────────────────────────────────────────────────
+// L'utilisateur choisit ce que Lucid lit. Le filtre est appliqué EN LOCAL, pas
+// côté API : l'API Drive n'a pas de requête récursive (`'<id>' in parents` ne
+// rend que les enfants directs), donc un sous-arbre coûterait N requêtes,
+// parfois plus que la liste complète. Et le coût n'est pas là — énumérer des
+// métadonnées prend une minute, les télécharger et les OCRiser prend des heures.
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Selection {
+    /// IDs des dossiers cochés. **Vide = tout le Drive.** C'est aussi l'état des
+    /// comptes connectés avant cette feature (aucun fichier de config) : sans ce
+    /// défaut, la mise à jour ferait disparaître leur Drive au sync suivant.
+    #[serde(default)]
+    pub folders: Vec<String>,
+    /// Fichiers sans dossier cochable (racine du Drive, partage non indexé).
+    /// Case dédiée : sans elle ils disparaissent sans un mot (ADR-0015).
+    #[serde(default)]
+    pub include_orphans: bool,
+}
+
+fn selection_path() -> Option<std::path::PathBuf> {
+    crate::ai::llama::app_data_dir().map(|d| d.join("google_drive_selection.json"))
+}
+
+pub fn selection() -> Selection {
+    selection_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default()
+}
+
+pub fn set_selection(folders: Vec<String>, include_orphans: bool) -> Result<(), String> {
+    let path = selection_path().ok_or("Dossier de données introuvable.")?;
+    let sel = Selection { folders, include_orphans };
+    std::fs::write(path, serde_json::to_string(&sel).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+/// Un fichier est retenu si l'un de ses ancêtres est coché. `folder_parents` et
+/// `known_folders` sont construits sur les seuls dossiers de la liste — les deux
+/// tables que `sync_docs` calcule déjà pour l'arborescence, donc le prédicat est
+/// quasi gratuit.
+fn is_selected(
+    parents: &[String],
+    folder_parents: &std::collections::HashMap<String, String>,
+    known_folders: &std::collections::HashSet<String>,
+    sel: &Selection,
+) -> bool {
+    if sel.folders.is_empty() {
+        return true; // aucune sélection = tout le Drive
+    }
+    let Some(start) = parents.first() else {
+        return sel.include_orphans; // aucun parent du tout
+    };
+    let mut current = start.clone();
+    let mut seen_known = false;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current.clone()) {
+        if sel.folders.contains(&current) {
+            return true;
+        }
+        if known_folders.contains(&current) {
+            seen_known = true;
+        }
+        match folder_parents.get(&current) {
+            Some(parent) => current = parent.clone(),
+            None => break,
+        }
+    }
+    // Chaîne sans aucun dossier connu → le fichier est à la racine ou dans un
+    // partage non indexé : il n'a aucune case à cocher, d'où la case dédiée.
+    if seen_known { false } else { sel.include_orphans }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -262,6 +336,9 @@ struct FileList {
 #[derive(Deserialize)]
 struct DriveFile {
     id: String,
+    // `default` : les appels qui ne demandent pas tous les champs (empreinte,
+    // liste des dossiers) réutilisent la même struct.
+    #[serde(default)]
     name: String,
     #[serde(rename = "mimeType", default)]
     mime_type: String,
@@ -271,6 +348,127 @@ struct DriveFile {
     modified_time: Option<String>,
     #[serde(default)]
     parents: Vec<String>,
+    /// Racine d'un partage « Partagés avec moi » (faux sur les descendants).
+    #[serde(rename = "sharedWithMe", default)]
+    shared_with_me: bool,
+}
+
+const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+
+/// Pagination Drive : accumule toutes les pages d'une requête `files.list`.
+/// `fields` ne contient que les champs du sous-objet `files(...)`.
+fn fetch_files(
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+    q: &str,
+    fields: &str,
+) -> Result<Vec<DriveFile>, String> {
+    let fields = format!("nextPageToken,files({fields})");
+    let mut out: Vec<DriveFile> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut req = client
+            .get("https://www.googleapis.com/drive/v3/files")
+            .query(&[
+                ("q", q),
+                ("fields", fields.as_str()),
+                ("pageSize", "1000"),
+                // orderBy retiré : incompatible avec corpora=allDrives (Drive API renvoie 400)
+                ("corpora", "allDrives"),
+                ("includeItemsFromAllDrives", "true"),
+                ("supportsAllDrives", "true"),
+            ])
+            .bearer_auth(access_token);
+        if let Some(ref token) = page_token {
+            req = req.query(&[("pageToken", token.as_str())]);
+        }
+        let resp = req.send().map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let body = resp.text().map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            let msg = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| body.chars().take(300).collect());
+            return Err(format!("Drive API {status} : {msg}"));
+        }
+        let page: FileList = serde_json::from_str(&body)
+            .map_err(|e| format!("Réponse Drive invalide : {e}"))?;
+        let has_more = page.next_page_token.is_some();
+        page_token = page.next_page_token;
+        out.extend(page.files);
+        if !has_more {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Un dossier tel que servi à l'écran de sélection.
+#[derive(Serialize)]
+pub struct DriveFolder {
+    pub id: String,
+    pub name: String,
+    /// Parent direct — `None` si racine du Drive ou hors périmètre.
+    pub parent: Option<String>,
+    pub shared: bool,
+}
+
+/// Liste **uniquement les dossiers** — même sur un Drive de 1 To ils sont une
+/// fraction minuscule du total, donc l'écran de choix s'ouvre en quelques
+/// secondes sans énumérer les fichiers.
+pub fn list_folders() -> Result<Vec<DriveFolder>, String> {
+    let access_token = valid_access_token()?;
+    let client = reqwest::blocking::Client::new();
+    let files = fetch_files(
+        &client,
+        &access_token,
+        &format!("mimeType='{FOLDER_MIME}' and trashed=false"),
+        "id,name,parents,sharedWithMe",
+    )?;
+    let ids: std::collections::HashSet<&String> = files.iter().map(|f| &f.id).collect();
+    Ok(files
+        .iter()
+        .map(|f| DriveFolder {
+            id: f.id.clone(),
+            name: f.name.clone(),
+            // Un parent absent de la liste (racine du Drive, dossier partagé non
+            // indexé) est traité comme « pas de parent » → le dossier remonte au
+            // premier niveau de l'arbre au lieu de disparaître.
+            parent: f.parents.first().filter(|p| ids.contains(*p)).cloned(),
+            shared: f.shared_with_me,
+        })
+        .collect())
+}
+
+/// Nombre de documents ingérables par dossier (direct, non récursif — l'UI somme
+/// les descendants). Demande l'énumération complète : appelé en arrière-plan,
+/// jamais sur le chemin d'ouverture de l'écran de sélection.
+pub fn folder_doc_counts() -> Result<std::collections::HashMap<String, usize>, String> {
+    let access_token = valid_access_token()?;
+    let client = reqwest::blocking::Client::new();
+    let files = fetch_files(&client, &access_token, "trashed=false", "id,name,mimeType,parents")?;
+    let folders: std::collections::HashSet<&String> = files
+        .iter()
+        .filter(|f| f.mime_type == FOLDER_MIME)
+        .map(|f| &f.id)
+        .collect();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for f in &files {
+        if drive_kind(f).is_none() {
+            continue;
+        }
+        // Un parent inconnu (racine du Drive, partage non indexé) tombe sur "" :
+        // la clé que lit la case « fichiers sans dossier ».
+        let key = f
+            .parents
+            .first()
+            .filter(|p| folders.contains(*p))
+            .cloned()
+            .unwrap_or_default();
+        *counts.entry(key).or_default() += 1;
+    }
+    Ok(counts)
 }
 
 fn slugify(s: &str) -> String {
@@ -322,53 +520,57 @@ fn build_container_path(
 /// nécessaire, mais celui-ci ne télécharge que `modifiedTime` par fichier —
 /// même pagination que `sync_docs`, sans le contenu ni les champs superflus —
 /// jamais un `sync_docs()` complet juste pour savoir si quelque chose a changé.
+///
+/// L'empreinte **respecte la sélection de dossiers** : sans ça, un changement
+/// dans un dossier exclu déclencherait une resynchro qui ne produirait rien.
+/// C'est ce qui impose de demander `parents` et `mimeType` en plus de
+/// `modifiedTime` — même nombre de requêtes, payload à peine plus gros.
 pub fn changed_fingerprint() -> Option<String> {
-    #[derive(Deserialize)]
-    struct MetaList {
-        #[serde(default)]
-        files: Vec<FileMeta>,
-        #[serde(rename = "nextPageToken")]
-        next_page_token: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct FileMeta {
-        #[serde(rename = "modifiedTime")]
-        modified_time: Option<String>,
-    }
-
     let access_token = valid_access_token().ok()?;
     let client = reqwest::blocking::Client::new();
+    let files = fetch_files(
+        &client,
+        &access_token,
+        "trashed=false",
+        "id,mimeType,parents,modifiedTime",
+    )
+    .ok()?;
+
+    let sel = selection();
+    let folder_parents = folder_parents_of(&files);
+    let known_folders = known_folders_of(&files);
+
     let mut count = 0usize;
     let mut max_modified = String::new();
-    let mut page_token: Option<String> = None;
-    loop {
-        let mut req = client
-            .get("https://www.googleapis.com/drive/v3/files")
-            .query(&[
-                ("q", "trashed=false"),
-                ("fields", "nextPageToken,files(modifiedTime)"),
-                ("pageSize", "1000"),
-                ("corpora", "allDrives"),
-                ("includeItemsFromAllDrives", "true"),
-                ("supportsAllDrives", "true"),
-            ])
-            .bearer_auth(&access_token);
-        if let Some(ref token) = page_token {
-            req = req.query(&[("pageToken", token.as_str())]);
+    for f in &files {
+        if !is_selected(&f.parents, &folder_parents, &known_folders, &sel) {
+            continue;
         }
-        let resp = req.send().ok()?;
-        if !resp.status().is_success() { return None; }
-        let page: MetaList = resp.json().ok()?;
-        count += page.files.len();
-        for f in &page.files {
-            if let Some(m) = &f.modified_time {
-                if m.as_str() > max_modified.as_str() { max_modified = m.clone(); }
+        count += 1;
+        if let Some(m) = &f.modified_time {
+            if m.as_str() > max_modified.as_str() {
+                max_modified = m.clone();
             }
         }
-        page_token = page.next_page_token;
-        if page_token.is_none() { break; }
     }
     Some(format!("{count}:{max_modified}"))
+}
+
+/// id → parent id, sur les seuls dossiers (traversée de la hiérarchie).
+fn folder_parents_of(files: &[DriveFile]) -> std::collections::HashMap<String, String> {
+    files
+        .iter()
+        .filter(|f| f.mime_type == FOLDER_MIME)
+        .filter_map(|f| f.parents.first().map(|p| (f.id.clone(), p.clone())))
+        .collect()
+}
+
+fn known_folders_of(files: &[DriveFile]) -> std::collections::HashSet<String> {
+    files
+        .iter()
+        .filter(|f| f.mime_type == FOLDER_MIME)
+        .map(|f| f.id.clone())
+        .collect()
 }
 
 /// Tous les fichiers Drive (tous formats, drives partagés inclus).
@@ -378,53 +580,23 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     let client = reqwest::blocking::Client::new();
 
     // Collecte toutes les pages avant de traiter (nécessaire pour construire folder_names/parents).
-    let mut all_files: Vec<DriveFile> = Vec::new();
-    let mut page_token: Option<String> = None;
-    loop {
-        let mut req = client
-            .get("https://www.googleapis.com/drive/v3/files")
-            .query(&[
-                ("q", "trashed=false"),
-                ("fields", "nextPageToken,files(id,name,createdTime,modifiedTime,mimeType,parents)"),
-                ("pageSize", "1000"),
-                // orderBy retiré : incompatible avec corpora=allDrives (Drive API renvoie 400)
-                ("corpora", "allDrives"),
-                ("includeItemsFromAllDrives", "true"),
-                ("supportsAllDrives", "true"),
-            ])
-            .bearer_auth(&access_token);
-        if let Some(ref token) = page_token {
-            req = req.query(&[("pageToken", token.as_str())]);
-        }
-        let resp = req.send().map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let body = resp.text().map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            let msg = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or_else(|| body.chars().take(300).collect());
-            return Err(format!("Drive API {status} : {msg}"));
-        }
-        let file_list: FileList = serde_json::from_str(&body)
-            .map_err(|e| format!("Réponse Drive invalide : {e}"))?;
-        let has_more = file_list.next_page_token.is_some();
-        page_token = file_list.next_page_token;
-        all_files.extend(file_list.files);
-        if !has_more { break; }
-    }
+    let all_files = fetch_files(
+        &client,
+        &access_token,
+        "trashed=false",
+        "id,name,createdTime,modifiedTime,mimeType,parents",
+    )?;
 
     // id → nom (pour les dossiers uniquement).
     let folder_names: std::collections::HashMap<String, String> = all_files.iter()
-        .filter(|f| f.mime_type == "application/vnd.google-apps.folder")
+        .filter(|f| f.mime_type == FOLDER_MIME)
         .map(|f| (f.id.clone(), f.name.clone()))
         .collect();
 
     // id → parent_id (pour la traversée de la hiérarchie).
-    let folder_parents: std::collections::HashMap<String, String> = all_files.iter()
-        .filter(|f| f.mime_type == "application/vnd.google-apps.folder")
-        .filter_map(|f| f.parents.first().map(|p| (f.id.clone(), p.clone())))
-        .collect();
+    let folder_parents = folder_parents_of(&all_files);
+    let known_folders = known_folders_of(&all_files);
+    let sel = selection();
 
     // Cache local : évite de re-télécharger les fichiers inchangés.
     let existing: std::collections::HashMap<String, Conversation> = load_conversations()
@@ -445,9 +617,19 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     let mut convs: Vec<Conversation> = Vec::new();
     let mut new_count = 0usize;
 
+    let mut skipped = 0usize;
+
     for f in all_files {
         // PDF, Google Slides, PowerPoint .pptx — le reste (images, vidéos…) ignoré.
         let Some(kind) = drive_kind(&f) else { continue };
+
+        // Filtre de sélection : le fichier sort du lot AVANT tout téléchargement,
+        // donc avant la partie chère (download + OCR).
+        if !is_selected(&f.parents, &folder_parents, &known_folders, &sel) {
+            skipped += 1;
+            continue;
+        }
+
         crate::elog!("📋 {kind} détecté : {} ({})", f.name, f.mime_type);
 
         let id = f.id.clone();
@@ -477,7 +659,11 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
         }
     }
 
-    crate::elog!("📂 Google Drive : {new_count} nouveaux / {} total", convs.len());
+    crate::elog!(
+        "📂 Google Drive : {new_count} nouveaux / {} total{}",
+        convs.len(),
+        if skipped > 0 { format!(" ({skipped} hors sélection)") } else { String::new() }
+    );
 
     let path = crate::ai::llama::app_data_dir()
         .ok_or("Dossier de données introuvable.")?
@@ -970,6 +1156,7 @@ fn to_title_case(s: &str) -> String {
 /// Supprime les tokens et les conversations cachées → déconnexion propre.
 pub fn disconnect() {
     if let Some(p) = tokens_path() { let _ = std::fs::remove_file(p); }
+    if let Some(p) = selection_path() { let _ = std::fs::remove_file(p); }
     if let Some(p) = crate::ai::llama::app_data_dir().map(|d| d.join("google_drive_conversations.json")) {
         let _ = std::fs::remove_file(p);
     }
@@ -990,6 +1177,71 @@ pub fn load_conversations() -> Vec<Conversation> {
 
 pub fn load_by_id(id: &str) -> Option<Conversation> {
     load_conversations().into_iter().find(|c| c.summary.id == id)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    /// Arbre : racine(inconnue) → "travail" → "papiris" ; "perso" à côté.
+    fn tables() -> (
+        std::collections::HashMap<String, String>,
+        std::collections::HashSet<String>,
+    ) {
+        let parents = [("travail", "root"), ("papiris", "travail"), ("perso", "root")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let known = ["travail", "papiris", "perso"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        (parents, known)
+    }
+
+    fn sel(folders: &[&str], orphans: bool) -> Selection {
+        Selection {
+            folders: folders.iter().map(|s| s.to_string()).collect(),
+            include_orphans: orphans,
+        }
+    }
+
+    #[test]
+    fn selection_vide_prend_tout() {
+        let (p, k) = tables();
+        // Défaut des comptes déjà connectés : leur Drive ne doit pas disparaître.
+        assert!(is_selected(&["perso".into()], &p, &k, &Selection::default()));
+        assert!(is_selected(&[], &p, &k, &Selection::default()));
+    }
+
+    #[test]
+    fn un_ancetre_coche_suffit() {
+        let (p, k) = tables();
+        let s = sel(&["travail"], false);
+        assert!(is_selected(&["papiris".into()], &p, &k, &s), "sous-dossier hérité");
+        assert!(is_selected(&["travail".into()], &p, &k, &s));
+        assert!(!is_selected(&["perso".into()], &p, &k, &s));
+    }
+
+    #[test]
+    fn les_orphelins_ont_leur_propre_case() {
+        let (p, k) = tables();
+        // Fichier à la racine du Drive : parent inconnu, aucune case à cocher.
+        assert!(!is_selected(&["root".into()], &p, &k, &sel(&["travail"], false)));
+        assert!(is_selected(&["root".into()], &p, &k, &sel(&["travail"], true)));
+        // La case orphelins ne doit PAS repêcher un dossier connu non coché.
+        assert!(!is_selected(&["perso".into()], &p, &k, &sel(&["travail"], true)));
+    }
+
+    #[test]
+    fn cycle_de_parents_ne_boucle_pas() {
+        let p = [("a", "b"), ("b", "a")]
+            .into_iter()
+            .map(|(x, y)| (x.to_string(), y.to_string()))
+            .collect();
+        let k = ["a", "b"].into_iter().map(str::to_string).collect();
+        assert!(!is_selected(&["a".into()], &p, &k, &sel(&["autre"], false)));
+    }
 }
 
 #[cfg(test)]

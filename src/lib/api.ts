@@ -142,6 +142,40 @@ export function googleDriveSync(): Promise<[number, number]> {
   return invoke("google_drive_sync");
 }
 
+export type DriveFolder = {
+  id: string;
+  name: string;
+  /** Parent direct — null si racine du Drive ou hors périmètre. */
+  parent: string | null;
+  /** Racine d'un partage « Partagés avec moi ». */
+  shared: boolean;
+};
+
+export type DriveSelection = {
+  /** IDs cochés. **Vide = tout le Drive** (défaut historique). */
+  folders: string[];
+  /** Fichiers sans dossier cochable (racine, partage non indexé). */
+  include_orphans: boolean;
+};
+
+/** Arbre des dossiers Drive — dossiers uniquement, donc rapide même sur 1 To. */
+export function googleDriveFolders(): Promise<DriveFolder[]> {
+  return invoke("google_drive_folders");
+}
+
+/** Documents ingérables par dossier (clé "" = fichiers sans dossier). Lent : à charger en fond. */
+export function googleDriveFolderCounts(): Promise<Record<string, number>> {
+  return invoke("google_drive_folder_counts");
+}
+
+export function googleDriveSelection(): Promise<DriveSelection> {
+  return invoke("google_drive_selection");
+}
+
+export function googleDriveSetSelection(folders: string[], includeOrphans: boolean): Promise<void> {
+  return invoke("google_drive_set_selection", { folders, includeOrphans });
+}
+
 /** Chat local sur le brain.md (réponse générée par Gemma). */
 export function askBrain(question: string): Promise<string> {
   return invoke("ask_brain", { question });
