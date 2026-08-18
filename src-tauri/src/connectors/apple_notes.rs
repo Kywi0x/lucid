@@ -153,6 +153,7 @@ fn write_cache(notes: &[RawNote]) -> Result<(), String> {
 /// Synchronise (réécrit le cache en entier — une bibliothèque de notes reste
 /// petite comparée à des PDF, pas besoin d'incrémental). Renvoie le nombre de notes.
 pub fn sync() -> Result<usize, String> {
+    let _badge = crate::SyncBadge::new("apple-notes");
     let notes = fetch_notes()?;
     let n = notes.len();
     write_cache(&notes)?;

@@ -23,6 +23,7 @@ import { SettingsModal } from "@/components/SettingsModal";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { BetaBadge } from "@/components/BetaBadge";
+import { SyncBadge } from "@/components/SyncBadge";
 import {
   GenerateEmpty,
 } from "@/components/BrainView";
@@ -1487,6 +1488,7 @@ function App() {
           {!selectedNode && (
             <div className="absolute right-3 top-3 z-20 flex items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)]/75 px-1.5 py-1 shadow-[var(--shadow-float)] backdrop-blur-md">
               <BetaBadge />
+              <SyncBadge />
               {graph && (
                 <button
                   onClick={() => handleGenerate()}

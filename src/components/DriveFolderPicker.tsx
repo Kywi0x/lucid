@@ -1,16 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
-import { Check, ChevronRight, Folder, Loader2, Minus, Search, Users, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Check, ChevronRight, Folder, HardDrive, Loader2, Minus, Search, Users, X } from "lucide-react";
 import {
-  googleDriveFolders,
-  googleDriveFolderCounts,
+  googleDriveRoots,
+  googleDriveChildren,
+  googleDriveSearchFolders,
   googleDriveSelection,
   googleDriveSetSelection,
   type DriveFolder,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
-
-/** Clé du bac « fichiers sans dossier » côté Rust (racine du Drive, partage non indexé). */
-const ORPHANS = "";
 
 type Props = {
   onClose: () => void;
@@ -19,40 +17,56 @@ type Props = {
 };
 
 /**
- * Écran de choix des dossiers Drive.
+ * Écran de choix des dossiers Drive — **chargement paresseux**.
  *
- * Ne liste que les dossiers (rapide même sur un Drive de 1 To) ; les compteurs de
- * documents arrivent en arrière-plan et ne bloquent jamais l'ouverture — sur un très
- * gros compte l'énumération complète est justement ce qui peut traîner.
+ * Mesuré le 18/08/2026 sur un compte professionnel (16 unités partagées) :
+ * lister tous les dossiers d'un coup, c'était 24 694 lignes en 42 s, et compter
+ * les documents de chacun demandait d'énumérer plus de 100 000 objets — l'écran
+ * restait sur « comptage… » plusieurs minutes. On charge donc les racines
+ * (~150 entrées, 2 s) puis une requête par dépliage.
+ *
+ * ponytail: plus de compteurs de documents. Les afficher imposait l'énumération
+ * complète, pour un chiffre indicatif ; le nom du dossier suffit à choisir.
  */
 export function DriveFolderPicker({ onClose, onSaved }: Props) {
-  const [folders, setFolders] = useState<DriveFolder[] | null>(null);
+  const [roots, setRoots] = useState<DriveFolder[] | null>(null);
+  const [kids, setKids] = useState<Map<string, DriveFolder[]>>(new Map());
+  const [byId, setById] = useState<Map<string, DriveFolder>>(new Map());
+  const [loading, setLoading] = useState<Set<string>>(new Set());
+  const [open, setOpen] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
-  const [counts, setCounts] = useState<Record<string, number> | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [initial, setInitial] = useState<Set<string>>(new Set());
   const [orphans, setOrphans] = useState(false);
   const [initialOrphans, setInitialOrphans] = useState(false);
-  const [open, setOpen] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<DriveFolder[] | null>(null);
+  const [searching, setSearching] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  const remember = useCallback((list: DriveFolder[]) => {
+    setById((prev) => {
+      const next = new Map(prev);
+      for (const f of list) next.set(f.id, f);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     let alive = true;
-    Promise.all([googleDriveFolders(), googleDriveSelection()])
-      .then(([f, sel]) => {
+    Promise.all([googleDriveRoots(), googleDriveSelection()])
+      .then(([r, sel]) => {
         if (!alive) return;
-        setFolders(f);
+        setRoots(r);
+        remember(r);
         setSelected(new Set(sel.folders));
         setInitial(new Set(sel.folders));
         setOrphans(sel.include_orphans);
         setInitialOrphans(sel.include_orphans);
       })
       .catch((e) => alive && setError(String(e)));
-    // Compteurs en fond : l'écran est utilisable sans eux.
-    googleDriveFolderCounts().then((c) => alive && setCounts(c)).catch(() => {});
     return () => { alive = false; };
-  }, []);
+  }, [remember]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -62,60 +76,41 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
     return () => window.removeEventListener("keydown", onKey, { capture: true });
   }, [onClose]);
 
-  // `kidsOf` et pas `children` : passé en prop à <Tree>, le nom `children` serait
-  // capté par React comme contenu de l'élément.
-  const { kidsOf, byId, roots, shared } = useMemo(() => {
-    const kidsOf = new Map<string, DriveFolder[]>();
-    const byId = new Map<string, DriveFolder>();
-    for (const f of folders ?? []) byId.set(f.id, f);
-    for (const f of folders ?? []) {
-      const key = f.parent ?? "__root__";
-      const list = kidsOf.get(key) ?? [];
-      list.push(f);
-      kidsOf.set(key, list);
+  // Recherche côté Drive : l'arbre n'est pas en mémoire, on ne peut pas filtrer localement.
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) { setHits(null); setSearching(false); return; }
+    setSearching(true);
+    const t = setTimeout(() => {
+      googleDriveSearchFolders(q)
+        .then((r) => { setHits(r); remember(r); })
+        .catch((e) => setError(String(e)))
+        .finally(() => setSearching(false));
+    }, 350);
+    return () => clearTimeout(t);
+  }, [query, remember]);
+
+  async function toggleExpand(id: string) {
+    const wasOpen = open.has(id);
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (wasOpen) next.delete(id); else next.add(id);
+      return next;
+    });
+    if (wasOpen || kids.has(id)) return;
+    setLoading((prev) => new Set(prev).add(id));
+    try {
+      const list = await googleDriveChildren(id);
+      setKids((prev) => new Map(prev).set(id, list));
+      remember(list);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading((prev) => { const next = new Set(prev); next.delete(id); return next; });
     }
-    for (const list of kidsOf.values()) list.sort((a, b) => a.name.localeCompare(b.name, "fr"));
-    const top = kidsOf.get("__root__") ?? [];
-    return {
-      kidsOf,
-      byId,
-      roots: top.filter((f) => !f.shared),
-      shared: top.filter((f) => f.shared),
-    };
-  }, [folders]);
-
-  /** Documents d'un dossier, ses descendants compris. */
-  const totalOf = useMemo(() => {
-    const cache = new Map<string, number>();
-    const walk = (id: string): number => {
-      const hit = cache.get(id);
-      if (hit !== undefined) return hit;
-      cache.set(id, 0); // garde-fou cycle
-      let n = counts?.[id] ?? 0;
-      for (const c of kidsOf.get(id) ?? []) n += walk(c.id);
-      cache.set(id, n);
-      return n;
-    };
-    return walk;
-  }, [counts, kidsOf]);
-
-  const everything = useMemo(
-    () => Object.values(counts ?? {}).reduce((a, b) => a + b, 0),
-    [counts],
-  );
-
-  /** Total ingéré pour une sélection donnée — sert aussi à chiffrer ce qu'on retire. */
-  function totalFor(sel: Set<string>, withOrphans: boolean): number {
-    if (sel.size === 0) return everything;
-    let n = withOrphans ? counts?.[ORPHANS] ?? 0 : 0;
-    for (const id of sel) {
-      // Un dossier dont un ancêtre est déjà coché serait compté deux fois.
-      if (!inheritedFrom(id, sel)) n += totalOf(id);
-    }
-    return n;
   }
 
-  /** L'un des ancêtres de `id` est-il coché ? (`id` lui-même exclu) */
+  /** L'un des ancêtres **chargés** de `id` est-il coché ? (`id` lui-même exclu) */
   function inheritedFrom(id: string, sel: Set<string>): boolean {
     let cur = byId.get(id)?.parent ?? null;
     const seen = new Set<string>();
@@ -127,8 +122,9 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
     return false;
   }
 
+  /** Un descendant chargé est-il coché ? (case « partielle ») */
   function hasSelectedDescendant(id: string, sel: Set<string>): boolean {
-    for (const c of kidsOf.get(id) ?? []) {
+    for (const c of kids.get(id) ?? []) {
       if (sel.has(c.id) || hasSelectedDescendant(c.id, sel)) return true;
     }
     return false;
@@ -141,10 +137,9 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
         next.delete(id);
       } else {
         next.add(id);
-        // Un descendant coché devient redondant — on le retire pour garder une
-        // sélection lisible (et un compteur juste).
+        // Un descendant déjà chargé et coché devient redondant : le parent le couvre.
         const drop = (fid: string) => {
-          for (const c of kidsOf.get(fid) ?? []) { next.delete(c.id); drop(c.id); }
+          for (const c of kids.get(fid) ?? []) { next.delete(c.id); drop(c.id); }
         };
         drop(id);
       }
@@ -168,18 +163,14 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
     }
   }
 
-  const before = totalFor(initial, initialOrphans);
-  const after = totalFor(selected, orphans);
-  const removed = counts ? Math.max(0, before - after) : 0;
   const dirty =
     orphans !== initialOrphans ||
     selected.size !== initial.size ||
     [...selected].some((id) => !initial.has(id));
 
-  const matches = query.trim().toLowerCase();
-  const flat = matches
-    ? (folders ?? []).filter((f) => f.name.toLowerCase().includes(matches)).slice(0, 200)
-    : [];
+  const mine = (roots ?? []).filter((f) => !f.shared);
+  const shared = (roots ?? []).filter((f) => f.shared);
+  const treeProps = { kids, loading, selected, open, inheritedFrom, hasSelectedDescendant, toggleExpand, toggle };
 
   return (
     <div className="absolute inset-0 z-20 flex flex-col justify-end bg-black/20" onClick={onClose}>
@@ -205,11 +196,13 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
 
         {/* Recherche */}
         <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-2">
-          <Search className="size-3.5 shrink-0 text-[var(--color-muted)]" />
+          {searching
+            ? <Loader2 className="size-3.5 shrink-0 animate-spin text-[var(--color-muted)]" />
+            : <Search className="size-3.5 shrink-0 text-[var(--color-muted)]" />}
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Filtrer les dossiers…"
+            placeholder="Chercher un dossier par nom…"
             className="w-full bg-transparent text-xs text-[var(--color-text)] outline-none placeholder:text-[var(--color-muted)]"
           />
         </div>
@@ -218,54 +211,38 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
         <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
           {error && <p className="px-2 py-3 text-xs text-[var(--color-err)]">{error}</p>}
 
-          {!folders && !error && (
+          {!roots && !error && (
             <p className="flex items-center gap-2 px-2 py-6 text-xs text-[var(--color-muted)]">
-              <Loader2 className="size-3.5 animate-spin" /> Lecture de l'arborescence…
+              <Loader2 className="size-3.5 animate-spin" /> Lecture des dossiers…
             </p>
           )}
 
-          {folders && folders.length === 0 && (
-            <p className="px-2 py-6 text-xs text-[var(--color-muted)]">
-              Aucun dossier sur ce Drive — tous les fichiers sont à la racine.
-            </p>
-          )}
-
-          {folders && matches && (
-            flat.length === 0
+          {hits !== null ? (
+            hits.length === 0
               ? <p className="px-2 py-6 text-xs text-[var(--color-muted)]">Aucun dossier ne correspond.</p>
-              : flat.map((f) => (
+              : hits.map((f) => (
                   <Row
                     key={f.id}
                     folder={f}
                     depth={0}
-                    count={counts ? totalOf(f.id) : null}
                     state={selected.has(f.id) ? "on" : inheritedFrom(f.id, selected) ? "inherited" : "off"}
                     expandable={false}
                     expanded={false}
+                    busy={false}
                     onToggleExpand={() => {}}
                     onToggle={() => toggle(f.id)}
                   />
                 ))
-          )}
-
-          {folders && !matches && (
+          ) : roots && (
             <>
-              <Tree
-                nodes={roots}
-                depth={0}
-                {...{ kidsOf, counts, totalOf, selected, inheritedFrom, hasSelectedDescendant, open, setOpen, toggle }}
-              />
+              <Tree nodes={mine} depth={0} {...treeProps} />
 
               {shared.length > 0 && (
                 <>
                   <p className="mt-3 flex items-center gap-1.5 px-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">
                     <Users className="size-3" /> Partagés avec moi
                   </p>
-                  <Tree
-                    nodes={shared}
-                    depth={0}
-                    {...{ kidsOf, counts, totalOf, selected, inheritedFrom, hasSelectedDescendant, open, setOpen, toggle }}
-                  />
+                  <Tree nodes={shared} depth={0} {...treeProps} />
                 </>
               )}
 
@@ -284,43 +261,19 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
                       À la racine du Drive ou dans un partage non listé
                     </span>
                   </span>
-                  {counts && (
-                    <span className="shrink-0 text-[10px] text-[var(--color-muted)]">
-                      {counts[ORPHANS] ?? 0}
-                    </span>
-                  )}
                 </button>
               </div>
             </>
           )}
         </div>
 
-        {/* Pied : ce que ça donne concrètement */}
+        {/* Pied */}
         <div className="flex flex-col gap-2 border-t border-[var(--color-border)] px-4 py-3">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-[var(--color-muted)]">
-              {selected.size === 0
-                ? "Tout le Drive"
-                : `${selected.size} dossier${selected.size > 1 ? "s" : ""}`}
-            </span>
-            <span className="text-[var(--color-muted)]">
-              {counts === null ? (
-                <span className="flex items-center gap-1.5">
-                  <Loader2 className="size-3 animate-spin" /> comptage…
-                </span>
-              ) : (
-                `${after} document${after > 1 ? "s" : ""} indexé${after > 1 ? "s" : ""}`
-              )}
-            </span>
-          </div>
-
-          {/* Un retrait n'est pas silencieux : on chiffre ce qui sort du cerveau. */}
-          {removed > 0 && (
-            <p className="rounded-lg bg-[var(--color-surface-2)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--color-muted)]">
-              {removed} document{removed > 1 ? "s" : ""} sortiront de ton cerveau à la
-              prochaine synchronisation. Tes fichiers Drive ne sont jamais touchés.
-            </p>
-          )}
+          <span className="text-[11px] text-[var(--color-muted)]">
+            {selected.size === 0
+              ? "Tout le Drive sera indexé"
+              : `${selected.size} dossier${selected.size > 1 ? "s" : ""} sélectionné${selected.size > 1 ? "s" : ""}`}
+          </span>
 
           <div className="flex gap-1.5">
             <button
@@ -349,14 +302,13 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
 type TreeProps = {
   nodes: DriveFolder[];
   depth: number;
-  kidsOf: Map<string, DriveFolder[]>;
-  counts: Record<string, number> | null;
-  totalOf: (id: string) => number;
+  kids: Map<string, DriveFolder[]>;
+  loading: Set<string>;
   selected: Set<string>;
+  open: Set<string>;
   inheritedFrom: (id: string, sel: Set<string>) => boolean;
   hasSelectedDescendant: (id: string, sel: Set<string>) => boolean;
-  open: Set<string>;
-  setOpen: React.Dispatch<React.SetStateAction<Set<string>>>;
+  toggleExpand: (id: string) => void;
   toggle: (id: string) => void;
 };
 
@@ -364,7 +316,7 @@ function Tree(p: TreeProps) {
   return (
     <>
       {p.nodes.map((f) => {
-        const kids = p.kidsOf.get(f.id) ?? [];
+        const loaded = p.kids.get(f.id);
         const expanded = p.open.has(f.id);
         const state = p.selected.has(f.id)
           ? "on"
@@ -378,21 +330,29 @@ function Tree(p: TreeProps) {
             <Row
               folder={f}
               depth={p.depth}
-              count={p.counts ? p.totalOf(f.id) : null}
               state={state}
-              expandable={kids.length > 0}
+              // On ne sait pas si un dossier a des enfants sans le demander :
+              // la flèche est donc toujours offerte, et un dossier vide le dit.
+              expandable
               expanded={expanded}
-              onToggleExpand={() =>
-                p.setOpen((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(f.id)) next.delete(f.id);
-                  else next.add(f.id);
-                  return next;
-                })
-              }
+              busy={p.loading.has(f.id)}
+              onToggleExpand={() => p.toggleExpand(f.id)}
               onToggle={() => p.toggle(f.id)}
             />
-            {expanded && kids.length > 0 && <Tree {...p} nodes={kids} depth={p.depth + 1} />}
+            {expanded && (
+              loaded === undefined
+                ? null
+                : loaded.length === 0
+                  ? (
+                    <p
+                      className="py-1 text-[10px] italic text-[var(--color-muted)]"
+                      style={{ paddingLeft: 8 + (p.depth + 1) * 14 + 22 }}
+                    >
+                      aucun sous-dossier
+                    </p>
+                  )
+                  : <Tree {...p} nodes={loaded} depth={p.depth + 1} />
+            )}
           </div>
         );
       })}
@@ -403,14 +363,14 @@ function Tree(p: TreeProps) {
 type BoxState = "on" | "off" | "partial" | "inherited";
 
 function Row({
-  folder, depth, count, state, expandable, expanded, onToggleExpand, onToggle,
+  folder, depth, state, expandable, expanded, busy, onToggleExpand, onToggle,
 }: {
   folder: DriveFolder;
   depth: number;
-  count: number | null;
   state: BoxState;
   expandable: boolean;
   expanded: boolean;
+  busy: boolean;
   onToggleExpand: () => void;
   onToggle: () => void;
 }) {
@@ -425,10 +385,10 @@ function Row({
         className={cn(
           "shrink-0 rounded p-0.5 text-[var(--color-muted)] transition-transform",
           !expandable && "invisible",
-          expanded && "rotate-90",
+          expanded && !busy && "rotate-90",
         )}
       >
-        <ChevronRight className="size-3" />
+        {busy ? <Loader2 className="size-3 animate-spin" /> : <ChevronRight className="size-3" />}
       </button>
 
       {/* Un dossier hérité est coché mais non cliquable : on décoche le parent.
@@ -443,13 +403,12 @@ function Row({
         )}
       >
         <Box state={state} />
-        <Folder className="size-3.5 shrink-0 text-[var(--color-muted)]" />
+        {folder.shared && depth === 0
+          ? <HardDrive className="size-3.5 shrink-0 text-[var(--color-muted)]" />
+          : <Folder className="size-3.5 shrink-0 text-[var(--color-muted)]" />}
         <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text)]" title={folder.name}>
           {folder.name}
         </span>
-        {count !== null && count > 0 && (
-          <span className="shrink-0 text-[10px] text-[var(--color-muted)]">{count}</span>
-        )}
       </button>
     </div>
   );

@@ -227,6 +227,7 @@ fn file_to_conversation(root_str: &str, rel: &str, abs: &Path) -> Result<Convers
 /// connaître `total` à l'avance (lister des noms de fichiers est quasi gratuit
 /// comparé à l'extraction qui suit).
 pub fn sync(mut on_progress: impl FnMut(usize, usize, &str)) -> Result<SyncReport, String> {
+    let _badge = crate::SyncBadge::new("local-folder");
     let roots = folders();
     if roots.is_empty() {
         return Err("Aucun dossier configuré.".into());

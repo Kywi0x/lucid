@@ -204,7 +204,7 @@ fn valid_access_token() -> Result<String, String> {
     let rt = tokens
         .refresh_token
         .ok_or("Pas de refresh token — reconnecte-toi à Google.")?;
-    let client = reqwest::blocking::Client::new();
+    let client = http();
     let cid = google_client_id();
     let csecret = google_client_secret();
     let resp: serde_json::Value = client
@@ -262,7 +262,7 @@ pub fn prepare_connect() -> Result<(TcpListener, String, String, String), String
 pub fn finish_connect(listener: TcpListener, redirect_uri: &str, code_verifier: &str) -> Result<(), String> {
     let code = wait_for_code(listener)?;
 
-    let client = reqwest::blocking::Client::new();
+    let client = http();
     let cid = google_client_id();
     let csecret = google_client_secret();
     let resp: serde_json::Value = client
@@ -348,15 +348,25 @@ struct DriveFile {
     modified_time: Option<String>,
     #[serde(default)]
     parents: Vec<String>,
-    /// Racine d'un partage « Partagés avec moi » (faux sur les descendants).
-    #[serde(rename = "sharedWithMe", default)]
-    shared_with_me: bool,
 }
 
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
 /// Pagination Drive : accumule toutes les pages d'une requête `files.list`.
 /// `fields` ne contient que les champs du sous-objet `files(...)`.
+/// Client HTTP du connecteur : **avec délais bornés**. `Client::new()` n'en pose
+/// aucun — une requête qui cale attend pour toujours, et comme la synchro tourne
+/// sous `GEN_LOCK`, tout ce qui attend ce verrou gèle avec elle (fenêtre figée
+/// observée le 18/08/2026). Le délai global est large : il couvre le
+/// téléchargement d'un PDF de 25 Mo, il ne borne que les vrais blocages.
+fn http() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 fn fetch_files(
     client: &reqwest::blocking::Client,
     access_token: &str,
@@ -414,61 +424,107 @@ pub struct DriveFolder {
     pub shared: bool,
 }
 
-/// Liste **uniquement les dossiers** — même sur un Drive de 1 To ils sont une
-/// fraction minuscule du total, donc l'écran de choix s'ouvre en quelques
-/// secondes sans énumérer les fichiers.
-pub fn list_folders() -> Result<Vec<DriveFolder>, String> {
+/// Racines du sélecteur : dossiers de premier niveau de Mon Drive, unités
+/// partagées, puis dossiers partagés avec moi.
+///
+/// **Chargement paresseux, mesuré et non spéculatif.** La version précédente
+/// listait tous les dossiers d'un coup, en pariant qu'ils sont « une fraction
+/// minuscule » du Drive. Sur un compte professionnel (16 unités partagées) ce
+/// pari est faux : 24 694 dossiers en 42 s, pour un arbre de 24 694 lignes que
+/// personne ne peut parcourir (mesuré le 18/08/2026). Ici : 153 entrées en 2 s,
+/// et une requête par dépliage.
+pub fn list_roots() -> Result<Vec<DriveFolder>, String> {
     let access_token = valid_access_token()?;
-    let client = reqwest::blocking::Client::new();
-    let files = fetch_files(
+    let client = http();
+    let mut out = Vec::new();
+
+    // Premier niveau de Mon Drive.
+    for f in fetch_files(
         &client,
         &access_token,
-        &format!("mimeType='{FOLDER_MIME}' and trashed=false"),
-        "id,name,parents,sharedWithMe",
-    )?;
-    let ids: std::collections::HashSet<&String> = files.iter().map(|f| &f.id).collect();
-    Ok(files
-        .iter()
-        .map(|f| DriveFolder {
-            id: f.id.clone(),
-            name: f.name.clone(),
-            // Un parent absent de la liste (racine du Drive, dossier partagé non
-            // indexé) est traité comme « pas de parent » → le dossier remonte au
-            // premier niveau de l'arbre au lieu de disparaître.
-            parent: f.parents.first().filter(|p| ids.contains(*p)).cloned(),
-            shared: f.shared_with_me,
-        })
-        .collect())
+        &format!("'root' in parents and mimeType='{FOLDER_MIME}' and trashed=false"),
+        "id,name",
+    )? {
+        out.push(DriveFolder { id: f.id, name: f.name, parent: None, shared: false });
+    }
+
+    // Unités partagées : leur id est aussi celui de leur dossier racine, donc
+    // elles se déplient comme un dossier ordinaire.
+    let resp = client
+        .get("https://www.googleapis.com/drive/v3/drives")
+        .query(&[("pageSize", "100")])
+        .bearer_auth(&access_token)
+        .send()
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        #[derive(Deserialize)]
+        struct Drive { id: String, name: String }
+        #[derive(Deserialize)]
+        struct DriveList { #[serde(default)] drives: Vec<Drive> }
+        if let Ok(list) = resp.json::<DriveList>() {
+            for d in list.drives {
+                out.push(DriveFolder { id: d.id, name: d.name, parent: None, shared: true });
+            }
+        }
+    }
+
+    // Dossiers partagés avec moi. `sharedWithMe` est refusé dans `fields` mais
+    // valide dans `q` — c'est bien deux choses différentes côté API.
+    for f in fetch_files(
+        &client,
+        &access_token,
+        &format!("sharedWithMe=true and mimeType='{FOLDER_MIME}' and trashed=false"),
+        "id,name",
+    )? {
+        out.push(DriveFolder { id: f.id, name: f.name, parent: None, shared: true });
+    }
+
+    Ok(out)
 }
 
-/// Nombre de documents ingérables par dossier (direct, non récursif — l'UI somme
-/// les descendants). Demande l'énumération complète : appelé en arrière-plan,
-/// jamais sur le chemin d'ouverture de l'écran de sélection.
-pub fn folder_doc_counts() -> Result<std::collections::HashMap<String, usize>, String> {
-    let access_token = valid_access_token()?;
-    let client = reqwest::blocking::Client::new();
-    let files = fetch_files(&client, &access_token, "trashed=false", "id,name,mimeType,parents")?;
-    let folders: std::collections::HashSet<&String> = files
-        .iter()
-        .filter(|f| f.mime_type == FOLDER_MIME)
-        .map(|f| &f.id)
-        .collect();
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for f in &files {
-        if drive_kind(f).is_none() {
-            continue;
-        }
-        // Un parent inconnu (racine du Drive, partage non indexé) tombe sur "" :
-        // la clé que lit la case « fichiers sans dossier ».
-        let key = f
-            .parents
-            .first()
-            .filter(|p| folders.contains(*p))
-            .cloned()
-            .unwrap_or_default();
-        *counts.entry(key).or_default() += 1;
+/// Dossiers dont le nom contient `needle`. Sert la barre de recherche du
+/// sélecteur : sur 24 694 dossiers, déplier à la main ne suffit pas.
+pub fn search_folders(needle: &str) -> Result<Vec<DriveFolder>, String> {
+    let needle = needle.trim();
+    if needle.len() < 2 {
+        return Ok(vec![]);
     }
-    Ok(counts)
+    let access_token = valid_access_token()?;
+    let safe = needle.replace('\\', "\\\\").replace('\'', "\\'");
+    Ok(fetch_files(
+        &http(),
+        &access_token,
+        &format!("name contains '{safe}' and mimeType='{FOLDER_MIME}' and trashed=false"),
+        "id,name,parents",
+    )?
+    .into_iter()
+    .take(200)
+    .map(|f| DriveFolder { id: f.id, name: f.name, parent: f.parents.first().cloned(), shared: false })
+    .collect())
+}
+
+/// Sous-dossiers directs d'un dossier (ou d'une unité partagée). Une requête,
+/// quelques dizaines de lignes.
+pub fn list_children(parent: &str) -> Result<Vec<DriveFolder>, String> {
+    let access_token = valid_access_token()?;
+    let client = http();
+    // `parent` vient d'un nœud déjà servi par l'API : on l'échappe quand même,
+    // une apostrophe dans un id casserait la requête (et c'est une injection).
+    let safe = parent.replace('\\', "\\\\").replace('\'', "\\'");
+    Ok(fetch_files(
+        &client,
+        &access_token,
+        &format!("'{safe}' in parents and mimeType='{FOLDER_MIME}' and trashed=false"),
+        "id,name",
+    )?
+    .into_iter()
+    .map(|f| DriveFolder {
+        id: f.id,
+        name: f.name,
+        parent: Some(parent.to_string()),
+        shared: false,
+    })
+    .collect())
 }
 
 fn slugify(s: &str) -> String {
@@ -527,23 +583,23 @@ fn build_container_path(
 /// `modifiedTime` — même nombre de requêtes, payload à peine plus gros.
 pub fn changed_fingerprint() -> Option<String> {
     let access_token = valid_access_token().ok()?;
-    let client = reqwest::blocking::Client::new();
-    let files = fetch_files(
-        &client,
-        &access_token,
-        "trashed=false",
-        "id,mimeType,parents,modifiedTime",
-    )
-    .ok()?;
-
+    let client = http();
+    const FP_FIELDS: &str = "id,mimeType,parents,modifiedTime";
     let sel = selection();
+    let scoped = !sel.folders.is_empty();
+    let files = if scoped {
+        fetch_in_selection(&client, &access_token, &sel, FP_FIELDS).ok()?
+    } else {
+        fetch_files(&client, &access_token, "trashed=false", FP_FIELDS).ok()?
+    };
+
     let folder_parents = folder_parents_of(&files);
     let known_folders = known_folders_of(&files);
 
     let mut count = 0usize;
     let mut max_modified = String::new();
     for f in &files {
-        if !is_selected(&f.parents, &folder_parents, &known_folders, &sel) {
+        if !scoped && !is_selected(&f.parents, &folder_parents, &known_folders, &sel) {
             continue;
         }
         count += 1;
@@ -573,19 +629,119 @@ fn known_folders_of(files: &[DriveFile]) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Métadonnées d'un fichier par son id. La liste ne rend que les *enfants* d'un
+/// dossier, jamais le dossier lui-même : sans ça, un document rangé directement
+/// sous un dossier coché arrive avec un `container_path` vide, donc sans bulle
+/// dans le cerveau (régression du 18/08/2026).
+fn fetch_meta(
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+    id: &str,
+    fields: &str,
+) -> Option<DriveFile> {
+    client
+        .get(format!("https://www.googleapis.com/drive/v3/files/{id}"))
+        .query(&[("fields", fields), ("supportsAllDrives", "true")])
+        .bearer_auth(access_token)
+        .send()
+        .ok()?
+        .json::<DriveFile>()
+        .ok()
+}
+
+/// Fichiers du **périmètre coché**, par descente de l'arbre : une requête par
+/// dossier visité, au lieu d'énumérer tout le Drive.
+///
+/// Le coût suit la sélection, pas la taille du compte. Avant, cocher un dossier
+/// de cinq PDF déclenchait quand même l'énumération complète — 24 694 dossiers +
+/// 42 638 PDF sur un compte professionnel, une à deux minutes de réseau à chaque
+/// synchro **et** à chaque sondage de 5 minutes (mesuré le 18/08/2026).
+///
+/// Sélection vide = tout le Drive : l'appelant garde l'énumération complète, qui
+/// reste le seul moyen de tout voir.
+fn fetch_in_selection(
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+    sel: &Selection,
+    fields: &str,
+) -> Result<Vec<DriveFile>, String> {
+    let mut out: Vec<DriveFile> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = sel.folders.clone();
+    // Les fichiers de la racine n'ont pas de dossier à cocher : leur case dédiée
+    // les fait entrer ici (ADR-0015 — sinon ils disparaissent sans un mot).
+    if sel.include_orphans {
+        queue.push("root".to_string());
+    }
+    // Les dossiers cochés et leurs ancêtres : ils ne sont enfants de personne
+    // dans ce parcours, donc personne ne rendrait leur nom — et c'est
+    // précisément le nom que l'utilisateur cherche dans son cerveau.
+    for id in &sel.folders {
+        let mut cur = id.clone();
+        // Remonte jusqu'à la racine (ou une chaîne déjà connue) : chemin complet,
+        // pas seulement le dossier choisi.
+        for _ in 0..32 {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            let Some(meta) = fetch_meta(client, access_token, &cur, "id,name,mimeType,parents") else {
+                break;
+            };
+            let parent = meta.parents.first().cloned();
+            out.push(meta);
+            match parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        // Le dossier coché doit être visité comme conteneur, pas seulement décrit.
+        seen.remove(id);
+        queue.push(id.clone());
+    }
+
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id.clone()) {
+            continue; // raccourci d'un cycle de parents, ou dossier coché deux fois
+        }
+        let safe = id.replace('\\', "\\\\").replace('\'', "\\'");
+        let files = fetch_files(client, access_token, &format!("'{safe}' in parents and trashed=false"), fields)?;
+        for f in files {
+            if f.mime_type == FOLDER_MIME {
+                queue.push(f.id.clone());
+            }
+            out.push(f);
+        }
+    }
+    Ok(out)
+}
+
 /// Tous les fichiers Drive (tous formats, drives partagés inclus).
 /// Renvoie (count_ingested, count_total).
 pub fn sync_docs() -> Result<(usize, usize), String> {
+    // Une seule synchro à la fois : la commande manuelle et la génération
+    // déclenchée par le watcher ont tourné en parallèle le 18/08/2026 — deux
+    // énumérations complètes du Drive et deux écritures du même fichier.
+    static SYNC: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_busy) = SYNC.try_lock() else {
+        return Err("Une synchronisation Google Drive est déjà en cours.".to_string());
+    };
+    // Témoin dans la barre d'outils. Ici et pas dans la commande : la synchro
+    // automatique (watcher → refresh_connector_caches) passe par la même porte,
+    // et c'est celle qu'on ne voyait jamais.
+    let _badge = crate::SyncBadge::new("google-drive");
     let access_token = valid_access_token()?;
-    let client = reqwest::blocking::Client::new();
+    let client = http();
 
     // Collecte toutes les pages avant de traiter (nécessaire pour construire folder_names/parents).
-    let all_files = fetch_files(
-        &client,
-        &access_token,
-        "trashed=false",
-        "id,name,createdTime,modifiedTime,mimeType,parents",
-    )?;
+    const SYNC_FIELDS: &str = "id,name,createdTime,modifiedTime,mimeType,parents";
+    let sel = selection();
+    // Sélection vide = tout le Drive (défaut historique, cf. `Selection`).
+    let scoped = !sel.folders.is_empty();
+    let all_files = if scoped {
+        fetch_in_selection(&client, &access_token, &sel, SYNC_FIELDS)?
+    } else {
+        fetch_files(&client, &access_token, "trashed=false", SYNC_FIELDS)?
+    };
 
     // id → nom (pour les dossiers uniquement).
     let folder_names: std::collections::HashMap<String, String> = all_files.iter()
@@ -596,7 +752,6 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     // id → parent_id (pour la traversée de la hiérarchie).
     let folder_parents = folder_parents_of(&all_files);
     let known_folders = known_folders_of(&all_files);
-    let sel = selection();
 
     // Cache local : évite de re-télécharger les fichiers inchangés.
     let existing: std::collections::HashMap<String, Conversation> = load_conversations()
@@ -618,14 +773,23 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     let mut new_count = 0usize;
 
     let mut skipped = 0usize;
+    let mut ignored: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for f in all_files {
-        // PDF, Google Slides, PowerPoint .pptx — le reste (images, vidéos…) ignoré.
-        let Some(kind) = drive_kind(&f) else { continue };
+        // Ce qui n'est ni un document lisible ni un dossier (images, vidéos, zip…)
+        // est ignoré — mais compté par type, et dit à la fin. Un fichier qui
+        // disparaît sans un mot est l'anti-pattern interdit par l'ADR-0015.
+        let Some(kind) = drive_kind(&f) else {
+            if f.mime_type != FOLDER_MIME {
+                *ignored.entry(f.mime_type.clone()).or_insert(0usize) += 1;
+            }
+            continue;
+        };
 
-        // Filtre de sélection : le fichier sort du lot AVANT tout téléchargement,
-        // donc avant la partie chère (download + OCR).
-        if !is_selected(&f.parents, &folder_parents, &known_folders, &sel) {
+        // Filtre de sélection — inutile quand le parcours est déjà ciblé : tout
+        // ce qui remonte est dans le périmètre. Il ne sert qu'au mode « tout le
+        // Drive », où il écarte le fichier AVANT la partie chère (download + OCR).
+        if !scoped && !is_selected(&f.parents, &folder_parents, &known_folders, &sel) {
             skipped += 1;
             continue;
         }
@@ -664,6 +828,17 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
         convs.len(),
         if skipped > 0 { format!(" ({skipped} hors sélection)") } else { String::new() }
     );
+    if !ignored.is_empty() {
+        let mut par_type: Vec<(String, usize)> = ignored.into_iter().collect();
+        par_type.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: usize = par_type.iter().map(|(_, n)| n).sum();
+        let detail: Vec<String> = par_type
+            .iter()
+            .take(6)
+            .map(|(m, n)| format!("{n}× {}", m.rsplit(['.', '/']).next().unwrap_or(m)))
+            .collect();
+        crate::elog!("   ↳ {total} fichier(s) non lisibles ignorés : {}", detail.join(", "));
+    }
 
     let path = crate::ai::llama::app_data_dir()
         .ok_or("Dossier de données introuvable.")?
@@ -675,15 +850,32 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
 }
 
 const MIME_SLIDES: &str = "application/vnd.google-apps.presentation";
+const MIME_GDOC: &str = "application/vnd.google-apps.document";
+const MIME_GSHEET: &str = "application/vnd.google-apps.spreadsheet";
 const MIME_PPTX: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
 /// Type de fichier Drive supporté → clé de dispatch, None = ignoré.
+/// Types que Lucid sait lire sur Drive. Le mot rendu est soit un traitement
+/// spécial (`pdf`, `slides`, `gdoc`, `gsheet`), soit une extension : dans ce cas
+/// le fichier est téléchargé et confié à `file_to_source_text`, le même
+/// extracteur que les dossiers locaux.
+///
+/// Avant le 18/08/2026, seuls PDF/Slides/pptx passaient : un dossier de 7 `.docx`
+/// donnait zéro document, sans un mot (`docs/known-gaps.md`). Drive était plus
+/// pauvre que le connecteur « dossiers locaux » alors que l'extracteur est commun.
 fn drive_kind(f: &DriveFile) -> Option<&'static str> {
     let name = f.name.to_lowercase();
     if f.mime_type == "application/pdf" || name.ends_with(".pdf") { return Some("pdf"); }
     if f.mime_type == MIME_SLIDES { return Some("slides"); }
     if f.mime_type == MIME_PPTX || name.ends_with(".pptx") { return Some("pptx"); }
+    // Formats Google natifs : pas de binaire à télécharger, on demande un export.
+    if f.mime_type == MIME_GDOC { return Some("gdoc"); }
+    if f.mime_type == MIME_GSHEET { return Some("gsheet"); }
+    // Fichiers déposés tels quels : l'extension décide, comme en local.
+    for ext in ["docx", "xlsx", "csv", "txt", "md", "rtf", "doc"] {
+        if name.ends_with(&format!(".{ext}")) { return Some(ext); }
+    }
     None
 }
 
@@ -698,9 +890,19 @@ fn ingest_file(
     container_path: Vec<String>,
 ) -> Option<Conversation> {
     let text = match kind {
-        "slides" => export_slides_text(client, access_token, &file),
+        "slides" => export_text(client, access_token, &file, "text/plain"),
+        "gdoc" => export_text(client, access_token, &file, "text/plain"),
+        // Un tableur exporté en CSV : `file_to_source_text` en fait déjà un
+        // tableau markdown pour les fichiers locaux, on garde le texte brut ici.
+        "gsheet" => export_text(client, access_token, &file, "text/csv"),
         "pptx" => download_then(client, access_token, &file, "pptx", |p| pptx_to_markdown(p)),
-        _ => extract_pdf(client, access_token, &file),
+        "pdf" => extract_pdf(client, access_token, &file),
+        // docx, xlsx, csv, txt, md, rtf, doc — même extracteur que les dossiers locaux.
+        ext => download_then(client, access_token, &file, ext, |p| {
+            crate::file_to_source_text(p)
+                .map_err(|e| crate::elog!("⚠️ Drive : {} illisible — {e}", p.display()))
+                .ok()
+        }),
     }?;
     let ts = file.modified_time.clone();
     Some(Conversation {
@@ -765,19 +967,20 @@ fn extract_pdf(
 /// Exporte le texte d'un Google Slides via l'API Drive (`files.export`).
 /// ponytail: text/plain ne marque pas les diapos — suffisant pour brain.md ;
 /// si la structure par diapo devient nécessaire, exporter en pptx et convertir.
-fn export_slides_text(
+fn export_text(
     client: &reqwest::blocking::Client,
     access_token: &str,
     file: &DriveFile,
+    mime: &str,
 ) -> Option<String> {
     let resp = client
         .get(format!("https://www.googleapis.com/drive/v3/files/{}/export", file.id))
-        .query(&[("mimeType", "text/plain")])
+        .query(&[("mimeType", mime)])
         .bearer_auth(access_token)
         .send()
         .ok()?;
     if !resp.status().is_success() {
-        crate::elog!("⚠️ export Slides {} : HTTP {}", file.name, resp.status());
+        crate::elog!("⚠️ export Drive {} : HTTP {}", file.name, resp.status());
         return None;
     }
     let text = resp.text().ok()?.trim().to_string();

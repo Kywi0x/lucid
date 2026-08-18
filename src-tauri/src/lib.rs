@@ -2541,17 +2541,24 @@ fn google_drive_disconnect() {
 /// Arbre des dossiers Drive pour l'écran de sélection. Ne liste QUE les dossiers
 /// (quelques secondes même sur un Drive de 1 To).
 #[tauri::command]
-async fn google_drive_folders() -> Result<Vec<connectors::google_drive::DriveFolder>, String> {
-    tauri::async_runtime::spawn_blocking(connectors::google_drive::list_folders)
+async fn google_drive_roots() -> Result<Vec<connectors::google_drive::DriveFolder>, String> {
+    tauri::async_runtime::spawn_blocking(connectors::google_drive::list_roots)
         .await
         .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
-/// Nombre de documents ingérables par dossier (clé "" = fichiers sans dossier).
-/// Demande l'énumération complète → appelé en arrière-plan, jamais bloquant.
+/// Sous-dossiers d'un nœud — appelé au dépliage, pas au chargement.
 #[tauri::command]
-async fn google_drive_folder_counts() -> Result<std::collections::HashMap<String, usize>, String> {
-    tauri::async_runtime::spawn_blocking(connectors::google_drive::folder_doc_counts)
+async fn google_drive_children(parent: String) -> Result<Vec<connectors::google_drive::DriveFolder>, String> {
+    tauri::async_runtime::spawn_blocking(move || connectors::google_drive::list_children(&parent))
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Recherche de dossiers par nom (barre du sélecteur).
+#[tauri::command]
+async fn google_drive_search_folders(query: String) -> Result<Vec<connectors::google_drive::DriveFolder>, String> {
+    tauri::async_runtime::spawn_blocking(move || connectors::google_drive::search_folders(&query))
         .await
         .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
@@ -3829,10 +3836,19 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
 
 /// Version "tout accepter d'un coup" — utilisée par le mode autonome et par le
 /// bouton "Tout accepter" du panneau de propositions.
+/// Async + spawn_blocking, comme l'export zip plus bas : `resolve_all_pending_in`
+/// prend `GEN_LOCK`, que la génération garde le temps d'une passe complète
+/// (synchros connecteurs incluses). En commande sync, l'attente se ferait sur le
+/// main thread et **gèlerait toute l'UI** — observé le 18/08/2026, fenêtre figée
+/// pendant une synchro Drive.
 #[tauri::command]
-fn resolve_all_mcp_proposals() -> Result<Vec<String>, String> {
-    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    resolve_all_pending_in(&dir)
+async fn resolve_all_mcp_proposals() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+        resolve_all_pending_in(&dir)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
 /// Liste les propositions en attente déposées par le serveur MCP.
@@ -4039,9 +4055,14 @@ fn import_shared_space(payload: serde_json::Value, space_id: String) -> Result<B
 
 /// Accepte ou refuse une proposition MCP. Renvoie les ids résolus (chaîne).
 #[tauri::command]
-fn resolve_mcp_proposal(id: String, accept: bool) -> Result<Vec<String>, String> {
-    let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
-    resolve_proposal_in(&dir, &id, accept)
+async fn resolve_mcp_proposal(id: String, accept: bool) -> Result<Vec<String>, String> {
+    // Même verrou, même raison qu'au-dessus.
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = ai::llama::app_data_dir().ok_or("Dossier de données introuvable.")?;
+        resolve_proposal_in(&dir, &id, accept)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
 /// Exporte le cerveau en zip (hors modèles) pour la sauvegarde/sync cloud.
@@ -6128,6 +6149,37 @@ fn has_real_brain(dir: &std::path::Path) -> bool {
 /// ponytail: re-sync à chaque génération ; incrémental donc bon marché (mtime
 /// pour les fichiers, seulement les docs Drive modifiés). Si ça devient trop
 /// lourd un jour, gater sur un fingerprint par connecteur.
+/// Handle global, posé au démarrage. Les connecteurs tournent dans des threads
+/// détachés (watcher, `spawn_blocking`) qui n'ont aucun handle sous la main :
+/// sans ça, une synchro automatique ne peut rien dire à l'UI — et c'est
+/// justement celle qu'on ne voit jamais.
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// Signale qu'un connecteur commence (`true`) ou termine (`false`) sa synchro.
+pub fn emit_sync(source: &str, active: bool) {
+    use tauri::Emitter;
+    if let Some(app) = APP.get() {
+        let _ = app.emit("connector-sync", serde_json::json!({ "source": source, "active": active }));
+    }
+}
+
+/// Garde : émet `false` même en cas de `?` ou de panique en cours de synchro.
+/// Un témoin qui reste allumé pour toujours est pire que pas de témoin.
+pub struct SyncBadge(&'static str);
+
+impl SyncBadge {
+    pub fn new(source: &'static str) -> Self {
+        emit_sync(source, true);
+        SyncBadge(source)
+    }
+}
+
+impl Drop for SyncBadge {
+    fn drop(&mut self) {
+        emit_sync(self.0, false);
+    }
+}
+
 fn refresh_connector_caches() {
     if connectors::apple_notes::is_connected() {
         if let Err(e) = connectors::apple_notes::sync() { crate::elog!("⚠️ sync Notes Apple : {e}"); }
@@ -6895,6 +6947,7 @@ pub fn run() {
             if let Some(dir) = ai::llama::app_data_dir() {
                 ensure_all_space_anchors(&dir);
             }
+            let _ = APP.set(app.handle().clone());
             start_watcher(app.handle().clone());
             start_data_watcher(app.handle().clone());
             start_mcp_pending_watcher(app.handle().clone());
@@ -6920,8 +6973,9 @@ pub fn run() {
             google_drive_connect,
             google_drive_sync,
             google_drive_disconnect,
-            google_drive_folders,
-            google_drive_folder_counts,
+            google_drive_roots,
+            google_drive_children,
+            google_drive_search_folders,
             google_drive_selection,
             google_drive_set_selection,
             ask_brain,

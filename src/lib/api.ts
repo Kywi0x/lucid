@@ -147,7 +147,7 @@ export type DriveFolder = {
   name: string;
   /** Parent direct — null si racine du Drive ou hors périmètre. */
   parent: string | null;
-  /** Racine d'un partage « Partagés avec moi ». */
+  /** Unité partagée ou dossier partagé avec moi (groupé à part dans l'arbre). */
   shared: boolean;
 };
 
@@ -158,14 +158,19 @@ export type DriveSelection = {
   include_orphans: boolean;
 };
 
-/** Arbre des dossiers Drive — dossiers uniquement, donc rapide même sur 1 To. */
-export function googleDriveFolders(): Promise<DriveFolder[]> {
-  return invoke("google_drive_folders");
+/** Racines : 1er niveau de Mon Drive + unités partagées + partagés avec moi. */
+export function googleDriveRoots(): Promise<DriveFolder[]> {
+  return invoke("google_drive_roots");
 }
 
-/** Documents ingérables par dossier (clé "" = fichiers sans dossier). Lent : à charger en fond. */
-export function googleDriveFolderCounts(): Promise<Record<string, number>> {
-  return invoke("google_drive_folder_counts");
+/** Sous-dossiers d'un nœud, chargés au dépliage. */
+export function googleDriveChildren(parent: string): Promise<DriveFolder[]> {
+  return invoke("google_drive_children", { parent });
+}
+
+/** Recherche de dossiers par nom (2 caractères minimum, 200 résultats max). */
+export function googleDriveSearchFolders(query: string): Promise<DriveFolder[]> {
+  return invoke("google_drive_search_folders", { query });
 }
 
 export function googleDriveSelection(): Promise<DriveSelection> {

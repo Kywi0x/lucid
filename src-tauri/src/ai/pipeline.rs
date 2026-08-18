@@ -371,7 +371,14 @@ pub fn generate_brain(
         ));
     }
 
-    crate::elog!("📦 Cache : {cache_hits}/{total} conversations réutilisées.");
+    // Le compteur ne veut dire quelque chose que si l'extraction IA tourne :
+    // sinon il n'y a rien à réutiliser et la ligne affichait « 0/409 », lue
+    // comme un cache en panne (18/08/2026).
+    if AI_EXTRACTION {
+        crate::elog!("📦 Cache : {cache_hits}/{total} conversations réutilisées.");
+    } else {
+        crate::elog!("📦 {total} conversations traitées (extraction IA désactivée).");
+    }
     if let Some(path) = cache_path {
         save_cache(path, &cache);
     }
