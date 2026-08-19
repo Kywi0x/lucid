@@ -168,6 +168,11 @@ export function googleDriveChildren(parent: string): Promise<DriveFolder[]> {
   return invoke("google_drive_children", { parent });
 }
 
+/** Noms des dossiers cochés — la sélection ne stocke que des ids. */
+export function googleDriveFolderLabels(ids: string[]): Promise<DriveFolder[]> {
+  return invoke("google_drive_folder_labels", { ids });
+}
+
 /** Recherche de dossiers par nom (2 caractères minimum, 200 résultats max). */
 export function googleDriveSearchFolders(query: string): Promise<DriveFolder[]> {
   return invoke("google_drive_search_folders", { query });

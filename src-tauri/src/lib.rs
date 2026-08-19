@@ -971,6 +971,9 @@ struct EmbedPlan {
     /// Lots de classement de domaine dont l'appel IA a échoué — remontés au
     /// rapport pour ne pas présenter une passe trouée comme une passe complète.
     domain_failures: usize,
+    /// Aucun vecteur obtenu alors qu'il y avait des documents à embedder :
+    /// le moteur a lâché EN COURS de passe (il répondait au démarrage).
+    embed_failed: bool,
     /// Similarité interne moyenne de chaque cluster retenu (membres ↔ centroïde),
     /// même mesure que la garde de cohésion. Même ordre que `clusters`.
     cohesion: Vec<f32>,
@@ -1143,7 +1146,7 @@ fn best_anchor(
 
 fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &BrainGraph, engine: Option<&LlamaEngine>, tuning: &ArchivistTuning) -> EmbedPlan {
     let mut plan = EmbedPlan {
-        anchors: Vec::new(), clusters: Vec::new(), domain_failures: 0,
+        anchors: Vec::new(), clusters: Vec::new(), domain_failures: 0, embed_failed: false,
         cohesion: Vec::new(), names_reused: 0,
         embeddings_new: 0, embeddings_cached: 0,
     };
@@ -1214,7 +1217,13 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     let (vecs, embedded_now) = embed_nodes_cached(dir, &to_embed);
     plan.embeddings_new = embedded_now;
     plan.embeddings_cached = to_embed.len().saturating_sub(embedded_now);
-    if vecs.is_empty() { return plan; } // moteur indispo → repli (rien rangé par embeddings)
+    if vecs.is_empty() {
+        // Moteur tombé en cours de route : rien rangé par embeddings. On le
+        // remonte au rapport plutôt que de rendre un plan vide indiscernable
+        // d'un « rien à ranger ».
+        plan.embed_failed = !to_embed.is_empty();
+        return plan;
+    }
 
     // Tag de domaine (le signal SUJET) pour tout ce qu'on manipule. Sert de GARDE :
     // on n'ancre/ne regroupe jamais à travers deux domaines, même si l'embedding
@@ -1486,12 +1495,28 @@ fn run_archivist_scan_once_in_progress(
     let capture_theme = |created: &mut Vec<(String, String, usize, Vec<String>)>, c: &archivist::ThemeCluster| {
         created.push((format!("arch-theme-{}", c.label.to_lowercase()), c.label.clone(), c.node_ids.len(), theme_sample(&c.node_ids)));
     };
-    crate::elog!("🗂️ archiviste: engine={}, embed={}, ai_pool={} candidats (catchall_id={:?})",
-        engine.is_some(), ai::llama::embed_model_available(), ai_pool.len(), result.catchall_id);
+    // Le modèle sur le disque ne dit RIEN de la disponibilité du moteur : on
+    // démarre (ou réveille) le serveur d'embedding et on le sonde pour de vrai
+    // AVANT de choisir le chemin de rangement. Sans ça, une passe entière peut
+    // tourner sans un seul vecteur en affichant `embed=true` (2026-08-06).
+    let embed_model = ai::llama::embed_model_available();
+    let embed_ready = embed_model && !ai_pool.is_empty() && ai::llama::embed_engine_ready();
+    crate::elog!("🗂️ archiviste: engine={}, embed={} (modèle présent={}), ai_pool={} candidats (catchall_id={:?})",
+        engine.is_some(), embed_ready, embed_model, ai_pool.len(), result.catchall_id);
+    // Jamais de repli muet : si le modèle est là mais que le moteur ne répond
+    // pas, le rangement qui suit est dégradé et l'utilisateur doit le lire dans
+    // son rapport, pas le déduire d'un résultat pauvre (règle de parité ADR-0015).
+    if embed_model && !embed_ready && !ai_pool.is_empty() {
+        report.push_str("⚠️ Moteur d'embedding indisponible (serveur non démarré) — rangement dégradé pour cette passe. Relance après redémarrage de Lucid.\n");
+        crate::elog!("⚠️ archiviste: moteur d'embedding indisponible malgré le modèle présent → repli.");
+    }
 
-    if ai::llama::embed_model_available() {
+    if embed_ready {
         let plan = embed_organize(dir, &ai_pool, &graph, engine.as_ref(), &tuning);
         domain_failures = plan.domain_failures;
+        if plan.embed_failed {
+            report.push_str("⚠️ Le moteur d'embedding s'est arrêté pendant la passe : aucun document rangé par similarité. Relance l'Archiviste.\n");
+        }
         metrics.anchored = plan.anchors.len();
         metrics.clusters = plan.clusters.len();
         metrics.largest_cluster = plan.clusters.iter().map(|c| c.node_ids.len()).max().unwrap_or(0);
@@ -2553,6 +2578,14 @@ async fn google_drive_children(parent: String) -> Result<Vec<connectors::google_
     tauri::async_runtime::spawn_blocking(move || connectors::google_drive::list_children(&parent))
         .await
         .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Noms des dossiers actuellement cochés (liste « déjà synchronisés »).
+#[tauri::command]
+async fn google_drive_folder_labels(ids: Vec<String>) -> Result<Vec<connectors::google_drive::DriveFolder>, String> {
+    tauri::async_runtime::spawn_blocking(move || connectors::google_drive::folder_labels(&ids))
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))
 }
 
 /// Recherche de dossiers par nom (barre du sélecteur).
@@ -6976,6 +7009,7 @@ pub fn run() {
             google_drive_roots,
             google_drive_children,
             google_drive_search_folders,
+            google_drive_folder_labels,
             google_drive_selection,
             google_drive_set_selection,
             ask_brain,

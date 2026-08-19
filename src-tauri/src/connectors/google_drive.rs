@@ -482,6 +482,22 @@ pub fn list_roots() -> Result<Vec<DriveFolder>, String> {
     Ok(out)
 }
 
+/// Noms des dossiers cochés. La sélection ne stocke que des ids : sans ça, on ne
+/// peut pas dire à l'utilisateur **ce qui est synchronisé** quand les dossiers
+/// concernés ne sont pas chargés dans l'arbre (demande de Liam, 18/08/2026).
+/// Les noms ne sont pas persistés exprès — un dossier renommé dans Drive doit
+/// s'afficher sous son nom actuel.
+pub fn folder_labels(ids: &[String]) -> Vec<DriveFolder> {
+    let Ok(access_token) = valid_access_token() else { return vec![] };
+    let client = http();
+    ids.iter()
+        .filter_map(|id| {
+            let f = fetch_meta(&client, &access_token, id, "id,name,parents")?;
+            Some(DriveFolder { id: f.id, name: f.name, parent: f.parents.first().cloned(), shared: false })
+        })
+        .collect()
+}
+
 /// Dossiers dont le nom contient `needle`. Sert la barre de recherche du
 /// sélecteur : sur 24 694 dossiers, déplier à la main ne suffit pas.
 pub fn search_folders(needle: &str) -> Result<Vec<DriveFolder>, String> {

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronRight, Folder, HardDrive, Loader2, Minus, Search, Users, X } from "lucide-react";
 import {
   googleDriveRoots,
   googleDriveChildren,
   googleDriveSearchFolders,
+  googleDriveFolderLabels,
   googleDriveSelection,
   googleDriveSetSelection,
   type DriveFolder,
@@ -43,6 +44,7 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
   const [hits, setHits] = useState<DriveFolder[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [saving, setSaving] = useState(false);
+  const dirtyRef = useRef(false);
 
   const remember = useCallback((list: DriveFolder[]) => {
     setById((prev) => {
@@ -63,18 +65,28 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
         setInitial(new Set(sel.folders));
         setOrphans(sel.include_orphans);
         setInitialOrphans(sel.include_orphans);
+        // Les cochés ne sont pas forcément dans l'arbre chargé : sans leurs noms,
+        // impossible de dire ce qui est synchronisé.
+        if (sel.folders.length) googleDriveFolderLabels(sel.folders).then(remember).catch(() => {});
       })
       .catch((e) => alive && setError(String(e)));
     return () => { alive = false; };
   }, [remember]);
 
+  // Fermer avec des modifications non enregistrées les jetait sans un mot :
+  // Liam a coché des dossiers, fermé, rouvert, et tout avait disparu (18/08/2026).
+  const closeGuarded = useCallback(() => {
+    if (dirtyRef.current && !confirm("Modifications non enregistrées. Fermer quand même ?")) return;
+    onClose();
+  }, [onClose]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.stopPropagation(); onClose(); }
+      if (e.key === "Escape") { e.stopPropagation(); closeGuarded(); }
     };
     window.addEventListener("keydown", onKey, { capture: true });
     return () => window.removeEventListener("keydown", onKey, { capture: true });
-  }, [onClose]);
+  }, [closeGuarded]);
 
   // Recherche côté Drive : l'arbre n'est pas en mémoire, on ne peut pas filtrer localement.
   useEffect(() => {
@@ -168,12 +180,14 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
     selected.size !== initial.size ||
     [...selected].some((id) => !initial.has(id));
 
+  dirtyRef.current = dirty;
+
   const mine = (roots ?? []).filter((f) => !f.shared);
   const shared = (roots ?? []).filter((f) => f.shared);
   const treeProps = { kids, loading, selected, open, inheritedFrom, hasSelectedDescendant, toggleExpand, toggle };
 
   return (
-    <div className="absolute inset-0 z-20 flex flex-col justify-end bg-black/20" onClick={onClose}>
+    <div className="absolute inset-0 z-20 flex flex-col justify-end bg-black/20" onClick={closeGuarded}>
       <div
         className="m-3 flex max-h-[85%] flex-col overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)]"
         onClick={(e) => e.stopPropagation()}
@@ -185,9 +199,17 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
             <p className="text-[11px] text-[var(--color-muted)]">
               Lucid ne lira que ce que tu coches. Aucune case = tout le Drive.
             </p>
+            {/* Vérifié le 18/08/2026 : décocher retire le dossier du suivi, mais
+                les documents restent dans brain.db. Le taire ferait croire à une
+                suppression — ou à une conservation, selon ce que l'utilisateur
+                imagine. Même règle que les sources passées en stand-by le 06/08. */}
+            <p className="mt-0.5 text-[10px] text-[var(--color-muted)]">
+              Décocher arrête le suivi — les documents déjà indexés restent dans ton
+              cerveau, mais ne seront plus mis à jour.
+            </p>
           </div>
           <button
-            onClick={onClose}
+            onClick={closeGuarded}
             className="rounded-lg p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] transition-colors"
           >
             <X className="size-4" />
@@ -207,6 +229,30 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
           />
         </div>
 
+        {/* Ce qui est réellement synchronisé — la question de Liam : « voir les
+            dossiers synchronisés et pouvoir les desync ». L'arbre paresseux ne
+            peut pas la montrer (un dossier coché en profondeur n'est pas chargé),
+            cette liste si. */}
+        {selected.size > 0 && (
+          <div className="flex flex-wrap gap-1.5 border-b border-[var(--color-border)] px-4 py-2">
+            <span className="w-full text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">
+              Dossiers indexés ({selected.size})
+            </span>
+            {[...selected].map((id) => (
+              <button
+                key={id}
+                onClick={() => toggle(id)}
+                title="Retirer de la sélection"
+                className="flex max-w-full items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-surface-2)] px-2 py-0.5 text-[11px] text-[var(--color-text)] hover:border-[var(--color-err)] hover:text-[var(--color-err)] transition-colors"
+              >
+                <Folder className="size-3 shrink-0" />
+                <span className="truncate">{byId.get(id)?.name ?? "dossier…"}</span>
+                <X className="size-3 shrink-0" />
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* Arbre */}
         <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
           {error && <p className="px-2 py-3 text-xs text-[var(--color-err)]">{error}</p>}
@@ -220,19 +266,9 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
           {hits !== null ? (
             hits.length === 0
               ? <p className="px-2 py-6 text-xs text-[var(--color-muted)]">Aucun dossier ne correspond.</p>
-              : hits.map((f) => (
-                  <Row
-                    key={f.id}
-                    folder={f}
-                    depth={0}
-                    state={selected.has(f.id) ? "on" : inheritedFrom(f.id, selected) ? "inherited" : "off"}
-                    expandable={false}
-                    expanded={false}
-                    busy={false}
-                    onToggleExpand={() => {}}
-                    onToggle={() => toggle(f.id)}
-                  />
-                ))
+              // Même composant que l'arbre : un résultat de recherche se déplie
+              // comme un dossier ordinaire (il ne le faisait pas — 18/08/2026).
+              : <Tree nodes={hits} depth={0} {...treeProps} />
           ) : roots && (
             <>
               <Tree nodes={mine} depth={0} {...treeProps} />

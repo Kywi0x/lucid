@@ -1,6 +1,6 @@
 # Trous connus, dette technique & évolutions
 
-> Audit direct du code · 2026-07-30 · sévérité indicative.
+> Audit direct du code · 2026-07-30, mis à jour le 2026-08-18 · sévérité indicative.
 
 ## 🔴 Perte de données / sync
 
@@ -15,7 +15,7 @@
 
 | Problème | Où | Évolution possible |
 |---|---|---|
-| **Drive jette Docs/Sheets/.docx/.xlsx/.csv sans un mot** (l'anti-exemple du CLAUDE.md) | `google_drive.rs:448` | Liste canonique + export types Google + liste « skipped » |
+| ~~Drive jette Docs/Sheets/.docx/.xlsx/.csv sans un mot~~ **corrigé 18/08/2026** | `google_drive.rs::drive_kind` | Extracteur commun (`file_to_source_text`) + export natif Google Docs/Sheets + ignorés comptés par type et loggués |
 | **OCR Drive cassé sur Windows** (chemins `/opt/homebrew` en dur) | `google_drive.rs:764` | Résoudre le sidecar déjà embarqué (`bundle-sidecars.ps1`) |
 | **Token Drive expiré = détection morte en silence** | `google_drive.rs:339` | Proposer une reconnexion |
 | **Dossier bloqué TCC macOS = 0 fichier, aucun message** | `local_folder.rs:144`, `obsidian.rs:95` | Modal « autoriser dans Réglages Système » |
@@ -35,7 +35,7 @@
 
 | Problème | Où | Évolution possible |
 |---|---|---|
-| **Drive : pas de `changes` token** → re-liste tout à chaque sync + poll | `google_drive.rs` | Delta-token Drive |
+| **Drive : pas de `changes` token** — le mode « tout le Drive » (sélection vide) re-liste tout à chaque sync + poll (>100 000 objets mesurés sur un compte pro). Avec sélection, le parcours est ciblé depuis le 18/08 | `google_drive.rs` | Delta-token Drive |
 | **Apple Notes : import tout-ou-rien** (une note verrouillée casse tout), pas de timeout | `apple_notes.rs` | Par lots + timeout + skip note KO |
 | **Symlinks cycliques → récursion infinie** | `local_folder.rs:143`, `obsidian.rs` | Set `visited` |
 | **`free_port` fait `kill -9`** sur tout PID du port | `ai/llama.rs` | Vérifier que c'est bien Lucid |
@@ -50,6 +50,15 @@
 | **`container_path` vide** (claude.ai / ChatGPT) | Dette | Pas de hiérarchie projet — `claude_ai.rs:94` |
 | **Bootstrap 1er lancement + build Windows** | Codés, non testés | À valider en réel |
 | **Inbox** | Limite | Ne capte pas les changements Drive au fichier |
+
+## 🟡 Ouvert depuis le test Drive à l'échelle réelle (18/08/2026)
+
+| Sujet | État | Note |
+|---|---|---|
+| **Désélection d'un dossier** : que deviennent les documents déjà rangés ? | à trancher | Décision produit ; le message qui chiffrait le retrait a disparu avec les compteurs |
+| **« Vide = tout le Drive »** sur un compte pro = 42 638 PDF visés | assumé (décision Liam) | Garde-fou au-delà d'un seuil ? |
+| **Témoin de synchro** ne couvre pas la régénération qui suit | partiel | `archivist-progress` existe déjà, à brancher |
+| `.doc` / `.rtf` via `textutil` = macOS seulement | parité | RTF en Rust pur au plan beta |
 
 ## Résidus de code
 

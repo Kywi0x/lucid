@@ -785,6 +785,29 @@ pub fn generation_model_available() -> bool { resolve_model().is_some() }
 /// RAM totale détectée (Go) — exposée pour le diagnostic.
 pub fn detected_ram_gb() -> f32 { total_ram_gb() }
 
+/// Sonde de disponibilité RÉELLE : un embedding minuscule via `/v1/embeddings`.
+/// `/health` passe au vert avant que l'endpoint accepte des requêtes — c'est
+/// cette course qui a produit une passe d'Archiviste sans un seul vecteur.
+fn embed_probe(token: &str) -> bool {
+    reqwest::blocking::Client::new()
+        .post(format!("http://127.0.0.1:{EMBED_PORT}/v1/embeddings"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "input": "ok" }))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|j| j.get("data")?.as_array()?.first()?.get("embedding")?.as_array().map(|a| a.len()))
+        .is_some_and(|len| len > 0)
+}
+
+/// Le moteur d'embedding est-il RÉELLEMENT utilisable ici et maintenant ?
+/// Démarre le serveur si besoin (donc coûteux au premier appel : chargement du
+/// modèle). À utiliser avant de choisir un chemin de rangement — contrairement à
+/// `embed_model_available()`, qui ne dit que « le fichier .gguf est sur le disque ».
+pub fn embed_engine_ready() -> bool { ensure_embed_server().is_some() }
+
 /// Démarre (ou réutilise) le serveur d'embedding. `None` si binaire ou modèle
 /// absent, ou démarrage échoué. Renvoie la clé d'API.
 fn ensure_embed_server() -> Option<String> {
@@ -821,9 +844,13 @@ fn ensure_embed_server() -> Option<String> {
     let mut proc = cmd.spawn().ok().map(|child| ServerProc { child, model: model.clone(), token: token.clone() })?;
     let started = Instant::now();
     while started.elapsed() < SERVER_STARTUP_TIMEOUT {
-        if health_on(EMBED_PORT, &token) {
+        // Sonde le VRAI endpoint, pas `/health` : le 2026-08-06, `/health`
+        // répondait 200 pendant que `/v1/embeddings` refusait encore la
+        // connexion — une passe entière a tourné sans vecteurs en se croyant
+        // prête. Un embedding de test est le seul signal qui ne ment pas.
+        if embed_probe(&token) {
             *slot = Some(proc);
-            crate::elog!("✅ llama-server (embedding) prêt en {:.1}s.", started.elapsed().as_secs_f32());
+            crate::elog!("✅ llama-server (embedding) prêt en {:.1}s (embedding de test OK).", started.elapsed().as_secs_f32());
             return Some(token);
         }
         if let Ok(Some(status)) = proc.child.try_wait() {
