@@ -676,7 +676,11 @@ fn embed_text(n: &BrainNode) -> String {
 /// Renvoie `(id → vecteur, nombre de vecteurs CALCULÉS pendant cet appel)`. Le
 /// second terme remonte au rapport : sur une machine lente, il dit si le temps est
 /// parti dans l'embedding ou ailleurs.
-fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> (std::collections::HashMap<String, Vec<f32>>, usize) {
+/// Le 3ᵉ terme dit si le MOTEUR a refusé de répondre pendant cet appel — pas si
+/// des vecteurs manquent. Un corpus entièrement en cache n'a rien à demander et
+/// n'est donc jamais « en échec » ; à l'inverse, 3 nouveaux vecteurs perdus sur
+/// 200 en cache doivent se voir, alors que la map, elle, reste bien remplie.
+fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> (std::collections::HashMap<String, Vec<f32>>, usize, bool) {
     let mut cache: std::collections::HashMap<String, EmbedEntry> =
         std::fs::read_to_string(embed_cache_path(dir)).ok()
             .and_then(|r| serde_json::from_str(&r).ok())
@@ -697,6 +701,7 @@ fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> (std::coll
             todo_texts.push(embed_text(n));
         }
     }
+    let mut engine_failed = false;
     if !todo_texts.is_empty() {
         let started = std::time::Instant::now();
         match ai::llama::embed_texts(&todo_texts) {
@@ -714,7 +719,10 @@ fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> (std::coll
                     todo_texts.len(), secs, secs / todo_texts.len() as f32,
                     nodes.len().saturating_sub(todo_texts.len()));
             }
-            Err(e) => crate::elog!("🗂️ embeddings indisponibles ({e})."),
+            Err(e) => {
+                engine_failed = true;
+                crate::elog!("🗂️ embeddings indisponibles ({e}).");
+            }
         }
     }
     // Vecteurs RÉELLEMENT calculés, pas tentés : en cas d'échec du moteur, `todo`
@@ -727,7 +735,7 @@ fn embed_nodes_cached(dir: &std::path::Path, nodes: &[&BrainNode]) -> (std::coll
     let out = nodes.iter()
         .filter_map(|n| cache.get(&n.id).filter(|e| !e.vec.is_empty()).map(|e| (n.id.clone(), e.vec.clone())))
         .collect();
-    (out, computed)
+    (out, computed, engine_failed)
 }
 
 // Cache des tags de domaine (même esprit que le cache d'embeddings) : un doc
@@ -971,8 +979,8 @@ struct EmbedPlan {
     /// Lots de classement de domaine dont l'appel IA a échoué — remontés au
     /// rapport pour ne pas présenter une passe trouée comme une passe complète.
     domain_failures: usize,
-    /// Aucun vecteur obtenu alors qu'il y avait des documents à embedder :
-    /// le moteur a lâché EN COURS de passe (il répondait au démarrage).
+    /// Le moteur d'embedding a refusé de répondre pendant la passe (total ou
+    /// partiel) : le rangement par similarité est incomplet, il faut le dire.
     embed_failed: bool,
     /// Similarité interne moyenne de chaque cluster retenu (membres ↔ centroïde),
     /// même mesure que la garde de cohésion. Même ordre que `clusters`.
@@ -1214,16 +1222,11 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (id, _) in pool { if let Some(n) = by_id.get(id.as_str()) { if seen.insert(n.id.as_str()) { to_embed.push(n); } } }
     for kids in folder_children.values() { for n in kids { if seen.insert(n.id.as_str()) { to_embed.push(n); } } }
-    let (vecs, embedded_now) = embed_nodes_cached(dir, &to_embed);
+    let (vecs, embedded_now, embed_failed) = embed_nodes_cached(dir, &to_embed);
+    plan.embed_failed = embed_failed;
     plan.embeddings_new = embedded_now;
     plan.embeddings_cached = to_embed.len().saturating_sub(embedded_now);
-    if vecs.is_empty() {
-        // Moteur tombé en cours de route : rien rangé par embeddings. On le
-        // remonte au rapport plutôt que de rendre un plan vide indiscernable
-        // d'un « rien à ranger ».
-        plan.embed_failed = !to_embed.is_empty();
-        return plan;
-    }
+    if vecs.is_empty() { return plan; } // rien à comparer → repli (rien rangé par embeddings)
 
     // Tag de domaine (le signal SUJET) pour tout ce qu'on manipule. Sert de GARDE :
     // on n'ancre/ne regroupe jamais à travers deux domaines, même si l'embedding
@@ -1495,27 +1498,25 @@ fn run_archivist_scan_once_in_progress(
     let capture_theme = |created: &mut Vec<(String, String, usize, Vec<String>)>, c: &archivist::ThemeCluster| {
         created.push((format!("arch-theme-{}", c.label.to_lowercase()), c.label.clone(), c.node_ids.len(), theme_sample(&c.node_ids)));
     };
-    // Le modèle sur le disque ne dit RIEN de la disponibilité du moteur : on
-    // démarre (ou réveille) le serveur d'embedding et on le sonde pour de vrai
-    // AVANT de choisir le chemin de rangement. Sans ça, une passe entière peut
-    // tourner sans un seul vecteur en affichant `embed=true` (2026-08-06).
+    // `embed_model` = le .gguf est sur le disque, RIEN de plus — on ne sonde pas
+    // le moteur ici : un corpus déjà entièrement en cache n'a aucun vecteur à
+    // calculer, et le réveiller pour rien coûterait un chargement de modèle
+    // (600 Mo) plus la contention mémoire avec le serveur de génération.
+    // L'indisponibilité est constatée là où elle fait mal — au moment d'embedder
+    // — et remontée par `plan.embed_failed`.
     let embed_model = ai::llama::embed_model_available();
-    let embed_ready = embed_model && !ai_pool.is_empty() && ai::llama::embed_engine_ready();
-    crate::elog!("🗂️ archiviste: engine={}, embed={} (modèle présent={}), ai_pool={} candidats (catchall_id={:?})",
-        engine.is_some(), embed_ready, embed_model, ai_pool.len(), result.catchall_id);
-    // Jamais de repli muet : si le modèle est là mais que le moteur ne répond
-    // pas, le rangement qui suit est dégradé et l'utilisateur doit le lire dans
-    // son rapport, pas le déduire d'un résultat pauvre (règle de parité ADR-0015).
-    if embed_model && !embed_ready && !ai_pool.is_empty() {
-        report.push_str("⚠️ Moteur d'embedding indisponible (serveur non démarré) — rangement dégradé pour cette passe. Relance après redémarrage de Lucid.\n");
-        crate::elog!("⚠️ archiviste: moteur d'embedding indisponible malgré le modèle présent → repli.");
-    }
+    crate::elog!("🗂️ archiviste: engine={}, modèle d'embedding présent={}, ai_pool={} candidats (catchall_id={:?})",
+        engine.is_some(), embed_model, ai_pool.len(), result.catchall_id);
 
-    if embed_ready {
+    if embed_model {
         let plan = embed_organize(dir, &ai_pool, &graph, engine.as_ref(), &tuning);
         domain_failures = plan.domain_failures;
+        // Jamais de dégradation muette (règle de parité ADR-0015) : sans cette
+        // ligne, une passe sans vecteurs se lit comme une passe où il n'y avait
+        // rien à ranger — c'est exactement le piège du 2026-08-06.
         if plan.embed_failed {
-            report.push_str("⚠️ Le moteur d'embedding s'est arrêté pendant la passe : aucun document rangé par similarité. Relance l'Archiviste.\n");
+            report.push_str("⚠️ Moteur d'embedding indisponible pendant la passe : le rangement par similarité est incomplet. Relance l'Archiviste après un redémarrage de Lucid.\n");
+            crate::elog!("⚠️ archiviste: moteur d'embedding en échec → rangement par similarité incomplet.");
         }
         metrics.anchored = plan.anchors.len();
         metrics.clusters = plan.clusters.len();

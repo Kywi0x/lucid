@@ -114,12 +114,24 @@ pub const CATCHALL_LABEL: &str = "Non triable";
 /// run précédent) ne le recrée pas — idempotent par construction.
 pub const CATCHALL_ID: &str = "arch-non-triable";
 
-/// Sources « à trier » (politique de structure, ADR-0020) : leur contenu est du
-/// vrac à ranger thématiquement, PAS une arbo à respecter. Leurs feuilles sont
-/// donc traitées comme candidates par l'Archiviste, où qu'elles soient placées.
+/// Sources « à trier » (politique de structure, ADR-0020) : l'Archiviste a le
+/// droit de REGARDER leur contenu. Ça ne veut pas dire tout déplacer — ce qui est
+/// réellement rangé est protégé juste après par `RESPECT_SUBFOLDERS`.
 /// - `local-folder` : dumps Bureau/Documents/Téléchargements.
 /// - `apple-notes` : app de notes, pas de vraie hiérarchie (décision Liam 2026-07-30).
-const SORTABLE_CONNECTORS: &[&str] = &["local-folder", "apple-notes"];
+/// - `google-drive` : niveau 2 d'ADR-0020, « respecter + compléter » — l'arbo est
+///   gardée, mais le vrac posé à la racine du Drive doit être rangeable
+///   (décision Liam 2026-08-19 : jusqu'ici Drive était en tout-ou-rien, absent de
+///   cette liste, donc même ses fichiers en vrac n'étaient jamais examinés).
+const SORTABLE_CONNECTORS: &[&str] = &["local-folder", "apple-notes", "google-drive"];
+
+/// Sources dont les SOUS-dossiers ne sont pas des destinations valables : ranger
+/// un document d'un sous-dossier de Téléchargements vers un autre, c'est déplacer
+/// du vrac dans du vrac. Sous-ensemble de `SORTABLE_CONNECTORS` — Drive en est
+/// absent exprès : `Drive/Ideeri/Factures` est un vrai classement humain, il doit
+/// rester une cible (c'est déjà la règle de `RECEIVING_SOURCES`).
+const DUMP_CONNECTORS: &[&str] = &["local-folder", "apple-notes"];
+
 
 /// Sources dont les dossiers peuvent RECEVOIR un document venu d'ailleurs
 /// (ADR-0022 phase 1.3). Volontairement restrictif.
@@ -140,9 +152,12 @@ const SORTABLE_CONNECTORS: &[&str] = &["local-folder", "apple-notes"];
 pub const RECEIVING_SOURCES: &[&str] = &["local-folder", "google-drive"];
 
 /// Sources triables dont on respecte tout de même les SOUS-dossiers (ADR-0022
-/// phase 1.2). Apple Notes en est absent exprès : ADR-0020 le classe niveau 3
-/// (« toujours ranger »), ses dossiers ne sont pas un signal fiable.
-const RESPECT_SUBFOLDERS: &[&str] = &["local-folder"];
+/// phase 1.2) — quel que soit le nombre de documents qu'ils contiennent : un
+/// dossier nommé avec un seul fichier est un classement qui attend d'être rempli,
+/// pas un accident (débat tranché avec Liam le 2026-08-19). Apple Notes en est
+/// absent exprès : ADR-0020 le classe niveau 3 (« toujours ranger »), ses dossiers
+/// ne sont pas un signal fiable.
+const RESPECT_SUBFOLDERS: &[&str] = &["local-folder", "google-drive"];
 
 /// `true` si le bac "Non triable" n'existe pas encore dans ce graphe — à
 /// l'orchestrateur (lib.rs) de le créer avant le prochain passage.
@@ -235,14 +250,32 @@ pub fn scan(graph: &BrainGraph, respect_user_folders: bool) -> ScanResult {
         .collect();
     let under_scan_root = |id: &str| ancestor_chain(id, &parent_of).iter().any(|a| scan_root_ids.contains(a));
 
+    // Sous-ensemble « dump » des dossiers de scan : leurs SOUS-dossiers ne sont
+    // pas des destinations (vrac vers vrac). Séparé de `scan_root_ids` depuis que
+    // Drive est triable : la racine du Drive n'est pas une cible, mais ses
+    // sous-dossiers en sont de vraies (ADR-0022 phase 1.3, `RECEIVING_SOURCES`).
+    let dump_root_ids: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|c| scan_root_ids.contains(c.id.as_str()))
+        .filter(|c| {
+            graph.nodes.iter().any(|n| {
+                n.connector.as_deref().is_some_and(|conn| DUMP_CONNECTORS.contains(&conn))
+                    && ancestor_chain(&n.id, &parent_of).contains(&c.id.as_str())
+            })
+        })
+        .map(|c| c.id.as_str())
+        .collect();
+    let under_dump_root = |id: &str| ancestor_chain(id, &parent_of).iter().any(|a| dump_root_ids.contains(a));
+
     // Conteneurs candidats pour le rattachement — jamais la racine, jamais un
-    // dossier de scan brut ni l'un de ses sous-dossiers (on range VERS un vrai
+    // dossier de scan brut ni un sous-dossier de dump (on range VERS un vrai
     // dossier thématique, pas d'un sous-dossier de Downloads vers un autre).
     let container_tokens: Vec<(&BrainNode, HashSet<String>)> = graph
         .nodes
         .iter()
         .filter(|n| n.kind == "container" && Some(&n.id) != root_id.as_ref())
-        .filter(|c| !scan_root_ids.contains(c.id.as_str()) && !under_scan_root(&c.id))
+        .filter(|c| !scan_root_ids.contains(c.id.as_str()) && !under_dump_root(&c.id))
         .map(|n| (n, tokens(&n.label)))
         .collect();
 
@@ -296,6 +329,13 @@ pub fn scan(graph: &BrainGraph, respect_user_folders: bool) -> ScanResult {
             // été rangé par un humain, contrairement à celui posé dans `Documents/`.
             // On ne garde donc comme candidat que le vrac DIRECTEMENT dans un dossier
             // scanné. Ne s'applique qu'aux sources de `RESPECT_SUBFOLDERS`.
+            //
+            // Le nombre de documents dans le sous-dossier n'entre PAS en compte
+            // (débat du 2026-08-19) : un dossier nommé qui n'en contient qu'un est
+            // un classement qui attend d'être rempli — et c'est déjà une
+            // destination valable pour l'ancrage par similarité (son centroïde
+            // existe), donc il se remplira tout seul. Le dissoudre reviendrait à le
+            // casser juste avant qu'il serve.
             if respect_user_folders && !direct_root_child {
                 let parent_is_scan_root = n.parent_id.as_deref()
                     .is_some_and(|p| scan_root_ids.contains(p));
@@ -2261,6 +2301,8 @@ mod tests {
             node("p:Documents", "Documents", "container", Some("root")),
             node("p:Documents/Clients", "Clients", "container", Some("p:Documents")),
             // Rangé à la main dans un sous-dossier → doit être laissé tranquille.
+            // UN SEUL document dedans, exprès : un dossier nommé qui n'en contient
+            // qu'un reste un classement (débat tranché le 2026-08-19).
             local_leaf("leaf:range", "proposition-2026", "p:Documents/Clients"),
             // Posé en vrac directement dans Documents → doit rester candidat.
             local_leaf("leaf:vrac", "scan001", "p:Documents"),
@@ -2284,6 +2326,43 @@ mod tests {
             .collect();
         assert!(touches_avant.contains(&"leaf:range"),
             "drapeau à false = comportement d'avant, donc marche arrière réelle : {touches_avant:?}");
+    }
+
+    /// ADR-0020 niveau 2 pour Drive (décision Liam 2026-08-19) : l'arbo Drive est
+    /// gardée, mais le vrac posé à la racine du Drive devient rangeable. Avant,
+    /// `google-drive` était absent de `SORTABLE_CONNECTORS` : rien de Drive n'était
+    /// jamais examiné, vrac compris.
+    #[test]
+    fn drive_arbo_gardee_mais_vrac_de_la_racine_rangeable() {
+        let drive_leaf = |id: &str, label: &str, parent: &str| {
+            let mut n = node(id, label, "leaf", Some(parent));
+            n.connector = Some("google-drive".into());
+            n
+        };
+        let g = graph(vec![
+            node("root", "Cerveau", "root", None),
+            node("p:Drive", "Google Drive", "container", Some("root")),
+            node("p:Drive/Factures", "Factures", "container", Some("p:Drive")),
+            node("p:Drive/Assurance", "Assurance habitation", "container", Some("p:Drive")),
+            // Classement humain → intouchable.
+            drive_leaf("d:range", "facture-ideeri-01", "p:Drive/Factures"),
+            drive_leaf("d:range2", "facture-ideeri-02", "p:Drive/Factures"),
+            // Dossier nommé avec UN SEUL document : classement qui attend d'être
+            // rempli, protégé au même titre (débat tranché le 2026-08-19).
+            drive_leaf("d:seul", "attestation-2026", "p:Drive/Assurance"),
+            // Vrac à la racine du Drive → candidat, comme le vrac dans Documents.
+            drive_leaf("d:vrac", "SCAN_20260414_0001", "p:Drive"),
+        ]);
+        let r = scan(&g, true);
+        let touches: Vec<&str> = r.moves.iter().map(|m| m.node_id.as_str())
+            .chain(r.orphans_unresolved_ids.iter().map(String::as_str))
+            .chain(r.theme_clusters.iter().flat_map(|c| c.node_ids.iter().map(String::as_str)))
+            .collect();
+        assert!(touches.contains(&"d:vrac"), "le vrac Drive doit être candidat : {touches:?}");
+        assert!(!touches.contains(&"d:range") && !touches.contains(&"d:range2"),
+            "l'arbo Drive reste intouchée : {touches:?}");
+        assert!(!touches.contains(&"d:seul"),
+            "un dossier Drive nommé à 1 document reste un classement : {touches:?}");
     }
 
     /// Bande « certain » (ADR-0022) : deux documents au même texte sont le MÊME

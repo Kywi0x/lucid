@@ -802,12 +802,6 @@ fn embed_probe(token: &str) -> bool {
         .is_some_and(|len| len > 0)
 }
 
-/// Le moteur d'embedding est-il RÉELLEMENT utilisable ici et maintenant ?
-/// Démarre le serveur si besoin (donc coûteux au premier appel : chargement du
-/// modèle). À utiliser avant de choisir un chemin de rangement — contrairement à
-/// `embed_model_available()`, qui ne dit que « le fichier .gguf est sur le disque ».
-pub fn embed_engine_ready() -> bool { ensure_embed_server().is_some() }
-
 /// Démarre (ou réutilise) le serveur d'embedding. `None` si binaire ou modèle
 /// absent, ou démarrage échoué. Renvoie la clé d'API.
 fn ensure_embed_server() -> Option<String> {
