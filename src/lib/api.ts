@@ -260,6 +260,8 @@ export interface AiDiagnostics {
   gen_model: string | null;
   gen_model_present: boolean;
   embed_model_present: boolean;
+  /** Débit de génération de la dernière requête (tokens/s), null si rien servi. */
+  gen_tokens_per_second: number | null;
   log_tail: string;
   gen_server_log: string;
   embed_server_log: string;

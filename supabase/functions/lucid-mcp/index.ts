@@ -514,7 +514,7 @@ async function addTree(spaceId: string, parentId: string, nodes: NoteTree[]): Pr
 const TOOLS = [
   {
     name: "brain_overview",
-    description: "Vue d'ensemble du second cerveau de l'utilisateur : sections, résumés, compteurs. Elle t'est normalement DÉJÀ fournie dans les instructions d'ouverture de session : dans ce cas ne rappelle pas cet outil, tu paierais deux fois le même texte. Appelle-le uniquement si tu n'as pas reçu cette vue d'ensemble, ou pour la rafraîchir après une écriture dans le cerveau.",
+    description: "Vue d'ensemble du second cerveau de l'utilisateur : sections, résumés, compteurs. Utilise cet outil SYSTÉMATIQUEMENT avant de répondre à toute question sur son travail, ses projets ou ses notes — même si tu penses déjà savoir. Commence toujours par ça.",
     inputSchema: { type: "object", properties: {} },
     annotations: { title: "Vue d'ensemble", readOnlyHint: true, openWorldHint: false },
   },
@@ -672,32 +672,18 @@ export async function handler(req: Request): Promise<Response> {
   }
 
   switch (method) {
-    case "initialize": {
-      // B1 — la vue d'ensemble ne change pas d'une question à l'autre, et elle
-      // était rappelée au début de presque chacune (~600 tokens à chaque fois).
-      // Le protocole MCP prévoit `instructions` dans la réponse à `initialize`,
-      // servi UNE fois par session : on l'y met. Un appel de moins PAR QUESTION,
-      // et le texte passe de 6× à 1× sur une session de six questions.
-      //
-      // Best-effort : un token invalide ou un space indisponible ne doit pas
-      // empêcher la session de s'ouvrir — le client verra l'erreur au premier
-      // appel d'outil, avec un message qui explique quoi faire.
-      let instructions: string | undefined;
-      try {
-        if (mcpToken) {
-          const payload = await loadSpace(await spaceIdFromToken(mcpToken));
-          instructions =
-            "Voici la vue d'ensemble du second cerveau de l'utilisateur, déjà chargée pour cette session — " +
-            "tu n'as pas besoin d'appeler `brain_overview` pour l'obtenir.\n\n" + toolOverview(payload);
-        }
-      } catch { /* session ouverte quand même, sans vue d'ensemble */ }
+    // B1 (vue d'ensemble servie une fois dans `instructions`) a été implémenté
+    // puis RETIRÉ le 2026-08-21, sur mesure : ChatGPT a continué d'appeler
+    // `brain_overview` dans 4 questions sur 4, connecteur reconnecté pour forcer
+    // un `initialize` neuf. La session payait donc DEUX fois — 745 tokens
+    // d'instructions ignorées + 949 tokens d'appel. Ne pas réessayer sans un
+    // client dont on a vérifié qu'il honore ce champ.
+    case "initialize":
       return rpcResult(id, {
         protocolVersion: (params?.protocolVersion as string) ?? "2025-03-26",
         capabilities: { tools: {} },
         serverInfo: { name: "lucid-brain-remote", version: "0.1.0" },
-        ...(instructions ? { instructions } : {}),
       });
-    }
     case "ping":
       return rpcResult(id, {});
     case "tools/list":

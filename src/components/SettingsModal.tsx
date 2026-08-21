@@ -1410,6 +1410,16 @@ function AccountSection({ onRestored }: { onRestored?: () => void }) {
                 `Binaire llama-server (serveur + embeddings): ${yn(d.server_binary)}`,
                 `Modèle génération: ${d.gen_model ?? "—"} (présent: ${yn(d.gen_model_present)})`,
                 `Modèle embedding (BGE-M3): ${yn(d.embed_model_present)}`,
+                // Le chiffre qui dit si le GPU travaille. Sans lui, un scan de
+                // 85 minutes ressemble à un blocage et personne ne sait pourquoi
+                // (run Windows du 06/08 : 8,76 tok/s, CPU pur).
+                `Débit génération: ${
+                  d.gen_tokens_per_second == null
+                    ? "— (aucune génération depuis le démarrage)"
+                    : `${d.gen_tokens_per_second.toFixed(1)} tok/s${
+                        d.gen_tokens_per_second < 20 ? " ⚠️ CPU pur probable — scan très lent" : ""
+                      }`
+                }`,
                 "--- llama-server (génération) stderr ---",
                 d.gen_server_log || "(vide — serveur jamais démarré)",
                 "--- llama-server (embedding) stderr ---",

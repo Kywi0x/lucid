@@ -27,8 +27,15 @@ const readEnvFile = async (): Promise<string | undefined> => {
 const args = process.argv.slice(2);
 // Compat : si le 1ᵉʳ argument ressemble à une URL, c'est l'ancienne forme d'appel.
 const inlineUrl = args[0]?.startsWith("http") ? args.shift() : undefined;
-const url = inlineUrl ?? process.env.LUCID_MCP_URL ?? (await readEnvFile());
+// Les chevrons du placeholder (`<url>`) et les guillemets se recopient tout seuls
+// depuis une doc — les retirer coûte une ligne et évite un « Invalid URL » opaque.
+const clean = (u?: string) => u?.trim().replace(/^[<"']+|[>"']+$/g, "");
+const url = clean(inlineUrl ?? process.env.LUCID_MCP_URL ?? (await readEnvFile()));
 const query = args[0];
+if (url && !/^https?:\/\//.test(url)) {
+  console.error(`URL invalide : elle doit commencer par https:// (lue : ${url.slice(0, 24)}…)`);
+  process.exit(1);
+}
 if (!url || !query) {
   console.error('Usage: node scripts/measure-mcp-live.ts "<question>"');
   console.error("L'URL du MCP se lit dans LUCID_MCP_URL ou dans .env.mcp (jamais en argument).");

@@ -11,11 +11,41 @@ absent du corpus) et « taxe foncière » (contrôle négatif) matchent aujourd'
 vrais documents, mais dans **les notes qui parlent du test** (ADR-0022, la note ci-dessus, les
 sessions Claude Code archivées). Le cerveau s'est auto-contaminé par sa propre méta-documentation.
 
-Mots vérifiés **absents** du corpus au 2026-08-05, utilisables comme contrôles :
-`dentiste`, `hypothèque`, `testament`, `succession`. À re-vérifier avant chaque campagne :
+### Les contrôles négatifs sont à USAGE UNIQUE
+
+Deux vecteurs de contamination, et le second est le plus vicieux :
+
+1. **La documentation du test elle-même.** La note de journal qui raconte une campagne cite les
+   mots de contrôle → au scan suivant, ils sont dans le cerveau.
+2. **Les sessions Claude Code.** Le connecteur indexe les transcriptions du terminal. Choisir un
+   mot de contrôle *en en discutant dans une session Claude Code* le brûle avant même de l'avoir
+   utilisé. **Choisis-le sans l'écrire dans une session, ou utilise-le le jour même.**
+
+État au 2026-08-21 (sondé sur `brain.db` en incluant `source_text` — le contenu Obsidian n'est
+PAS dans la colonne `content`, une sonde qui l'oublie répond 0 partout et rassure à tort) :
+
+| Mot | Occurrences | État |
+|---|---|---|
+| `dentiste` | 2 | ❌ grillé par la note du 2026-08-05 |
+| `succession` | 2 | ❌ grillé |
+| `testament` | 1 | ❌ grillé |
+| `hypothèque` | 0 | ✅ (et le piège tient : des dossiers immobiliers existent) |
+| `kinésithérapeute` | 0 | ✅ vérifié aussi sur le space déployé le 21/08 |
+| `plongée`, `aquarium`, `scooter` | 0 | ✅ en réserve |
+
+Sonde locale (gratuite, instantanée) :
 
 ```bash
-node scripts/measure-mcp-live.ts "<url-mcp>" "dentiste"   # « Aucun résultat » = encore utilisable
+DB=~/Library/Application\ Support/com.lucidflow.lucid/users/<uuid>/brain.db
+sqlite3 "$DB" "select count(*) from nodes where lower(label||' '||coalesce(summary,'')||' '||\
+  coalesce(keywords,'')||' '||coalesce(content,'')||' '||coalesce(source_text,'')) like '%<mot>%';"
+```
+
+Confirmation sur le space réellement servi au MCP (l'URL se lit dans `.env.mcp`, jamais en
+argument — un argument finit dans l'historique du shell) :
+
+```bash
+node scripts/measure-mcp-live.ts "<mot>"   # « Aucune des N pages… » = encore utilisable
 ```
 
 ## Protocole
@@ -47,7 +77,7 @@ inventée compte comme un échec — c'est tout l'objet des contrôles négatifs
 | 6 | Qu'a-t-on décidé sur la recherche sémantique, et qu'est-ce qui ferait rouvrir la décision ? | note longue, lecture d'un passage précis | différée + le déclencheur « modèle client plus faible » |
 | 7 | Quelle est la répartition des parts entre Lucas et moi ? | note unique, réponse courte | 50-50 |
 | 8 | Où est rangé le tuto de la chorale, et combien de documents contient-il ? | navigation d'arborescence, pas de contenu | le conteneur + 6 documents |
-| 9 | Quel est le montant de mes frais de dentiste en 2025 ? | **contrôle négatif** (mot absent) | « je ne trouve pas » — aucune invention |
+| 9 | Quel est le montant de mes frais de kinésithérapeute en 2025 ? | **contrôle négatif** (mot absent) | « je ne trouve pas » — aucune invention |
 | 10 | À combien s'élève mon hypothèque sur l'appartement de Lyon ? | **contrôle négatif piégé** : `hypothèque` absent, mais un dossier « Immobilier Lyon » existe | « je ne trouve pas », sans broder à partir des documents immobiliers |
 
 ## Série conceptuelle (6)

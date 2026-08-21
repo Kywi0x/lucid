@@ -989,6 +989,50 @@ static FAILED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// cumulatif, les lecteurs comparent deux relevés.
 static TOTAL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Débit de génération de la DERNIÈRE requête servie, lu dans le log de
+/// `llama-server`. C'est le seul chiffre qui distingue un build GPU d'un build
+/// CPU sans rien relancer : ~55-60 tok/s sur Metal (mesuré 21/08), **8,76 tok/s**
+/// sur le run Windows CPU pur du 06/08 — soit 85 minutes pour 679 documents.
+///
+/// On lit le log plutôt que de chronométrer un appel de test : c'est gratuit,
+/// ça ne réveille pas le modèle, et le chiffre vient du moteur lui-même.
+pub fn last_generation_speed() -> Option<f32> {
+    // `shared_data_dir` et NON `app_data_dir` : les logs des serveurs sont écrits
+    // au niveau MACHINE (cf. `server_stderr`), pas dans le dossier du compte
+    // actif. Lire au mauvais endroit rendait simplement `None`, et le diagnostic
+    // annonçait « aucune génération » alors que le log débordait de timings
+    // (trouvé en testant sur le vrai diagnostic, 2026-08-21).
+    let path = shared_data_dir()?.join(GEN_SERVER_LOG);
+    parse_eval_speed(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Cœur testable : dernier `eval time = … ( … , X tokens per second)` du log.
+/// On IGNORE `prompt eval time` — c'est le débit de lecture du prompt, bien plus
+/// élevé (570 tok/s sur la même machine où la génération est à 55), le confondre
+/// ferait passer un CPU pour un GPU.
+fn parse_eval_speed(log: &str) -> Option<f32> {
+    log.lines()
+        .rev()
+        .filter(|l| l.contains("eval time =") && !l.contains("prompt eval time"))
+        .find_map(|l| {
+            let after = l.rsplit_once(',')?.1;
+            let num = after.trim().split_whitespace().next()?;
+            num.parse::<f32>().ok()
+        })
+}
+
+#[cfg(test)]
+mod speed_tests {
+    #[test]
+    fn lit_le_debit_de_generation_pas_celui_du_prompt() {
+        let log = "0.1 I slot print_timing: id 3 | prompt eval time =  3395.59 ms / 297 tokens (  11.43 ms per token,   570.19 tokens per second)
+0.2 I slot print_timing: id 3 |        eval time =    97.04 ms /   6 tokens (  16.17 ms per token,    61.83 tokens per second)
+0.3 I slot      release: id 3 | stop processing";
+        assert_eq!(super::parse_eval_speed(log), Some(61.83), "le débit du PROMPT (570) ne doit jamais être pris pour celui de la génération");
+        assert_eq!(super::parse_eval_speed("aucun timing ici"), None);
+    }
+}
+
 /// Nombre cumulé d'appels de génération en échec depuis le lancement.
 pub fn failed_calls() -> usize {
     FAILED_CALLS.load(std::sync::atomic::Ordering::Relaxed)

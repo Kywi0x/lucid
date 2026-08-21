@@ -38,3 +38,6 @@ dist-viewer/
 
 # Fixtures de test contenant des données réelles (brain.json de Liam) — jamais commit
 src-tauri/tests/fixtures/
+
+# CLI Supabase — état local de la liaison au projet
+supabase/.temp/

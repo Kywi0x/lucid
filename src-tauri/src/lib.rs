@@ -2668,6 +2668,11 @@ struct AiDiagnostics {
     gen_model: Option<String>,
     gen_model_present: bool,
     embed_model_present: bool,
+    /// Débit de génération de la dernière requête (tokens/s), `None` si le serveur
+    /// n'a encore rien servi. Sur Windows c'est LE chiffre qui dit si le build
+    /// Vulkan a trouvé un GPU : ~8 tok/s = CPU pur (85 min pour 679 documents),
+    /// plusieurs dizaines = GPU. Repère Mac/Metal mesuré le 21/08 : 55-62 tok/s.
+    gen_tokens_per_second: Option<f32>,
     log_tail: String,
     /// stderr du dernier démarrage du serveur de génération (raison d'un crash).
     gen_server_log: String,
@@ -2697,6 +2702,7 @@ fn ai_diagnostics() -> AiDiagnostics {
         gen_model: ai::llama::active_model_stored().map(|m| m.name),
         gen_model_present: ai::llama::generation_model_available(),
         embed_model_present: ai::llama::embed_model_available(),
+        gen_tokens_per_second: ai::llama::last_generation_speed(),
         log_tail: tail_data_file("lucid.log", 60),
         gen_server_log: tail_data_file(ai::llama::GEN_SERVER_LOG, 40),
         embed_server_log: tail_data_file(ai::llama::EMBED_SERVER_LOG, 40),

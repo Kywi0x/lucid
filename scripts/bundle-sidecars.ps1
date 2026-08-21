@@ -1,6 +1,7 @@
 # ─── Lucid — sidecars du bundle Windows ──────────────────────────────────────
 # Prépare les binaires externes attendus par tauri.windows.conf.json :
-#   - llama-completion.exe (= llama-cli.exe de la release officielle llama.cpp, CPU)
+#   - llama-completion.exe (= llama-cli.exe de la release officielle llama.cpp, build
+#     Vulkan : GPU si le pilote le permet, repli CPU automatique sinon — cf. §1)
 #     + les DLL de llama.cpp dans resources/win-libs/ (posées à côté de l'exe)
 #   - poppler (pdftotext/pdftoppm + DLL) dans resources/win-poppler/ → bundle poppler/
 #   - tesseract (+ DLL) dans resources/win-tesseract/               → bundle tesseract/
@@ -27,18 +28,40 @@ New-Item -ItemType Directory -Force -Path $BinDir, $LibDir, $PopDir, $TesDir, $T
 $ghHeaders = @{ "User-Agent" = "lucid-ci" }
 if ($env:GITHUB_TOKEN) { $ghHeaders["Authorization"] = "Bearer $($env:GITHUB_TOKEN)" }
 
-Write-Host "── 1/3 llama-completion (release officielle llama.cpp, CPU x64)"
-# On veut STRICTEMENT l'archive CPU x64 (contient llama-cli.exe + DLL ggml).
-# `latest` publie ses assets par vagues : l'exe CPU peut manquer quelques minutes
-# alors que les zips cudart/cuda sont déjà là. On balaie donc les dernières releases
-# jusqu'à en trouver une avec l'asset CPU (pas de fallback → jamais un zip cudart).
+Write-Host "── 1/3 llama-completion (release officielle llama.cpp, Vulkan x64)"
+# ARCHIVE VULKAN, pas CPU (A3, 2026-08-21). Le run Windows du 06/08 tournait à
+# 8,76 tok/s en génération — du CPU pur — soit ~85 min pour un premier scan de
+# 679 documents. C'est la différence entre « je lance et je reviens » et
+# « j'abandonne ».
+#
+# Vulkan plutôt que CUDA : CUDA coûterait 251 Mo + 391 Mo de cudart et ne
+# marcherait que sur NVIDIA. Vulkan fait 35 Mo (contre 18,6 en CPU, donc +16 Mo
+# dans l'installeur) et couvre NVIDIA, AMD et Intel avec le pilote du système.
+#
+# Aucun risque de perdre le CPU : l'archive Vulkan contient AUSSI les 15 DLL
+# `ggml-cpu-*` (vérifié le 21/08 sur b10549). ggml charge ses backends
+# dynamiquement — sans GPU exploitable, `ggml-vulkan.dll` est simplement ignorée
+# et la génération retombe sur le CPU. C'est un sur-ensemble, pas un échange.
+#
+# `latest` publie ses assets par vagues : on balaie les dernières releases
+# jusqu'à en trouver une complète. Repli explicite sur l'archive CPU si aucune
+# Vulkan n'est disponible — mieux vaut un build lent qu'un build cassé, et on
+# le DIT (ADR-0015 : jamais d'échec silencieux).
 $releases = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" -Headers $ghHeaders
 $asset = $null
 foreach ($r in $releases) {
-    $asset = $r.assets | Where-Object { $_.name -like "*bin-win-cpu-x64.zip" } | Select-Object -First 1
+    $asset = $r.assets | Where-Object { $_.name -like "*bin-win-vulkan-x64.zip" } | Select-Object -First 1
     if ($asset) { break }
 }
-if (-not $asset) { throw "Aucun asset llama.cpp *bin-win-cpu-x64.zip dans les 10 dernières releases." }
+if (-not $asset) {
+    Write-Warning "Aucune archive Vulkan dans les 10 dernières releases → repli sur l'archive CPU."
+    Write-Warning "Conséquence : génération ~6x plus lente sur GPU récent (8,76 tok/s mesurés en CPU pur)."
+    foreach ($r in $releases) {
+        $asset = $r.assets | Where-Object { $_.name -like "*bin-win-cpu-x64.zip" } | Select-Object -First 1
+        if ($asset) { break }
+    }
+}
+if (-not $asset) { throw "Aucun asset llama.cpp win-x64 (ni vulkan ni cpu) dans les 10 dernières releases." }
 Write-Host "   → $($asset.name)"
 
 $zip = Join-Path $env:TEMP $asset.name

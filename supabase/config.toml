@@ -1,0 +1,12 @@
+# Config CLI Supabase — volontairement minimale : on ne pilote que les Edge Functions
+# depuis ce dépôt, pas la base ni l'auth.
+project_id = "ahvlnejmuouibvjdical"
+
+[functions.lucid-mcp]
+# NE PAS RETIRER. Le MCP est appelé par ChatGPT/Claude SANS header Authorization :
+# le jeton voyage dans l'URL (`?token=`). Or `supabase functions deploy` réactive
+# la vérification du JWT PAR DÉFAUT — un déploiement sans cette ligne (ou sans le
+# flag `--no-verify-jwt`) casse le MCP en production, et l'erreur ressemble à un
+# bug de code côté client. Vérifié le 2026-08-21 : la version 21 en ligne tourne
+# bien avec verify_jwt = false.
+verify_jwt = false
