@@ -2,13 +2,36 @@
 // `brain_node` avec `query` (passages ciblés) vs sans (début de page).
 // N'affiche que des TAILLES — aucun contenu, aucune donnée personnelle.
 //
-//   node scripts/measure-mcp-live.ts "<url-mcp-avec-token>" "<question>"
+//   node scripts/measure-mcp-live.ts "<question>"
 //
-// L'URL contient un token : passe-la en argument, ne la commite pas.
+// L'URL du MCP contient un TOKEN : elle ne se passe plus en argument (un argument
+// finit dans l'historique du shell, dans `ps`, et dans le transcript d'une session
+// d'assistant). Mets-la dans `.env.mcp` à la racine — gitignoré par la règle
+// `.env.*` — ou dans la variable d'environnement `LUCID_MCP_URL` :
+//
+//   echo 'LUCID_MCP_URL=https://…/lucid-mcp?token=…' > .env.mcp
+//
+// L'ancienne forme (URL en 1ᵉʳ argument) reste acceptée pour ne rien casser.
 
-const [url, query] = process.argv.slice(2);
+const readEnvFile = async (): Promise<string | undefined> => {
+  try {
+    const raw = await (await import("node:fs/promises")).readFile(".env.mcp", "utf8");
+    return raw.split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.startsWith("LUCID_MCP_URL="))
+      ?.slice("LUCID_MCP_URL=".length)
+      .replace(/^["']|["']$/g, "");
+  } catch { return undefined; }
+};
+
+const args = process.argv.slice(2);
+// Compat : si le 1ᵉʳ argument ressemble à une URL, c'est l'ancienne forme d'appel.
+const inlineUrl = args[0]?.startsWith("http") ? args.shift() : undefined;
+const url = inlineUrl ?? process.env.LUCID_MCP_URL ?? (await readEnvFile());
+const query = args[0];
 if (!url || !query) {
-  console.error('Usage: node scripts/measure-mcp-live.ts "<url-mcp>" "<question>"');
+  console.error('Usage: node scripts/measure-mcp-live.ts "<question>"');
+  console.error("L'URL du MCP se lit dans LUCID_MCP_URL ou dans .env.mcp (jamais en argument).");
   process.exit(1);
 }
 

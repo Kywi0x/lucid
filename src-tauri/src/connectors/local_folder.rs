@@ -270,9 +270,22 @@ pub fn sync(mut on_progress: impl FnMut(usize, usize, &str)) -> Result<SyncRepor
             skipped.push(format!("{rel} — fichier > 100 Mo, ignoré"));
             continue;
         }
+        // A2 — un échec qui a déjà coûté cher (OCR à 177 s pour rien) n'est pas
+        // rejoué tant que le fichier n'a pas bougé. Il reste compté comme
+        // illisible : on économise le temps, pas l'aveu.
+        let key = format!("{SOURCE}::{id}");
+        let stamp = mtime.as_deref().unwrap_or("");
+        if let Some(reason) = super::known_extract_failure(&key, stamp) {
+            skipped.push(format!("{rel} — {reason} (déjà tenté, non rejoué)"));
+            continue;
+        }
+        let started = std::time::Instant::now();
         match file_to_conversation(&root_str, &rel, &abs) {
             Ok(c) => { new_count += 1; out.push(c); }
-            Err(e) => skipped.push(format!("{rel} — {e}")),
+            Err(e) => {
+                super::remember_extract_failure(&key, stamp, &e, started.elapsed());
+                skipped.push(format!("{rel} — {e}"));
+            }
         }
     }
 

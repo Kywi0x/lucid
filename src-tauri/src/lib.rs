@@ -2414,6 +2414,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             connected: connectors::claude_code::projects_dir().is_some(),
             last_sync: cc_sync,
             conversation_count: cc_convs.len(),
+            reconnect_reason: None,
             needs_setup: false,
         },
         {
@@ -2433,6 +2434,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
                 connected: connectors::cowork::sessions_dir().is_some(),
                 last_sync: cw_sync,
                 conversation_count: cw_convs.len(),
+                reconnect_reason: None,
                 needs_setup: false,
             }
         },
@@ -2445,6 +2447,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
                 connected: connectors::google_drive::is_connected(),
                 last_sync: gd_sync,
                 conversation_count: gd_convs.len(),
+                reconnect_reason: connectors::google_drive::reconnect_reason(),
                 needs_setup: false,
             }
         },
@@ -2454,6 +2457,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             connected: connectors::obsidian::is_connected(),
             last_sync: None,
             conversation_count: connectors::obsidian::count_files(),
+            reconnect_reason: None,
             needs_setup: !connectors::obsidian::is_connected(),
         },
         {
@@ -2465,6 +2469,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
                 connected: connectors::local_folder::is_connected(),
                 last_sync: lf_sync,
                 conversation_count: lf_convs.len(),
+                reconnect_reason: None,
                 needs_setup: !connectors::local_folder::is_connected(),
             }
         },
@@ -2487,6 +2492,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             connected: true,
             last_sync: ai_sync,
             conversation_count: ai_convs.len(),
+            reconnect_reason: None,
             needs_setup: false,
         });
     }
@@ -2498,6 +2504,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             connected: true,
             last_sync: cg_convs.iter().filter_map(|c| c.summary.last_timestamp.clone()).max(),
             conversation_count: cg_convs.len(),
+            reconnect_reason: None,
             needs_setup: false,
         });
     }
@@ -2513,6 +2520,7 @@ fn connectors_status() -> Vec<ConnectorStatus> {
             connected: connectors::apple_notes::is_connected(),
             last_sync: an_sync,
             conversation_count: an_convs.len(),
+            reconnect_reason: None,
             needs_setup: !connectors::apple_notes::is_connected(),
         });
     }

@@ -126,6 +126,11 @@ pub struct ConnectorStatus {
     /// true = credentials manquants, l'UI propose de les importer.
     #[serde(default)]
     pub needs_setup: bool,
+    /// Rempli quand la source était connectée et ne l'est plus (accès révoqué,
+    /// token expiré) : l'UI doit dire POURQUOI elle redemande une connexion,
+    /// sinon « non connecté » est indiscernable de « jamais connecté ».
+    #[serde(default)]
+    pub reconnect_reason: Option<String>,
 }
 
 /// Le graphe complet + ses sérialisations Markdown.

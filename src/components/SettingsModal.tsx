@@ -341,9 +341,21 @@ const SOURCE_ORIGIN: Record<string, string> = {
             )}
 
             {c.id === "google-drive" && !c.connected && (
-              <ActionBtn busy={busy} icon={<CheckCircle2 className="size-3.5" />} onClick={onConnect} primary>
-                Connecter Google Drive
-              </ActionBtn>
+              <>
+                {/* « Non connecté » ne doit pas être indiscernable de « ton accès
+                    a expiré » : sans cette ligne, une révocation Google se lisait
+                    comme un connecteur jamais branché, et la synchro s'arrêtait
+                    sans un mot. */}
+                {c.reconnect_reason && (
+                  <p className="rounded-lg bg-[var(--color-surface-2)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--color-muted)]">
+                    Ton accès Google Drive a expiré — la synchronisation est en pause.
+                    Reconnecte-toi pour la reprendre.
+                  </p>
+                )}
+                <ActionBtn busy={busy} icon={<CheckCircle2 className="size-3.5" />} onClick={onConnect} primary>
+                  {c.reconnect_reason ? "Reconnecter Google Drive" : "Connecter Google Drive"}
+                </ActionBtn>
+              </>
             )}
 
             {c.id === "google-drive" && c.connected && (

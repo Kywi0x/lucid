@@ -92,6 +92,13 @@ struct Tokens {
     refresh_token: Option<String>,
     /// Unix timestamp d'expiration.
     expires_at: i64,
+    /// Raison pour laquelle Google refuse DÉFINITIVEMENT de rafraîchir (accès
+    /// révoqué, refresh token expiré). Tant que c'est rempli, le connecteur se
+    /// déclare déconnecté : sans ça, `is_connected()` restait vrai à vie sur la
+    /// simple présence du fichier, chaque synchro échouait, et l'UI continuait
+    /// d'afficher « connecté » — l'échec silencieux interdit par l'ADR-0015.
+    #[serde(default)]
+    needs_reconnect: Option<String>,
 }
 
 fn tokens_path() -> Option<std::path::PathBuf> {
@@ -111,7 +118,23 @@ fn load_tokens() -> Option<Tokens> {
 }
 
 pub fn is_connected() -> bool {
-    load_tokens().is_some()
+    load_tokens().is_some_and(|t| t.needs_reconnect.is_none())
+}
+
+/// Pourquoi Drive demande une reconnexion, `None` si tout va bien. Remonté à
+/// l'UI pour distinguer « jamais connecté » de « accès expiré ».
+pub fn reconnect_reason() -> Option<String> {
+    load_tokens().and_then(|t| t.needs_reconnect)
+}
+
+/// Marque l'accès comme mort. On garde le fichier (et le refresh token) : c'est
+/// la reconnexion qui l'écrasera, et l'effacer ferait perdre la trace du motif.
+fn mark_needs_reconnect(reason: &str) {
+    let Some(mut t) = load_tokens() else { return };
+    if t.needs_reconnect.as_deref() == Some(reason) { return; }
+    crate::elog!("⚠️ Drive : accès expiré, reconnexion nécessaire — {reason}");
+    t.needs_reconnect = Some(reason.to_string());
+    let _ = save_tokens(&t);
 }
 
 // ─── Sélection de dossiers ───────────────────────────────────────────────────
@@ -222,11 +245,23 @@ fn valid_access_token() -> Result<String, String> {
 
     if let Some(err) = resp.get("error") {
         let desc = resp.get("error_description").and_then(|d| d.as_str()).unwrap_or("");
-        return Err(format!("Rafraîchissement refusé : {err} — {desc}"));
+        let msg = format!("Rafraîchissement refusé : {err} — {desc}");
+        // Une réponse d'erreur du serveur OAuth est un refus DÉFINITIF (accès
+        // révoqué, token expiré) : réessayer ne changera rien, seule une
+        // reconnexion débloque. Une panne réseau, elle, sort par le `?` de
+        // `.send()` plus haut et ne marque rien — on ne déconnecte pas
+        // l'utilisateur parce que son wifi a coupé.
+        mark_needs_reconnect(&msg);
+        return Err(msg);
     }
     let at = resp["access_token"].as_str().ok_or("Pas d'access_token.")?.to_string();
     let ei = resp["expires_in"].as_i64().unwrap_or(3600);
-    save_tokens(&Tokens { access_token: at.clone(), refresh_token: Some(rt), expires_at: unix_now() + ei })?;
+    save_tokens(&Tokens {
+        access_token: at.clone(),
+        refresh_token: Some(rt),
+        expires_at: unix_now() + ei,
+        needs_reconnect: None, // ça remarche : on efface la marque
+    })?;
     Ok(at)
 }
 
@@ -287,7 +322,7 @@ pub fn finish_connect(listener: TcpListener, redirect_uri: &str, code_verifier: 
     let at = resp["access_token"].as_str().ok_or("Pas d'access_token.")?.to_string();
     let rt = resp["refresh_token"].as_str().map(str::to_string);
     let ei = resp["expires_in"].as_i64().unwrap_or(3600);
-    save_tokens(&Tokens { access_token: at, refresh_token: rt, expires_at: unix_now() + ei })
+    save_tokens(&Tokens { access_token: at, refresh_token: rt, expires_at: unix_now() + ei, needs_reconnect: None })
 }
 
 /// Lit le premier GET du navigateur sur le socket, extrait le `code` OAuth.
@@ -790,6 +825,9 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
 
     let mut skipped = 0usize;
     let mut ignored: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Format supporté mais extraction sans résultat — distinct de `ignored`
+    // (format non lisible par nature) et de `skipped` (hors sélection).
+    let mut unreadable = 0usize;
 
     for f in all_files {
         // Ce qui n'est ni un document lisible ni un dossier (images, vidéos, zip…)
@@ -833,9 +871,24 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
             }
         }
 
+        // A2 — même mémoire d'échec que les dossiers locaux : sur Drive la note est
+        // encore plus salée, chaque essai repaie le TÉLÉCHARGEMENT avant l'OCR.
+        let key = format!("google-drive::{id}");
+        let stamp = modified.as_deref().unwrap_or("");
+        let name = f.name.clone();
+        if let Some(reason) = crate::connectors::known_extract_failure(&key, stamp) {
+            unreadable += 1;
+            crate::elog!("⏭️ Drive : {name} déjà illisible ({reason}), non rejoué.");
+            continue;
+        }
+        let started = std::time::Instant::now();
         if let Some(conv) = ingest_file(&client, &access_token, f, kind, &project, &project_slug, container_path) {
             convs.push(conv);
             new_count += 1;
+        } else {
+            unreadable += 1;
+            crate::connectors::remember_extract_failure(
+                &key, stamp, "aucun texte exploitable", started.elapsed());
         }
     }
 
@@ -844,6 +897,9 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
         convs.len(),
         if skipped > 0 { format!(" ({skipped} hors sélection)") } else { String::new() }
     );
+    if unreadable > 0 {
+        crate::elog!("   ↳ {unreadable} fichier(s) au format supporté mais sans texte exploitable.");
+    }
     if !ignored.is_empty() {
         let mut par_type: Vec<(String, usize)> = ignored.into_iter().collect();
         par_type.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1058,7 +1114,7 @@ pub fn pptx_to_markdown(path: &std::path::Path) -> Option<String> {
 
 /// Résout un binaire externe : sidecar du bundle d'abord (app packagée,
 /// binaire à côté de l'exécutable), puis Homebrew, puis le PATH.
-fn which_bin(name: &str) -> Option<String> {
+pub(super) fn which_bin(name: &str) -> Option<String> {
     // Sidecar embarqué, en dev COMME en release : `build.rs` pose désormais
     // `target/Resources` → `src-tauri/resources`, donc les dylibs cherchées en
     // `@executable_path/../Resources/libs/` se résolvent aussi hors bundle. Avant

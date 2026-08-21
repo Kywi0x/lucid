@@ -244,6 +244,45 @@ export function toolSearch(p: Payload, query: string): string {
   return out;
 }
 
+/// Les clients MCP passent un tableau tantôt comme tableau, tantôt comme chaîne
+/// JSON, tantôt comme liste séparée par des virgules. On accepte les trois plutôt
+/// que de punir le client qui n'a pas deviné la bonne forme (leçon du 06/08).
+export function idList(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map(String);
+  if (typeof raw !== "string") return [];
+  const t = raw.trim();
+  if (t.startsWith("[")) {
+    try { const j = JSON.parse(t); if (Array.isArray(j)) return j.map(String); } catch { /* pas du JSON : on tombe plus bas */ }
+  }
+  return t.includes(",") ? t.split(",").map((x) => x.trim()).filter(Boolean) : (t ? [t] : []);
+}
+
+/// B4 — plusieurs pages en UN appel. Un appel d'outil ne coûte pas que sa
+/// réponse : il impose un tour de modèle complet qui relit tout le contexte, deux
+/// fois. Trois lectures en un appel, c'est deux tours de modèle économisés — et
+/// c'est le cas fréquent quand les documents sont éparpillés hors d'un conteneur
+/// (quand ils sont DANS un conteneur, la lecture du conteneur suffit déjà).
+export const MAX_NODES_PER_CALL = 5;
+
+export function toolNodes(p: Payload, nodeIds: string[], opts: { query?: string; full?: boolean } = {}): string {
+  const ids = nodeIds.map((s) => String(s).trim()).filter(Boolean);
+  if (!ids.length) throw new Error("aucun id fourni (utilise brain_search pour en trouver)");
+  if (ids.length === 1) return toolNode(p, ids[0], opts);
+  const kept = ids.slice(0, MAX_NODES_PER_CALL);
+  // Une page introuvable ne doit pas faire échouer les autres : on le dit et on
+  // continue, sinon un seul mauvais id perd les quatre bonnes lectures.
+  const parts = kept.map((nodeId) => {
+    try { return toolNode(p, nodeId, opts); }
+    catch (e) { return `# (page illisible)\n\n- id : \`${nodeId}\`\n- erreur : ${(e as Error).message}\n`; }
+  });
+  let out = parts.join("\n\n---\n\n");
+  // Jamais de troncature muette : le modèle doit savoir qu'il lui reste des pages.
+  if (ids.length > kept.length) {
+    out += `\n\n---\n\n*${ids.length - kept.length} page(s) non lue(s) : ${MAX_NODES_PER_CALL} maximum par appel. Rappelle \`brain_node\` avec le reste.*\n`;
+  }
+  return out;
+}
+
 export function toolNode(p: Payload, nodeId: string, opts: { query?: string; full?: boolean } = {}): string {
   const byId = new Map(p.nodes.map((n) => [n.id, n]));
   const n = byId.get(nodeId);
@@ -475,7 +514,7 @@ async function addTree(spaceId: string, parentId: string, nodes: NoteTree[]): Pr
 const TOOLS = [
   {
     name: "brain_overview",
-    description: "Vue d'ensemble du second cerveau de l'utilisateur : sections, résumés, compteurs. Utilise cet outil SYSTÉMATIQUEMENT avant de répondre à toute question sur son travail, ses projets ou ses notes — même si tu penses déjà savoir. Commence toujours par ça.",
+    description: "Vue d'ensemble du second cerveau de l'utilisateur : sections, résumés, compteurs. Elle t'est normalement DÉJÀ fournie dans les instructions d'ouverture de session : dans ce cas ne rappelle pas cet outil, tu paierais deux fois le même texte. Appelle-le uniquement si tu n'as pas reçu cette vue d'ensemble, ou pour la rafraîchir après une écriture dans le cerveau.",
     inputSchema: { type: "object", properties: {} },
     annotations: { title: "Vue d'ensemble", readOnlyHint: true, openWorldHint: false },
   },
@@ -487,15 +526,15 @@ const TOOLS = [
   },
   {
     name: "brain_node",
-    description: "Lit une page (contenu, chemin, sous-pages) à partir de son id. À appeler après brain_overview/brain_search dès qu'une page semble pertinente, pour lire son contenu réel avant de répondre. Passe TOUJOURS `query` (les mots que tu cherches) : la page est alors réduite aux passages utiles au lieu de son début — une page peut peser plusieurs milliers de mots. Utilise `full` seulement s'il te manque du contexte.",
+    description: "Lit une ou PLUSIEURS pages (contenu, chemin, sous-pages) à partir de leur id. À appeler après brain_search dès qu'une page semble pertinente, pour lire son contenu réel avant de répondre. Si plusieurs pages t'intéressent, passe-les toutes d'un coup dans `node_ids` (jusqu'à 5) au lieu d'enchaîner les appels. Passe TOUJOURS `query` (les mots que tu cherches) : les pages sont alors réduites aux passages utiles au lieu de leur début — une page peut peser plusieurs milliers de mots. Utilise `full` seulement s'il te manque du contexte.",
     inputSchema: {
       type: "object",
       properties: {
-        node_id: { type: "string" },
-        query: { type: "string", description: "ce que tu cherches dans cette page (mots-clés ou question) — renvoie les passages pertinents" },
-        full: { type: "boolean", description: "true = page entière (coûteux, à réserver aux cas où les passages ne suffisent pas)" },
+        node_id: { type: "string", description: "id d'une page (ou utilise node_ids pour en lire plusieurs)" },
+        node_ids: { type: "array", items: { type: "string" }, description: "plusieurs ids à lire en un seul appel (5 maximum)" },
+        query: { type: "string", description: "ce que tu cherches dans ces pages (mots-clés ou question) — renvoie les passages pertinents" },
+        full: { type: "boolean", description: "true = pages entières (coûteux, à réserver aux cas où les passages ne suffisent pas)" },
       },
-      required: ["node_id"],
     },
     annotations: { title: "Lire une page", readOnlyHint: true, openWorldHint: false },
   },
@@ -633,12 +672,32 @@ export async function handler(req: Request): Promise<Response> {
   }
 
   switch (method) {
-    case "initialize":
+    case "initialize": {
+      // B1 — la vue d'ensemble ne change pas d'une question à l'autre, et elle
+      // était rappelée au début de presque chacune (~600 tokens à chaque fois).
+      // Le protocole MCP prévoit `instructions` dans la réponse à `initialize`,
+      // servi UNE fois par session : on l'y met. Un appel de moins PAR QUESTION,
+      // et le texte passe de 6× à 1× sur une session de six questions.
+      //
+      // Best-effort : un token invalide ou un space indisponible ne doit pas
+      // empêcher la session de s'ouvrir — le client verra l'erreur au premier
+      // appel d'outil, avec un message qui explique quoi faire.
+      let instructions: string | undefined;
+      try {
+        if (mcpToken) {
+          const payload = await loadSpace(await spaceIdFromToken(mcpToken));
+          instructions =
+            "Voici la vue d'ensemble du second cerveau de l'utilisateur, déjà chargée pour cette session — " +
+            "tu n'as pas besoin d'appeler `brain_overview` pour l'obtenir.\n\n" + toolOverview(payload);
+        }
+      } catch { /* session ouverte quand même, sans vue d'ensemble */ }
       return rpcResult(id, {
         protocolVersion: (params?.protocolVersion as string) ?? "2025-03-26",
         capabilities: { tools: {} },
         serverInfo: { name: "lucid-brain-remote", version: "0.1.0" },
+        ...(instructions ? { instructions } : {}),
       });
+    }
     case "ping":
       return rpcResult(id, {});
     case "tools/list":
@@ -683,7 +742,7 @@ export async function handler(req: Request): Promise<Response> {
         const text =
           name === "brain_overview" ? toolOverview(payload) :
           name === "brain_search" ? toolSearch(payload, args.query ?? "") :
-          name === "brain_node" ? toolNode(payload, args.node_id ?? "", { query: args.query, full: args.full === true || args.full === "true" }) :
+          name === "brain_node" ? toolNodes(payload, idList(args.node_ids ?? args.node_id), { query: args.query, full: args.full === true || args.full === "true" }) :
           (() => { throw new Error(`tool inconnu : ${name}`); })();
         return rpcResult(id, { content: [{ type: "text", text }] });
       } catch (e) {

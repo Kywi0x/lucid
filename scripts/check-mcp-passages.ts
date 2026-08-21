@@ -3,7 +3,7 @@
 //
 //   node scripts/check-mcp-passages.ts        (Node ≥ 22 retire les types tout seul)
 
-import { relevantPassages, toolNode } from "../supabase/functions/lucid-mcp/index.ts";
+import { idList, MAX_NODES_PER_CALL, relevantPassages, toolNode, toolNodes } from "../supabase/functions/lucid-mcp/index.ts";
 
 const ok = (cond: unknown, msg: string) => {
   if (!cond) throw new Error(`ÉCHEC : ${msg}`);
@@ -97,5 +97,38 @@ const usd = {
 };
 ok(toolNode(usd, "d2").includes("$25.00"), "conteneur sans query : montant en dollars, symbole devant le nombre");
 ok(blindAgg.length < 12_000, `conteneur sans query : budget tenu (${blindAgg.length} car.)`);
+
+// ── B4 — lecture multi-pages en un appel ────────────────────────────────────
+// Un appel d'outil = un tour de modèle complet : lire 3 pages en 1 appel au lieu
+// de 3 économise deux tours, pas seulement des tokens.
+const multi = {
+  title: "t",
+  nodes: [
+    { id: "a", label: "Page A", kind: "leaf", content: "Le loyer est de 850 euros." },
+    { id: "b", label: "Page B", kind: "leaf", content: "Le depot equivaut a un mois." },
+    { id: "c", label: "Page C", kind: "leaf", content: "Attestation exigee chaque annee." },
+  ],
+};
+const three = toolNodes(multi, ["a", "b", "c"]);
+ok(three.includes("Page A") && three.includes("Page B") && three.includes("Page C"),
+  "multi : les trois pages sont servies en un appel");
+ok(toolNodes(multi, ["a"]) === toolNode(multi, "a"),
+  "multi : un seul id rend exactement ce que rendait brain_node (aucune régression)");
+
+// Un mauvais id ne doit pas perdre les bonnes lectures.
+const partial = toolNodes(multi, ["a", "inconnu", "c"]);
+ok(partial.includes("Page A") && partial.includes("Page C"), "multi : un id introuvable n'annule pas les autres");
+ok(partial.includes("illisible"), "multi : l'id introuvable est signalé, pas avalé");
+
+// Plafond annoncé, jamais muet.
+const many = toolNodes(multi, ["a", "b", "c", "a", "b", "c", "a"]);
+ok(many.includes("non lue"), `multi : au-delà de ${MAX_NODES_PER_CALL} pages, le reste est ANNONCÉ`);
+
+// Les clients sérialisent les tableaux de trois façons : on accepte les trois.
+ok(idList(["a", "b"]).join() === "a,b", "idList : tableau natif");
+ok(idList('["a","b"]').join() === "a,b", "idList : tableau sérialisé en JSON");
+ok(idList("a, b").join() === "a,b", "idList : liste séparée par des virgules");
+ok(idList("a").join() === "a", "idList : id simple");
+ok(idList(undefined).length === 0, "idList : rien du tout");
 
 console.log("\nTous les checks passent.");

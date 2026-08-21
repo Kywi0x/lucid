@@ -118,6 +118,8 @@ export interface ConnectorStatus {
   last_sync: string | null;
   conversation_count: number;
   needs_setup?: boolean;
+  /** Rempli quand la source était connectée et ne l'est plus (accès révoqué). */
+  reconnect_reason?: string | null;
 }
 
 export interface Space {

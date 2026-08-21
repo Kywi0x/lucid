@@ -241,6 +241,13 @@ pub fn import_in(dir: &Path, bytes: &[u8]) -> Result<usize, String> {
     // Les données restaurées sont un vrai cerveau : l'état démo ne s'applique plus
     // (sinon la bannière « Contenu d'exemple » resterait par-dessus les vraies données).
     let _ = std::fs::remove_file(dir.join("demo.flag"));
+    // Le disque a changé sous le cache mémoire : sans ça, la prochaine lecture
+    // rend l'ANCIEN cerveau depuis la RAM et la restauration paraît sans effet
+    // jusqu'au redémarrage (recharger la page ne suffit pas, le process Tauri
+    // survit). Même bug que `reset_environment` en juillet, corrigé là-bas mais
+    // pas ici. Placé DANS `import_in` et non dans la commande Tauri : tous les
+    // appelants passent par là, présents et futurs.
+    clear_cache();
     Ok(count)
 }
 
@@ -1141,6 +1148,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dst.join("node_history/note-1/v1.md")).unwrap(), "ancien contenu");
         // Le brain.json écrasé a été gardé de côté
         assert!(dst.join("brain.json.avant-restauration").exists());
+        for d in [&src, &dst] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    /// Le bouton « Restaurer » paraissait sans effet jusqu'au redémarrage : les
+    /// fichiers étaient bien écrits, mais `load_brain_cached` resservait l'ancien
+    /// cerveau depuis la RAM (le process Tauri survit à un rechargement de page).
+    /// Même bug que `reset_environment` en juillet. Ce test échoue si le
+    /// `clear_cache()` d'`import_in` disparaît.
+    #[test]
+    fn import_in_invalide_le_cache_memoire() {
+        let src = std::env::temp_dir().join("brainlink_test_restore_cache_src");
+        let dst = std::env::temp_dir().join("brainlink_test_restore_cache_dst");
+        for d in [&src, &dst] { let _ = std::fs::remove_dir_all(d); std::fs::create_dir_all(d).unwrap(); }
+        std::fs::write(src.join("brain.json"), serde_json::to_string(&g(vec![n("NEUF", "Neuf", 1)])).unwrap()).unwrap();
+        let zip = export_in(&src).unwrap();
+
+        // Le cerveau d'avant est lu UNE fois : il peuple le cache mémoire.
+        std::fs::write(dst.join("brain.json"), serde_json::to_string(&g(vec![n("VIEUX", "Vieux", 1)])).unwrap()).unwrap();
+        assert_eq!(load_brain_cached(&dst).unwrap().nodes[0].id, "VIEUX");
+
+        import_in(&dst, &zip).unwrap();
+        assert_eq!(
+            load_brain_cached(&dst).unwrap().nodes[0].id, "NEUF",
+            "après restauration, la lecture doit venir du disque, pas du cache",
+        );
         for d in [&src, &dst] { let _ = std::fs::remove_dir_all(d); }
     }
 
