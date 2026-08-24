@@ -325,37 +325,81 @@ pub fn finish_connect(listener: TcpListener, redirect_uri: &str, code_verifier: 
     save_tokens(&Tokens { access_token: at, refresh_token: rt, expires_at: unix_now() + ei, needs_reconnect: None })
 }
 
-/// Lit le premier GET du navigateur sur le socket, extrait le `code` OAuth.
+/// Attend le retour du navigateur sur le socket loopback et extrait le `code`.
+///
+/// Deux défauts corrigés le 2026-08-24, tous deux vécus comme « la connexion ne
+/// dit rien » côté utilisateur (retour du test tiers du 21/08) :
+///
+/// 1. **Attente sans fin.** `accept()` bloquait pour toujours : qui ferme
+///    l'onglet Google sans autoriser laissait l'app sur « en attente du
+///    navigateur… » jusqu'au redémarrage, sans aucun moyen de le savoir. D'où
+///    l'échéance, et un message qui dit quoi faire.
+/// 2. **La première connexion n'est pas forcément la bonne.** Un navigateur
+///    préconnecte et réclame `/favicon.ico` : cette requête-là était prise pour
+///    le redirect, et la connexion échouait sur « Code OAuth introuvable » alors
+///    que l'autorisation arrivait une seconde plus tard. On sert les intruses et
+///    on continue d'écouter.
 fn wait_for_code(listener: TcpListener) -> Result<String, String> {
-    let (mut stream, _) = listener
-        .accept()
-        .map_err(|e| format!("Attente du redirect OAuth : {e}"))?;
+    // 5 min : le temps de choisir un compte Google et de lire l'écran de consentement.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+    let started = std::time::Instant::now();
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Socket d'écoute inutilisable : {e}"))?;
 
-    let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+    loop {
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= DEADLINE {
+                    return Err("Aucune autorisation Google reçue au bout de 5 minutes.                                 Relance « Connecter Google Drive » : l'onglet d'autorisation                                 doit être laissé ouvert jusqu'au message de succès."
+                        .to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => return Err(format!("Attente du redirect OAuth : {e}")),
+        };
+        // Le flux hérite du mode non bloquant : le repasser en bloquant, avec un
+        // délai propre — une connexion ouverte sans rien envoyer ne doit pas
+        // remplacer l'attente sans fin qu'on vient de supprimer.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
 
-    // Envoie une page de succès au navigateur.
-    let _ = stream.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
-          <html><body style='font-family:sans-serif;padding:2rem'>\
-          <h2>&#x2705; Connexion r\xc3\xa9ussie !</h2>\
-          <p>Tu peux fermer cet onglet.</p></body></html>",
-    );
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]);
+        // Extrait le code depuis "GET /?code=XXXX&... HTTP/1.1"
+        let first_line = request.lines().next().unwrap_or("");
+        let path = first_line.split(' ').nth(1).unwrap_or("");
 
-    // Extrait le code depuis "GET /?code=XXXX&... HTTP/1.1"
-    let first_line = request.lines().next().unwrap_or("");
-    let path = first_line.split(' ').nth(1).unwrap_or("");
+        let code = path
+            .split('?')
+            .nth(1)
+            .and_then(|q| q.split('&').find(|p| p.starts_with("code=")))
+            .map(|p| p.trim_start_matches("code=").to_string());
 
-    if path.contains("error=") {
-        return Err("Connexion Google refusée par l'utilisateur.".to_string());
+        if code.is_none() && !path.contains("error=") {
+            // Requête parasite (préconnexion, favicon) : on la ferme et on attend
+            // la vraie. Sans ça, elle consommait le seul `accept()` du flux.
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+            continue;
+        }
+
+        // Page finale pour le navigateur — succès comme refus, l'onglet doit dire
+        // quoi faire au lieu de rester sur une page blanche.
+        let body: &[u8] = if code.is_some() {
+            b"<h2>&#x2705; Connexion r\xc3\xa9ussie !</h2><p>Tu peux fermer cet onglet et revenir dans Lucid.</p>"
+        } else {
+            b"<h2>&#x274C; Connexion refus\xc3\xa9e</h2><p>Reviens dans Lucid pour r\xc3\xa9essayer.</p>"
+        };
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+                                   <html><body style='font-family:sans-serif;padding:2rem'>");
+        let _ = stream.write_all(body);
+        let _ = stream.write_all(b"</body></html>");
+
+        return code.ok_or_else(|| "Connexion Google refusée par l'utilisateur.".to_string());
     }
-
-    path.split('?')
-        .nth(1)
-        .and_then(|q| q.split('&').find(|p| p.starts_with("code=")))
-        .map(|p| p.trim_start_matches("code=").to_string())
-        .ok_or("Code OAuth introuvable dans le redirect.".to_string())
 }
 
 // ─── Drive API sync ───────────────────────────────────────────────────────────
@@ -408,9 +452,24 @@ fn fetch_files(
     q: &str,
     fields: &str,
 ) -> Result<Vec<DriveFile>, String> {
+    fetch_files_capped(client, access_token, q, fields, usize::MAX).map(|(files, _)| files)
+}
+
+/// Idem, mais borné à `max_pages` pages de 1000. Rend `true` s'il restait des
+/// pages : un compteur d'écran doit alors dire « ≥ N », jamais un chiffre faux.
+/// Sert le dépliage du sélecteur, où un dossier à 40 000 fichiers directs ne
+/// doit pas coûter 40 requêtes pour un simple indicateur.
+fn fetch_files_capped(
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+    q: &str,
+    fields: &str,
+    max_pages: usize,
+) -> Result<(Vec<DriveFile>, bool), String> {
     let fields = format!("nextPageToken,files({fields})");
     let mut out: Vec<DriveFile> = Vec::new();
     let mut page_token: Option<String> = None;
+    let mut pages = 0usize;
     loop {
         let mut req = client
             .get("https://www.googleapis.com/drive/v3/files")
@@ -443,10 +502,13 @@ fn fetch_files(
         page_token = page.next_page_token;
         out.extend(page.files);
         if !has_more {
-            break;
+            return Ok((out, false));
+        }
+        pages += 1;
+        if pages >= max_pages {
+            return Ok((out, true));
         }
     }
-    Ok(out)
 }
 
 /// Un dossier tel que servi à l'écran de sélection.
@@ -541,7 +603,7 @@ pub fn search_folders(needle: &str) -> Result<Vec<DriveFolder>, String> {
         return Ok(vec![]);
     }
     let access_token = valid_access_token()?;
-    let safe = needle.replace('\\', "\\\\").replace('\'', "\\'");
+    let safe = q_safe(needle);
     Ok(fetch_files(
         &http(),
         &access_token,
@@ -554,28 +616,116 @@ pub fn search_folders(needle: &str) -> Result<Vec<DriveFolder>, String> {
     .collect())
 }
 
-/// Sous-dossiers directs d'un dossier (ou d'une unité partagée). Une requête,
-/// quelques dizaines de lignes.
-pub fn list_children(parent: &str) -> Result<Vec<DriveFolder>, String> {
+/// Échappe un fragment (id de dossier, terme de recherche) avant de l'insérer
+/// dans une requête `q` Drive : une apostrophe casserait la requête, et c'est
+/// une injection.
+fn q_safe(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Ce qu'un dépliage rend à l'écran : les sous-dossiers **et** ce que le dossier
+/// contient directement.
+///
+/// Les compteurs sont gratuits : ils sortent de la **même** requête que les
+/// sous-dossiers (on ne filtre plus sur `mimeType`, on trie le résultat). C'est
+/// la leçon du 18/08/2026 — les anciens compteurs coûtaient une énumération
+/// complète du Drive, ceux-ci ne coûtent rien de plus qu'avant.
+#[derive(Serialize)]
+pub struct FolderChildren {
+    pub folders: Vec<DriveFolder>,
+    /// Fichiers directs que Lucid sait lire (`drive_kind`).
+    pub docs: u32,
+    /// Fichiers directs qu'il ne sait pas lire — annoncés, jamais tus (ADR-0015).
+    pub ignored: u32,
+    /// `true` = plafond de pages atteint, les chiffres sont des minorants.
+    pub truncated: bool,
+}
+
+/// Contenu direct d'un dossier (ou d'une unité partagée) : sous-dossiers + ce
+/// qu'il contient. Une requête, bornée à 5 pages.
+pub fn list_children(parent: &str) -> Result<FolderChildren, String> {
     let access_token = valid_access_token()?;
     let client = http();
-    // `parent` vient d'un nœud déjà servi par l'API : on l'échappe quand même,
-    // une apostrophe dans un id casserait la requête (et c'est une injection).
-    let safe = parent.replace('\\', "\\\\").replace('\'', "\\'");
-    Ok(fetch_files(
+    // ponytail: 5 pages = 5 000 fichiers directs. Au-delà, le chiffre exact
+    // n'aide plus à décider et chaque page est un aller-retour réseau.
+    let (files, truncated) = fetch_files_capped(
         &client,
         &access_token,
-        &format!("'{safe}' in parents and mimeType='{FOLDER_MIME}' and trashed=false"),
-        "id,name",
-    )?
-    .into_iter()
-    .map(|f| DriveFolder {
-        id: f.id,
-        name: f.name,
-        parent: Some(parent.to_string()),
-        shared: false,
-    })
-    .collect())
+        &format!("'{}' in parents and trashed=false", q_safe(parent)),
+        "id,name,mimeType",
+        5,
+    )?;
+    let mut out = FolderChildren { folders: Vec::new(), docs: 0, ignored: 0, truncated };
+    for f in files {
+        if f.mime_type == FOLDER_MIME {
+            out.folders.push(DriveFolder {
+                id: f.id,
+                name: f.name,
+                parent: Some(parent.to_string()),
+                shared: false,
+            });
+        } else if drive_kind(&f).is_some() {
+            out.docs += 1;
+        } else {
+            out.ignored += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Ce que cocher un dossier ramènerait *vraiment* : la sélection est récursive
+/// (`fetch_in_selection` descend tout le sous-arbre), donc un compteur du seul
+/// niveau direct dirait « 0 document » d'un dossier qui en cache 4 000. D'où ce
+/// comptage profond — **à la demande**, jamais automatique : c'est exactement
+/// l'énumération qui figeait l'écran quand elle tournait pour chaque ligne.
+#[derive(Serialize, Default)]
+pub struct FolderCount {
+    /// Sous-dossiers rencontrés (le dossier de départ non compris).
+    pub folders: u32,
+    pub docs: u32,
+    pub ignored: u32,
+    /// `true` = plafond atteint, les chiffres sont des minorants.
+    pub truncated: bool,
+}
+
+pub fn count_deep(root: &str) -> Result<FolderCount, String> {
+    // ponytail: plafond en nombre de requêtes, pas de profondeur. 300 dossiers
+    // visités ≈ 300 allers-retours ; au-delà, on rend un minorant honnête plutôt
+    // que de tenir l'écran une minute (mesuré : 24 694 dossiers sur un compte pro).
+    const MAX_VISITS: usize = 300;
+    let access_token = valid_access_token()?;
+    let client = http();
+    let mut out = FolderCount::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue = vec![root.to_string()];
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_VISITS {
+            out.truncated = true;
+            break;
+        }
+        let (files, more) = fetch_files_capped(
+            &client,
+            &access_token,
+            &format!("'{}' in parents and trashed=false", q_safe(&id)),
+            "id,name,mimeType",
+            5,
+        )?;
+        out.truncated |= more;
+        for f in files {
+            if f.mime_type == FOLDER_MIME {
+                out.folders += 1;
+                queue.push(f.id);
+            } else if drive_kind(&f).is_some() {
+                out.docs += 1;
+            } else {
+                out.ignored += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn slugify(s: &str) -> String {
@@ -754,8 +904,7 @@ fn fetch_in_selection(
         if !seen.insert(id.clone()) {
             continue; // raccourci d'un cycle de parents, ou dossier coché deux fois
         }
-        let safe = id.replace('\\', "\\\\").replace('\'', "\\'");
-        let files = fetch_files(client, access_token, &format!("'{safe}' in parents and trashed=false"), fields)?;
+        let files = fetch_files(client, access_token, &format!("'{}' in parents and trashed=false", q_safe(&id)), fields)?;
         for f in files {
             if f.mime_type == FOLDER_MIME {
                 queue.push(f.id.clone());
@@ -1568,6 +1717,45 @@ mod pptx_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le redirect OAuth n'est pas forcément la première connexion reçue : les
+    /// navigateurs préconnectent et réclament `/favicon.ico`. L'ancienne version
+    /// prenait le premier `accept()` venu et rendait « Code OAuth introuvable »
+    /// alors que l'autorisation arrivait juste derrière.
+    #[test]
+    fn wait_for_code_ignore_les_requetes_parasites() {
+        use std::io::Write as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let client = std::thread::spawn(move || {
+            let addr = format!("127.0.0.1:{port}");
+            // Requête parasite : ni code, ni error.
+            let mut a = std::net::TcpStream::connect(&addr).unwrap();
+            a.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            drop(a);
+            // Le vrai redirect Google.
+            let mut b = std::net::TcpStream::connect(&addr).unwrap();
+            b.write_all(b"GET /?code=SECRET42&scope=drive.readonly HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        });
+
+        assert_eq!(wait_for_code(listener).unwrap(), "SECRET42");
+        client.join().unwrap();
+    }
+
+    /// Un refus explicite s'arrête net (il ne doit pas attendre l'échéance).
+    #[test]
+    fn wait_for_code_refus_explicite() {
+        use std::io::Write as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || {
+            let mut a = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+            a.write_all(b"GET /?error=access_denied HTTP/1.1\r\n\r\n").unwrap();
+        });
+        assert!(wait_for_code(listener).is_err());
+        client.join().unwrap();
+    }
 
     #[test]
     fn b64url_no_padding() {

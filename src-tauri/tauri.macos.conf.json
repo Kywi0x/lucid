@@ -1,8 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "targets": ["dmg", "app"],
-    "macOS": { "signingIdentity": "-" },
+    "targets": [
+      "dmg",
+      "app"
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
+    },
     "externalBin": [
       "binaries/llama-completion",
       "binaries/llama-server",

@@ -567,7 +567,11 @@ function ConnectorsSection({
       : `${driveSel.folders.length} dossier${driveSel.folders.length > 1 ? "s" : ""} indexé${driveSel.folders.length > 1 ? "s" : ""}${driveSel.include_orphans ? " + fichiers sans dossier" : ""}.`;
 
   async function handleGoogleConnect() {
-    set("google-drive", true); msg("google-drive", "En attente du navigateur…");
+    // « En attente du navigateur… » ne disait ni quoi faire ni combien de temps :
+    // le testeur du 21/08 ne savait pas si l'OAuth avait réussi ou si c'était
+    // lent, et abandonnait. Le côté Rust borne désormais l'attente à 5 min.
+    set("google-drive", true);
+    msg("google-drive", "Autorise Lucid dans l'onglet qui vient de s'ouvrir, puis reviens ici. (5 min max)");
     try {
       await googleDriveConnect();
       msg("google-drive", "Connecté ! Choisis les dossiers à indexer.");

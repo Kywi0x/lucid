@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Sans cette clé, AUCUN sidecar ne démarre dans l'app installée.
+       Explication complète dans scripts/bundle-sidecars.sh.
+       Le parseur d'Apple (AMFI) est strict : pas de tiret double ici. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

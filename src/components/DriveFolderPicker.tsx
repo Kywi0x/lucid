@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, ChevronRight, Folder, HardDrive, Loader2, Minus, Search, Users, X } from "lucide-react";
+import { Check, ChevronRight, Folder, HardDrive, Loader2, Minus, Search, Sigma, Users, X } from "lucide-react";
 import {
   googleDriveRoots,
   googleDriveChildren,
+  googleDriveFolderCount,
   googleDriveSearchFolders,
   googleDriveFolderLabels,
   googleDriveSelection,
   googleDriveSetSelection,
   type DriveFolder,
+  type DriveFolderCount,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -26,8 +28,15 @@ type Props = {
  * restait sur « comptage… » plusieurs minutes. On charge donc les racines
  * (~150 entrées, 2 s) puis une requête par dépliage.
  *
- * ponytail: plus de compteurs de documents. Les afficher imposait l'énumération
- * complète, pour un chiffre indicatif ; le nom du dossier suffit à choisir.
+ * Les compteurs sont revenus le 24/08/2026, sans reprendre le défaut qui les
+ * avait fait retirer (retour du test tiers du 21/08 : « la sélection d'un dossier
+ * n'annonce ni le nombre de sous-dossiers ni le nombre de documents éligibles »,
+ * or c'est exactement ce qui décide quoi cocher) :
+ * - au **dépliage**, les chiffres du niveau direct sortent de la requête qui
+ *   charge déjà les sous-dossiers — zéro requête de plus qu'avant ;
+ * - le total récursif — ce que cocher ramènerait vraiment — reste **à la
+ *   demande**, un clic par dossier. C'est lui qui figeait l'écran quand il
+ *   tournait pour chaque ligne.
  */
 export function DriveFolderPicker({ onClose, onSaved }: Props) {
   const [roots, setRoots] = useState<DriveFolder[] | null>(null);
@@ -44,6 +53,10 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
   const [hits, setHits] = useState<DriveFolder[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Niveau direct, rempli au dépliage (gratuit) ; total récursif, sur clic.
+  const [direct, setDirect] = useState<Map<string, { docs: number; ignored: number; truncated: boolean }>>(new Map());
+  const [deep, setDeep] = useState<Map<string, DriveFolderCount>>(new Map());
+  const [counting, setCounting] = useState<Set<string>>(new Set());
   const dirtyRef = useRef(false);
 
   const remember = useCallback((list: DriveFolder[]) => {
@@ -112,9 +125,10 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
     if (wasOpen || kids.has(id)) return;
     setLoading((prev) => new Set(prev).add(id));
     try {
-      const list = await googleDriveChildren(id);
-      setKids((prev) => new Map(prev).set(id, list));
-      remember(list);
+      const res = await googleDriveChildren(id);
+      setKids((prev) => new Map(prev).set(id, res.folders));
+      remember(res.folders);
+      setDirect((prev) => new Map(prev).set(id, { docs: res.docs, ignored: res.ignored, truncated: res.truncated }));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -143,6 +157,10 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
   }
 
   function toggle(id: string) {
+    // Cocher, c'est le moment où le chiffre sert : « qu'est-ce que je viens de
+    // prendre ? ». On le lance donc tout seul ici — un clic de l'utilisateur, un
+    // comptage — au lieu d'attendre qu'il trouve le bouton (retour Liam, 24/08).
+    if (!selected.has(id) && !deep.has(id) && !counting.has(id)) void count(id);
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) {
@@ -157,6 +175,20 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
       }
       return next;
     });
+  }
+
+  /** Total récursif d'un dossier — le seul chiffre qui dise ce que cocher ramène,
+   *  la sélection descendant tout le sous-arbre. Déclenché par l'utilisateur. */
+  async function count(id: string) {
+    setCounting((prev) => new Set(prev).add(id));
+    try {
+      const total = await googleDriveFolderCount(id);
+      setDeep((prev) => new Map(prev).set(id, total));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCounting((prev) => { const next = new Set(prev); next.delete(id); return next; });
+    }
   }
 
   async function save() {
@@ -184,7 +216,7 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
 
   const mine = (roots ?? []).filter((f) => !f.shared);
   const shared = (roots ?? []).filter((f) => f.shared);
-  const treeProps = { kids, loading, selected, open, inheritedFrom, hasSelectedDescendant, toggleExpand, toggle };
+  const treeProps = { kids, loading, selected, open, direct, deep, counting, inheritedFrom, hasSelectedDescendant, toggleExpand, toggle, count };
 
   return (
     <div className="absolute inset-0 z-20 flex flex-col justify-end bg-black/20" onClick={closeGuarded}>
@@ -342,11 +374,43 @@ type TreeProps = {
   loading: Set<string>;
   selected: Set<string>;
   open: Set<string>;
+  direct: Map<string, { docs: number; ignored: number; truncated: boolean }>;
+  deep: Map<string, DriveFolderCount>;
+  counting: Set<string>;
   inheritedFrom: (id: string, sel: Set<string>) => boolean;
   hasSelectedDescendant: (id: string, sel: Set<string>) => boolean;
   toggleExpand: (id: string) => void;
   toggle: (id: string) => void;
+  count: (id: string) => void;
 };
+
+const s = (n: number) => (n > 1 ? "s" : "");
+
+/** Ce qu'on annonce à droite d'une ligne. Le total récursif prend la main dès
+ *  qu'il existe : il répond à la vraie question (« qu'est-ce que je coche ? »).
+ *  `≥` quand un plafond a été atteint — un minorant se dit, il ne s'arrondit pas. */
+function meta(
+  id: string,
+  p: Pick<TreeProps, "direct" | "deep" | "kids">,
+): string | null {
+  const d = p.deep.get(id);
+  if (d) {
+    const ge = d.truncated ? "≥ " : "";
+    const parts = [`${ge}${d.docs} document${s(d.docs)}`];
+    if (d.folders > 0) parts.push(`${ge}${d.folders} sous-dossier${s(d.folders)}`);
+    if (d.ignored > 0) parts.push(`${d.ignored} illisible${s(d.ignored)}`);
+    return `${parts.join(" · ")} au total`;
+  }
+  const one = p.direct.get(id);
+  if (!one) return null;
+  const subs = p.kids.get(id)?.length ?? 0;
+  const ge = one.truncated ? "≥ " : "";
+  const parts: string[] = [];
+  if (subs > 0) parts.push(`${subs} sous-dossier${s(subs)}`);
+  parts.push(`${ge}${one.docs} document${s(one.docs)} ici`);
+  if (one.ignored > 0) parts.push(`${one.ignored} illisible${s(one.ignored)}`);
+  return parts.join(" · ");
+}
 
 function Tree(p: TreeProps) {
   return (
@@ -372,6 +436,10 @@ function Tree(p: TreeProps) {
               expandable
               expanded={expanded}
               busy={p.loading.has(f.id)}
+              meta={meta(f.id, p)}
+              counting={p.counting.has(f.id)}
+              counted={p.deep.has(f.id)}
+              onCount={() => p.count(f.id)}
               onToggleExpand={() => p.toggleExpand(f.id)}
               onToggle={() => p.toggle(f.id)}
             />
@@ -399,7 +467,7 @@ function Tree(p: TreeProps) {
 type BoxState = "on" | "off" | "partial" | "inherited";
 
 function Row({
-  folder, depth, state, expandable, expanded, busy, onToggleExpand, onToggle,
+  folder, depth, state, expandable, expanded, busy, meta, counting, counted, onCount, onToggleExpand, onToggle,
 }: {
   folder: DriveFolder;
   depth: number;
@@ -407,6 +475,11 @@ function Row({
   expandable: boolean;
   expanded: boolean;
   busy: boolean;
+  /** Ce que le dossier contient — null tant qu'on n'a rien mesuré. */
+  meta: string | null;
+  counting: boolean;
+  counted: boolean;
+  onCount: () => void;
   onToggleExpand: () => void;
   onToggle: () => void;
 }) {
@@ -446,6 +519,27 @@ function Row({
           {folder.name}
         </span>
       </button>
+
+      {meta && (
+        <span className="shrink-0 text-[10px] tabular-nums text-[var(--color-muted)]">{meta}</span>
+      )}
+
+      {/* Le total récursif ne s'affiche pas tout seul pour chaque ligne : cette
+          énumération-là figeait l'écran. Il part au cochage (cf. `toggle`) ou
+          sur ce bouton — **libellé en clair** : l'icône Σ seule n'était pas
+          comprise (retour Liam, 24/08). */}
+      {!counted && (
+        <button
+          onClick={onCount}
+          disabled={counting}
+          title="Compter les documents, sous-dossiers inclus"
+          className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-[var(--color-muted)] underline decoration-dotted underline-offset-2 hover:bg-[var(--color-surface)] hover:text-[var(--color-accent)] transition-colors"
+        >
+          {counting
+            ? <><Loader2 className="size-3 animate-spin" /> comptage…</>
+            : <><Sigma className="size-3" /> compter</>}
+        </button>
+      )}
     </div>
   );
 }

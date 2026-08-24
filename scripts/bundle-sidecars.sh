@@ -96,7 +96,27 @@ fi
 
 echo "── 4/4 bit exécutable + re-signature ad-hoc (dylibbundler invalide les signatures)"
 chmod +x "$BIN_DIR"/*-"$TRIPLE"   # le llama téléchargé perd parfois son +x après cp/bundle
-codesign -f -s - "$BIN_DIR"/*-"$TRIPLE" "$LIB_DIR"/*.dylib 2>/dev/null
+# Signature ad-hoc des sidecars et de leurs dylibs. Elle ne SUFFIT PAS : Tauri
+# re-signe ensuite les binaires de Contents/MacOS/ avec le hardened runtime, ce
+# qui active la « library validation » — le process refuse alors toute dylib
+# signée séparément, et les nôtres vivent dans Contents/Resources/libs/.
+#
+# Symptôme (mesuré le 2026-08-21 sur une app installée, machine de dev ET machine
+# tierce) : les CINQ sidecars morts au lancement — llama-completion, llama-server,
+# pdftotext, pdftoppm, tesseract. Donc zéro IA locale, zéro OCR, zéro vecteur, sur
+# toutes les versions distribuées jusque-là (beta.17 comprise). Invisible en dev :
+# hors bundle, rien n'est signé avec le hardened runtime.
+#
+# Le message d'erreur ment : il parle de « different Team IDs » alors que les deux
+# côtés sont en ad-hoc, Team ID vide. La vraie cause est la library validation.
+#
+# Correctif : src-tauri/entitlements.plist (disable-library-validation), branché
+# dans tauri.macos.conf.json. Vérifier après un build :
+#   codesign -d --verbose=4 <app>/Contents/MacOS/llama-server   → doit lister l'entitlement
+#   <app>/Contents/MacOS/llama-server --version                 → doit répondre
+#
+# Pas de 2>/dev/null ici : une signature qui échoue doit se voir (ADR-0015).
+codesign -f -s - "$BIN_DIR"/*-"$TRIPLE" "$LIB_DIR"/*.dylib
 
 echo
 echo "✅ Sidecars prêts :"

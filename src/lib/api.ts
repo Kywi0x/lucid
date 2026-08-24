@@ -163,9 +163,33 @@ export function googleDriveRoots(): Promise<DriveFolder[]> {
   return invoke("google_drive_roots");
 }
 
-/** Sous-dossiers d'un nœud, chargés au dépliage. */
-export function googleDriveChildren(parent: string): Promise<DriveFolder[]> {
+/** Contenu direct d'un dossier : sous-dossiers + de quoi l'annoncer. */
+export type DriveChildren = {
+  folders: DriveFolder[];
+  /** Fichiers directs que Lucid sait lire. */
+  docs: number;
+  /** Fichiers directs illisibles — affichés, jamais tus. */
+  ignored: number;
+  /** Plafond de pages atteint : les chiffres sont des minorants. */
+  truncated: boolean;
+};
+
+/** Comptage récursif d'un dossier (ce que cocher ramènerait vraiment). */
+export type DriveFolderCount = {
+  folders: number;
+  docs: number;
+  ignored: number;
+  truncated: boolean;
+};
+
+/** Contenu direct d'un nœud, chargé au dépliage (une requête Drive). */
+export function googleDriveChildren(parent: string): Promise<DriveChildren> {
   return invoke("google_drive_children", { parent });
+}
+
+/** Comptage récursif — à la demande : c'est un parcours de tout le sous-arbre. */
+export function googleDriveFolderCount(folder: string): Promise<DriveFolderCount> {
+  return invoke("google_drive_folder_count", { folder });
 }
 
 /** Noms des dossiers cochés — la sélection ne stocke que des ids. */

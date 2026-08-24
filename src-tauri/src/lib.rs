@@ -2581,10 +2581,22 @@ async fn google_drive_roots() -> Result<Vec<connectors::google_drive::DriveFolde
         .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
-/// Sous-dossiers d'un nœud — appelé au dépliage, pas au chargement.
+/// Contenu direct d'un nœud — appelé au dépliage, pas au chargement. Rend les
+/// sous-dossiers **et** de quoi annoncer ce que le dossier contient (retour du
+/// test tiers du 21/08 : sans ces chiffres, impossible de décider quoi cocher).
 #[tauri::command]
-async fn google_drive_children(parent: String) -> Result<Vec<connectors::google_drive::DriveFolder>, String> {
+async fn google_drive_children(parent: String) -> Result<connectors::google_drive::FolderChildren, String> {
     tauri::async_runtime::spawn_blocking(move || connectors::google_drive::list_children(&parent))
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Comptage récursif d'un dossier — **à la demande** (un clic), jamais pour
+/// chaque ligne : c'est cette énumération qui figeait le sélecteur avant le
+/// 18/08. Rend des minorants honnêtes (`truncated`) plutôt que d'aller au bout.
+#[tauri::command]
+async fn google_drive_folder_count(folder: String) -> Result<connectors::google_drive::FolderCount, String> {
+    tauri::async_runtime::spawn_blocking(move || connectors::google_drive::count_deep(&folder))
         .await
         .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
@@ -7023,6 +7035,7 @@ pub fn run() {
             google_drive_disconnect,
             google_drive_roots,
             google_drive_children,
+            google_drive_folder_count,
             google_drive_search_folders,
             google_drive_folder_labels,
             google_drive_selection,
