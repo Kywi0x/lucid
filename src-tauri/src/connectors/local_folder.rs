@@ -143,14 +143,37 @@ pub fn disconnect() {
 
 // ─── Walk ─────────────────────────────────────────────────────────────────────
 
-fn walk(root: &Path) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
+/// Résultat d'un parcours : ce qu'on a trouvé, **et** ce qu'on n'a pas eu le
+/// droit de lire. Le second n'existait pas : `read_dir` en échec rendait la main
+/// sans un mot, si bien qu'un refus d'autorisation macOS (TCC) était
+/// **indiscernable d'un dossier vide** — le scan se terminait « avec succès » sur
+/// zéro fichier. C'est le premier écran d'un testeur sur un Mac neuf.
+#[derive(Default)]
+struct Walked {
+    files: Vec<(String, PathBuf)>,
+    /// Dossiers refusés par l'OS (macOS : Bureau/Documents/Téléchargements sont
+    /// derrière un consentement par app ; un refus tient jusqu'aux Réglages Système).
+    denied: Vec<PathBuf>,
+}
+
+fn walk(root: &Path) -> Walked {
+    let mut out = Walked::default();
     walk_dir(root, root, &mut out);
     out
 }
 
-fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+fn walk_dir(root: &Path, dir: &Path, out: &mut Walked) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            out.denied.push(dir.to_path_buf());
+            return;
+        }
+        // ponytail: les autres erreurs restent muettes (dossier supprimé pendant
+        // le parcours, lien cassé) — remonter ça n'aiderait personne. À rouvrir
+        // si un cas réel montre le contraire.
+        Err(_) => return,
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
@@ -163,7 +186,7 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
             .is_some_and(|e| EXTENSIONS.contains(&e.as_str()))
         {
             if let Ok(rel) = path.strip_prefix(root) {
-                out.push((rel.to_string_lossy().replace('\\', "/"), path));
+                out.files.push((rel.to_string_lossy().replace('\\', "/"), path));
             }
         }
     }
@@ -179,6 +202,12 @@ pub struct SyncReport {
     pub total: usize,
     /// Fichiers illisibles ou dossiers disparus : "chemin — raison".
     pub skipped: Vec<String>,
+    /// Dossiers refusés par l'OS. Séparés des `skipped` parce que la réponse
+    /// n'est pas la même : ici l'utilisateur peut débloquer d'un clic (Réglages
+    /// Système), et tant qu'il ne le fait pas le contenu reste **invisible**.
+    /// `default` : les rapports déjà persistés n'ont pas ce champ.
+    #[serde(default)]
+    pub denied: Vec<String>,
 }
 
 fn folder_name(root_str: &str) -> String {
@@ -234,14 +263,25 @@ pub fn sync(mut on_progress: impl FnMut(usize, usize, &str)) -> Result<SyncRepor
     }
 
     let mut skipped = Vec::new();
+    let mut denied: Vec<String> = Vec::new();
     let mut all_files: Vec<(String, String, PathBuf)> = Vec::new(); // (root_str, rel, abs)
     for root_str in &roots {
         let root = Path::new(root_str);
         if !root.is_dir() {
-            skipped.push(format!("{root_str} — dossier introuvable, ignoré"));
+            // `is_dir()` ment quand l'OS refuse jusqu'au stat : « introuvable »
+            // enverrait l'utilisateur chercher un dossier qui est là, sous ses yeux.
+            // On demande la vraie raison avant de conclure.
+            match std::fs::read_dir(root).err().map(|e| e.kind()) {
+                Some(std::io::ErrorKind::PermissionDenied) => denied.push(root_str.clone()),
+                _ => skipped.push(format!("{root_str} — dossier introuvable, ignoré")),
+            }
             continue;
         }
-        for (rel, abs) in walk(root) {
+        let walked = walk(root);
+        for dir in walked.denied {
+            denied.push(dir.to_string_lossy().to_string());
+        }
+        for (rel, abs) in walked.files {
             all_files.push((root_str.clone(), rel, abs));
         }
     }
@@ -296,7 +336,7 @@ pub fn sync(mut on_progress: impl FnMut(usize, usize, &str)) -> Result<SyncRepor
     std::fs::write(&path, serde_json::to_string(&out).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
 
-    let report = SyncReport { new: new_count, total: out.len(), skipped };
+    let report = SyncReport { new: new_count, total: out.len(), skipped, denied };
     // Best-effort : le rapport de diagnostic le relit, mais un échec d'écriture ne
     // doit jamais faire échouer un scan qui, lui, a réussi.
     if let (Some(p), Ok(json)) = (last_sync_path(), serde_json::to_string(&report)) {
@@ -342,7 +382,7 @@ mod tests {
         std::fs::write(dir.join("cours/.git/config.pdf"), "x").unwrap();
         std::fs::write(dir.join("Facture.CSV"), "x").unwrap();
 
-        let files = walk(&dir);
+        let files = walk(&dir).files;
         let rels: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
         assert!(rels.contains(&"cours/rapport.pdf"));
         assert!(rels.contains(&"Facture.CSV"), "extension insensible à la casse");
@@ -360,10 +400,37 @@ mod tests {
         // quand même jamais remonter : on ne descend pas dedans, point.
         std::fs::write(dir.join("mon-projet/node_modules/une-lib/fixture.pdf"), "x").unwrap();
 
-        let files = walk(&dir);
+        let files = walk(&dir).files;
         let rels: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
         assert!(rels.contains(&"mon-projet/rapport.pdf"));
         assert_eq!(rels.len(), 1, "node_modules jamais parcouru : {rels:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Le cas macOS : l'utilisateur refuse l'accès à Documents (TCC). Avant, le
+    /// dossier rendait zéro fichier et le scan se disait terminé — le testeur
+    /// concluait que Lucid ne trouve rien. Il doit être NOMMÉ comme refusé.
+    #[cfg(unix)]
+    #[test]
+    fn walk_signale_un_dossier_refuse_au_lieu_de_le_taire() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("lucid_test_local_folder_denied");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("prive")).unwrap();
+        std::fs::write(dir.join("prive/secret.pdf"), "x").unwrap();
+        std::fs::write(dir.join("visible.pdf"), "x").unwrap();
+        std::fs::set_permissions(dir.join("prive"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let walked = walk(&dir);
+        // root peut lire malgré le mode 000 : le test n'a alors rien à prouver.
+        if walked.files.len() == 1 {
+            assert_eq!(walked.denied.len(), 1, "le dossier refusé doit être nommé");
+            assert!(walked.denied[0].ends_with("prive"));
+        }
+        // Ce qui est lisible reste lu : un refus ne fait pas échouer le reste.
+        assert!(walked.files.iter().any(|(r, _)| r == "visible.pdf"));
+
+        std::fs::set_permissions(dir.join("prive"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

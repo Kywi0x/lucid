@@ -389,6 +389,12 @@ fn archivist_diagnostic(mask: bool) -> Result<String, String> {
         out.push_str("— Extraction (dernier scan des dossiers) —\n");
         out.push_str(&format!("Fichiers indexés  : {}\nExtraits ce scan  : {}\nIllisibles        : {}\n",
             sync.total, sync.new, sync.skipped.len()));
+        // Un dossier refusé par l'OS ne produit AUCUN fichier : sans cette ligne,
+        // « 0 indexé » se lit comme « rien à indexer ». Compté seulement — les
+        // chemins nomment des clients, le bloc doit rester partageable tel quel.
+        if !sync.denied.is_empty() {
+            out.push_str(&format!("Dossiers refusés  : {} (autorisation OS non accordée)\n", sync.denied.len()));
+        }
         if !sync.skipped.is_empty() {
             let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
             for line in &sync.skipped {
@@ -844,7 +850,15 @@ fn purge_fossil_autre_once(dir: &std::path::Path) {
 // → même nom, sans appel Gemma. Un groupe qui gagne ou perd quelques documents
 // reste reconnu par recouvrement, sinon le moindre ajout relancerait le nommage.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct ClusterName { members: Vec<String>, name: String }
+struct ClusterName {
+    members: Vec<String>,
+    name: String,
+    /// Entité déclarée par le modèle au moment du nommage. Conservée pour que le
+    /// nom repris du cache reste vérifiable contre les documents du jour — un
+    /// groupe rappelé par recouvrement partiel n'a pas la même composition.
+    #[serde(default)]
+    entity: Option<String>,
+}
 
 fn cluster_names_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("archivist_cluster_names.json")
@@ -861,9 +875,9 @@ fn load_cluster_names(dir: &std::path::Path) -> Vec<ClusterName> {
 /// garder son nom ; en dessous, c'est un autre groupe et il mérite son nom.
 const CLUSTER_RENAME_OVERLAP: f32 = 0.6;
 
-fn recall_cluster_name(cache: &[ClusterName], members: &[String]) -> Option<String> {
+fn recall_cluster_name<'a>(cache: &'a [ClusterName], members: &[String]) -> Option<&'a ClusterName> {
     let set: std::collections::HashSet<&str> = members.iter().map(String::as_str).collect();
-    let mut best: Option<(f32, &str)> = None;
+    let mut best: Option<(f32, &ClusterName)> = None;
     for entry in cache {
         let prev: std::collections::HashSet<&str> = entry.members.iter().map(String::as_str).collect();
         let inter = set.intersection(&prev).count() as f32;
@@ -871,17 +885,21 @@ fn recall_cluster_name(cache: &[ClusterName], members: &[String]) -> Option<Stri
         if union == 0.0 { continue; }
         let j = inter / union;
         if j >= CLUSTER_RENAME_OVERLAP && best.map(|(bj, _)| j > bj).unwrap_or(true) {
-            best = Some((j, entry.name.as_str()));
+            best = Some((j, entry));
         }
     }
-    best.map(|(_, name)| name.to_string())
+    best.map(|(_, entry)| entry)
 }
 
 /// Enregistre (ou rafraîchit) la composition associée à un nom — le groupe
 /// mémorisé suit ainsi les documents qui s'y ajoutent au fil des passes.
-fn remember_cluster_name(cache: &mut Vec<ClusterName>, members: &[String], name: &str) {
+fn remember_cluster_name(cache: &mut Vec<ClusterName>, members: &[String], name: &str, entity: Option<&str>) {
     cache.retain(|e| e.name != name);
-    cache.push(ClusterName { members: members.to_vec(), name: name.to_string() });
+    cache.push(ClusterName {
+        members: members.to_vec(),
+        name: name.to_string(),
+        entity: entity.map(str::to_string),
+    });
 }
 
 // ── Cache des décisions de fusion ────────────────────────────────────────────
@@ -1040,6 +1058,19 @@ struct ArchivistTuning {
     /// change (ADR-0022 encore `proposé`).
     #[serde(default = "tuning_true")]
     respect_user_folders: bool,
+    /// Cohésion minimale d'un groupe (similarité moyenne au centroïde). Exposée ici
+    /// depuis le 2026-08-24 : c'est le seul levier qui sépare un vrai thème d'un
+    /// fourre-tout, et il ne se règle pas en aveugle. Mesuré sur le corpus réel de
+    /// Liam, garde de domaine désactivée : le fourre-tout observé (exports SQL +
+    /// fiche RH + notes) sort à **0,885**, tous les groupes légitimes entre 0,916
+    /// et 0,997 — la frontière est nette et elle est BEAUCOUP plus haute que le
+    /// 0,84 codé en dur.
+    #[serde(default = "tuning_cohesion")]
+    cluster_cohesion_min: f32,
+    /// Écart au centroïde au-delà duquel un membre est retiré de son groupe même
+    /// si la cohésion moyenne est bonne (cf. `CLUSTER_OUTLIER_MARGIN`).
+    #[serde(default = "tuning_outlier")]
+    cluster_outlier_margin: f32,
     /// Passe de consolidation qui invente des dossiers PARENTS pour chapeauter les
     /// thèmes. `false` par défaut (décision Liam, 2026-08-03) : les feuilles sont
     /// fiables, les parents étaient devinés d'après un nom et rangeaient de travers.
@@ -1051,6 +1082,8 @@ struct ArchivistTuning {
 fn tuning_true() -> bool { true }
 fn tuning_anchor_sim() -> f32 { ANCHOR_SIM_THRESHOLD }
 fn tuning_anchor_margin() -> f32 { ANCHOR_MIN_MARGIN }
+fn tuning_cohesion() -> f32 { archivist::CLUSTER_COHESION_MIN }
+fn tuning_outlier() -> f32 { archivist::CLUSTER_OUTLIER_MARGIN }
 
 impl Default for ArchivistTuning {
     fn default() -> Self {
@@ -1059,6 +1092,8 @@ impl Default for ArchivistTuning {
             domain_guard_cluster: true,
             anchor_sim_threshold: ANCHOR_SIM_THRESHOLD,
             anchor_min_margin: ANCHOR_MIN_MARGIN,
+            cluster_cohesion_min: archivist::CLUSTER_COHESION_MIN,
+            cluster_outlier_margin: archivist::CLUSTER_OUTLIER_MARGIN,
             respect_user_folders: true,
             taxonomy_grouping: false,
         }
@@ -1292,31 +1327,44 @@ fn embed_organize(dir: &std::path::Path, pool: &[(String, String)], graph: &Brai
     for (_dom, idxs) in &by_domain {
         if idxs.len() < 3 { continue; }
         let sub_vecs: Vec<Vec<f32>> = idxs.iter().map(|&i| vecs[&rest[i].0].clone()).collect();
-        for g in archivist::cluster_indices(&sub_vecs) {
+        for g in archivist::cluster_indices_with(&sub_vecs, tuning.cluster_cohesion_min, tuning.cluster_outlier_margin) {
             if g.len() < 3 { continue; }
             let global: Vec<usize> = g.iter().map(|&li| idxs[li]).collect();
             let node_ids: Vec<String> = global.iter().map(|&i| rest[i].0.clone()).collect();
-            // Déjà nommé à une passe précédente ? On reprend le nom tel quel —
-            // pas d'appel Gemma, donc pas de dossier jumeau.
-            let label = match recall_cluster_name(&name_cache, &node_ids) {
-                Some(known) => { reused += 1; known }
+            // Échantillons = titre + extrait de CONTENU : le nommage peut ainsi
+            // repérer un client/entreprise récurrent (« Parabola ») que le titre
+            // seul (« Invoice-14545AA1-… ») ne révèle jamais. Calculés avant le
+            // `match` : ils servent aussi à contrôler un nom venu du cache.
+            let samples: Vec<String> = global.iter().take(12).map(|&i| {
+                let (id, label) = (&rest[i].0, &rest[i].1);
+                let snippet = by_id.get(id.as_str()).map(|n| {
+                    let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
+                    // 600 et non 200 : l'en-tête d'un document administratif (raison
+                    // sociale, adresse, SIRET) mange les ~150 premiers caractères, si
+                    // bien que le SUJET tombait hors de l'extrait — le modèle nommait
+                    // à l'aveugle et la vérification d'entité jugeait sur du papier
+                    // à en-tête (mesuré le 2026-08-24 sur le corpus de test).
+                    raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(600).collect::<String>()
+                }).unwrap_or_default();
+                if snippet.is_empty() { label.clone() } else { format!("{label} — {snippet}") }
+            }).collect();
+            // Déjà nommé à une passe précédente ? On reprend le nom — mais il
+            // repasse par le contrôle de couverture : un nom faux mis en cache ne
+            // se corrigerait JAMAIS, l'appel Gemma n'ayant plus lieu.
+            let (label, entity) = match recall_cluster_name(&name_cache, &node_ids) {
+                Some(known) => {
+                    let entity = known.entity.clone();
+                    match archivist::name_supported_by(&known.name, entity.as_deref(), &samples) {
+                        Some(ok) => { reused += 1; (ok, entity) }
+                        None => continue,
+                    }
+                }
                 None => {
-                    // Échantillons = titre + extrait de CONTENU : le nommage peut ainsi
-                    // repérer un client/entreprise récurrent (« Parabola ») que le titre
-                    // seul (« Invoice-14545AA1-… ») ne révèle jamais.
-                    let samples: Vec<String> = global.iter().take(12).map(|&i| {
-                        let (id, label) = (&rest[i].0, &rest[i].1);
-                        let snippet = by_id.get(id.as_str()).map(|n| {
-                            let raw = if !n.content.trim().is_empty() { n.content.as_str() } else { n.source_text.as_str() };
-                            raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect::<String>()
-                        }).unwrap_or_default();
-                        if snippet.is_empty() { label.clone() } else { format!("{label} — {snippet}") }
-                    }).collect();
                     let Some(fresh) = engine.and_then(|e| archivist::ai_name_cluster(e, &samples)) else { continue; };
                     fresh
                 }
             };
-            remember_cluster_name(&mut name_cache, &node_ids, &label);
+            remember_cluster_name(&mut name_cache, &node_ids, &label, entity.as_deref());
             // Cohésion du cluster RETENU, dans le même ordre que `clusters` : mesure
             // seule, elle n'entre dans aucune décision (la garde de cohésion a déjà
             // statué dans `cluster_indices`).
@@ -2075,20 +2123,24 @@ mod archivist_orchestration_tests {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut cache = Vec::new();
         let groupe = ids(&["a", "b", "c", "d", "e"]);
-        remember_cluster_name(&mut cache, &groupe, "Factures Parabola");
+        remember_cluster_name(&mut cache, &groupe, "Factures Parabola", Some("Parabola"));
+        let name_of = |c: &[ClusterName], g: &[String]| recall_cluster_name(c, g).map(|e| e.name.clone());
 
-        assert_eq!(recall_cluster_name(&cache, &groupe).as_deref(), Some("Factures Parabola"),
+        assert_eq!(name_of(&cache, &groupe).as_deref(), Some("Factures Parabola"),
             "groupe identique → même nom, aucun appel Gemma");
         // Une facture de plus, une retirée : toujours le même dossier.
-        assert_eq!(recall_cluster_name(&cache, &ids(&["a", "b", "c", "d", "f"])).as_deref(),
+        assert_eq!(name_of(&cache, &ids(&["a", "b", "c", "d", "f"])).as_deref(),
             Some("Factures Parabola"), "le groupe a bougé d'un document, pas d'identité");
+        // L'entité déclarée survit au cache : sans elle, un nom repris ne serait
+        // plus vérifiable contre les documents du jour.
+        assert_eq!(recall_cluster_name(&cache, &groupe).and_then(|e| e.entity.clone()).as_deref(), Some("Parabola"));
         // Groupe sans rapport : il doit être nommé pour lui-même.
-        assert_eq!(recall_cluster_name(&cache, &ids(&["x", "y", "z"])), None,
+        assert!(recall_cluster_name(&cache, &ids(&["x", "y", "z"])).is_none(),
             "un autre groupe ne doit jamais hériter d'un nom existant");
 
         // Le groupe suit ses documents : après renommage de la composition, un
         // ancien membre isolé ne rappelle plus le nom.
-        remember_cluster_name(&mut cache, &ids(&["a", "b", "c", "d", "f"]), "Factures Parabola");
+        remember_cluster_name(&mut cache, &ids(&["a", "b", "c", "d", "f"]), "Factures Parabola", Some("Parabola"));
         assert_eq!(cache.len(), 1, "un nom = une seule entrée, pas d'accumulation");
     }
 
@@ -2544,6 +2596,37 @@ async fn google_drive_connect(app: tauri::AppHandle) -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+/// Ouvre le panneau « Fichiers et dossiers » des Réglages Système (macOS), là où
+/// un refus d'autorisation TCC se rallume. Appelé depuis la bannière affichée
+/// quand un dossier du scan est revenu `PermissionDenied`.
+///
+/// Passé par Rust et non par `openUrl` côté JS : le scope par défaut du plugin
+/// opener ne laisse passer que http/https, le schéma `x-apple.systempreferences:`
+/// serait refusé — un bouton muet dans la fonctionnalité qui existe justement
+/// pour supprimer un silence.
+#[tauri::command]
+fn open_privacy_settings(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        return app
+            .opener()
+            .open_url(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders",
+                None::<&str>,
+            )
+            .map_err(|e| format!("Impossible d'ouvrir les Réglages Système : {e}"));
+    }
+    // Parité assumée (ADR-0015) : Windows n'a pas de consentement par dossier —
+    // un refus y vient des droits NTFS ou d'un disque absent. On le dit au lieu
+    // d'ouvrir un panneau qui ne réglerait rien.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("Sur cette plateforme, l'accès dépend des droits du dossier — vérifie qu'il est bien accessible.".to_string())
+    }
 }
 
 /// Synchronise les fichiers Drive vers le cache local. Renvoie (nouveaux, total).
@@ -7034,6 +7117,7 @@ pub fn run() {
             google_drive_sync,
             google_drive_disconnect,
             google_drive_roots,
+            open_privacy_settings,
             google_drive_children,
             google_drive_folder_count,
             google_drive_search_folders,

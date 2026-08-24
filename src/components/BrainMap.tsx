@@ -5,6 +5,7 @@ import type { BrainGraph, BrainNode, Space } from "@/lib/types";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { NodePicker } from "@/components/NodePicker";
 import { ThinkingOrb, type OrbState } from "thinking-orbs";
+import { humanEta } from "@/lib/utils";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -32,6 +33,9 @@ interface Props {
   phase?: "idle" | "scanning" | "generating";
   /** Message affiché sous l'orbe (root) — remplace le texte dessiné dans le canvas. */
   caption?: string | null;
+  /** Avancement sous le message : étape en cours + barre. `ratio: null` = total
+   *  inconnu, la barre reste indéterminée au lieu d'inventer une position. */
+  progress?: { step: number | null; steps: number; ratio: number | null; etaSec: number | null } | null;
   /** Passe de l'Archiviste en cours : rien ne change à l'écran tant qu'elle
    *  n'est pas finie (propositions batchées, cf. `archivingRef` dans App.tsx),
    *  donc la boucle de rendu se met en veille (~6 fps) pour libérer le GPU
@@ -392,7 +396,7 @@ export function BrainMap({
   revealKey = 0,
   spaces, onAddNodeToSpace, onMoveNode, onDeleteNode, onImportFiles,
   onBackgroundClick, panelOffset = 0, focus = null,
-  phase = "idle", caption = null, onOrbClick,
+  phase = "idle", caption = null, progress = null, onOrbClick,
   archiving = false,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -1211,6 +1215,27 @@ export function BrainMap({
           <span className="whitespace-nowrap text-xs text-[var(--color-muted)] group-hover:text-[var(--color-text)]">
             {caption}
           </span>
+        )}
+        {progress && (
+          <div className="w-48 space-y-1">
+            {/* Même barre que l'écran d'installation (`SetupScreen`) : un seul
+                objet « ça avance » dans toute l'app. */}
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-surface-2)]">
+              <div
+                className={`h-full rounded-full bg-[var(--color-accent)] ${
+                  progress.ratio === null ? "w-1/3 animate-pulse" : "transition-all duration-300"
+                }`}
+                style={progress.ratio === null ? undefined : { width: `${Math.round(progress.ratio * 100)}%` }}
+              />
+            </div>
+            {(progress.step !== null || progress.etaSec !== null) && (
+              <span className="block whitespace-nowrap text-center text-[10px] text-[var(--color-muted)]">
+                {progress.step !== null && `Étape ${progress.step}/${progress.steps}`}
+                {progress.step !== null && progress.etaSec !== null && " · "}
+                {progress.etaSec !== null && `reste ${humanEta(progress.etaSec)}`}
+              </span>
+            )}
+          </div>
         )}
       </div>
 

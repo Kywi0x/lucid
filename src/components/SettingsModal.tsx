@@ -672,8 +672,14 @@ function ConnectorsSection({
     try {
       const r = await localFolderSync();
       const skipped = r.skipped.length ? ` — ${r.skipped.length} illisibles` : "";
-      msg("local-folder", (r.new > 0 ? `${r.new} nouveaux sur ${r.total}` : `${r.total} fichiers indexés`) + skipped);
+      // Un dossier refusé par l'OS ne se compte pas avec les fichiers illisibles :
+      // son contenu n'a même pas été vu, et il y a un geste à faire pour l'ouvrir.
+      const denied = r.denied?.length
+        ? ` — ${r.denied.length} dossier${r.denied.length > 1 ? "s" : ""} sans autorisation (Réglages Système › Fichiers et dossiers)`
+        : "";
+      msg("local-folder", (r.new > 0 ? `${r.new} nouveaux sur ${r.total}` : `${r.total} fichiers indexés`) + skipped + denied);
       if (r.skipped.length) console.warn("Dossiers locaux — fichiers ignorés :", r.skipped);
+      if (r.denied?.length) console.warn("Dossiers locaux — accès refusé :", r.denied);
       onRefresh();
       if (r.total > 0) onSyncDone(r.new > 0);
     } catch (e) { msg("local-folder", `Erreur : ${e}`); }

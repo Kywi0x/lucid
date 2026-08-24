@@ -73,13 +73,14 @@ import { fetchSharedWithMe, ensurePersonalMcpSpace, type SharedWithMe } from "@/
 import { supabase } from "@/lib/supabase";
 import type { McpProposal, SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
+import { FolderAccessBanner } from "@/components/FolderAccessBanner";
 import { InboxPanel } from "@/components/InboxPanel";
 import type {
   BrainGraph,
   BrainNode,
   ConnectorStatus,
 } from "@/lib/types";
-import { cn, relativeDate } from "@/lib/utils";
+import { cn, etaSeconds, relativeDate } from "@/lib/utils";
 
 type View = "map" | "folder";
 
@@ -168,6 +169,18 @@ function App() {
   // aucun moyen de savoir si l'Archiviste avance ou est planté (retour de Liam
   // le 2026-07-24).
   const [archiveProgress, setArchiveProgress] = useState<{ current: number; total: number } | null>(null);
+  /** Temps restant de l'étape EN COURS, mesuré (pas estimé à la louche). */
+  const [etaSec, setEtaSec] = useState<number | null>(null);
+  const etaRef = useRef<{ key: string; at: number; from: number } | null>(null);
+  /** Fichiers que le scan initial n'a pas su lire — annoncés en fin de course. */
+  const scanSkippedRef = useRef<string[]>([]);
+  /** Dossiers refusés par l'OS pendant le scan (TCC macOS) — bannière dédiée :
+   *  un toast qui passe ne convient pas, il y a un geste à faire pour débloquer. */
+  const [deniedFolders, setDeniedFolders] = useState<string[]>([]);
+  /** Scan complet en cours (scan → génération → rangement). Une régénération
+   *  seule n'est PAS une étape 2 sur 3 : compter les étapes d'un parcours qu'on
+   *  ne fait pas serait le premier mensonge de la barre. */
+  const [fullRun, setFullRun] = useState(false);
   // Miroir en ref (pas juste le state) : le poll autonome plus bas lit cette
   // valeur depuis une closure figée au montage de son effet — un state y
   // serait toujours celui du premier rendu, jamais mis à jour. Sert à mettre
@@ -234,17 +247,35 @@ function App() {
     setDemoMode(true);
   }
 
+  /** Temps restant de l'étape en cours, extrapolé du **débit observé** depuis son
+   *  premier événement. Deux refus assumés : pas de pourcentage global (les trois
+   *  étapes ne comptent pas la même chose — fichiers, documents, pages — un chiffre
+   *  unique mentirait), et rien d'annoncé avant 3 éléments et 5 s de mesure, sinon
+   *  c'est du bruit affiché comme une promesse. */
+  function trackEta(key: string, current: number, total: number) {
+    const now = Date.now();
+    const ref = etaRef.current;
+    if (!ref || ref.key !== key || current < ref.from) {
+      etaRef.current = { key, at: now, from: current };
+      setEtaSec(null);
+      return;
+    }
+    setEtaSec(etaSeconds({ at: ref.at, current: ref.from }, current, total, now));
+  }
+
   /** Bouton "Commencer à créer mon cerveau" : connecte + synchronise les dossiers
    *  locaux (Bureau/Documents/Téléchargements) avec un retour fichier par fichier
    *  en direct, puis enchaîne sur la génération du cerveau. Le 1er accès à ces
    *  dossiers déclenche la demande d'autorisation native de l'OS (Mac : prompts
    *  TCC par dossier ; Windows : accès direct, pas de prompt système). */
   async function handleStartScan() {
+    setFullRun(true);
     setScanning(true);
     setError(null);
     setScanFiles([]);
     const unlisten = await listen<LocalFolderProgress>("local-folder-progress", (e) => {
       setScanProgress(e.payload);
+      trackEta("scan", e.payload.current, e.payload.total);
       setScanFiles((prev) => [...prev, e.payload.label]);
     });
     let ok = true;
@@ -265,7 +296,16 @@ function App() {
       } catch { /* absent ou déjà configuré autrement : silencieux, pas une erreur */ }
 
       await localFolderConnect();
-      await localFolderSync();
+      // Le rapport était jeté ici alors que `SettingsModal` l'annonce sur une
+      // synchro manuelle : le premier scan — celui sur lequel le produit est jugé
+      // — était donc le SEUL chemin où les fichiers illisibles passaient sous
+      // silence (interdit par l'ADR-0015). Annoncé en fin de course, une fois
+      // l'Archiviste passé, pour ne pas se faire écraser par son propre toast.
+      const report = await localFolderSync();
+      scanSkippedRef.current = report.skipped;
+      if (report.skipped.length) console.warn("Scan initial — fichiers illisibles :", report.skipped);
+      setDeniedFolders(report.denied ?? []);
+      if (report.denied?.length) console.warn("Scan initial — dossiers refusés par l'OS :", report.denied);
 
       // Notes Apple : Mac uniquement. Sur Windows ou si l'autorisation est
       // refusée, l'échec est attendu — on ne bloque pas le scan pour ça
@@ -278,6 +318,7 @@ function App() {
     } catch (e) {
       ok = false;
       setError(String(e));
+      setFullRun(false);
     } finally {
       unlisten();
       setScanning(false);
@@ -287,7 +328,15 @@ function App() {
       await handleGenerate();
       // Fin du scan machine : l'Archiviste range/fusionne ce que le pipeline
       // vient de générer (bac "Non triable", doublons de titres proches…).
-      void runArchivistNow();
+      await runArchivistNow();
+      setFullRun(false);
+      const skipped = scanSkippedRef.current;
+      if (skipped.length) {
+        showToast(
+          `${skipped.length} fichier${skipped.length > 1 ? "s" : ""} n'${skipped.length > 1 ? "ont" : "a"} pas pu être lu${skipped.length > 1 ? "s" : ""} — détail dans Réglages › Sources › Dossiers locaux.`,
+          10000,
+        );
+      }
     }
   }
 
@@ -325,7 +374,7 @@ function App() {
     const started = Date.now();
     const unlisten = await listen<{ current: number; total: number }>(
       "archivist-progress",
-      (e) => setArchiveProgress(e.payload),
+      (e) => { setArchiveProgress(e.payload); trackEta("arch", e.payload.current, e.payload.total); },
     );
     try {
       const report = await runArchivist();
@@ -427,6 +476,29 @@ function App() {
     return null;
   }, [scanning, scanProgress, generating, progress, archiving, archiveProgress]);
 
+  /** Ce que la barre affiche. Elle suit l'étape en cours, et **reste
+   *  indéterminée** (`ratio: null`) tant que le total n'est pas connu : une barre
+   *  qui avance sans savoir où elle va est un mensonge, la friction n°1 du
+   *  [[Parcours utilisateur (one-click)]] étant l'attente muette, pas l'attente. */
+  const busyProgress = useMemo(() => {
+    const phase = scanning
+      ? { step: 1, p: scanProgress }
+      : generating
+        ? { step: 2, p: progress }
+        : archiving
+          ? { step: 3, p: archiveProgress }
+          : null;
+    if (!phase) return null;
+    const current = phase.p?.current ?? 0;
+    const total = phase.p?.total ?? 0;
+    return {
+      step: fullRun ? phase.step : null,
+      steps: 3,
+      ratio: total > 0 ? Math.min(1, current / total) : null,
+      etaSec,
+    };
+  }, [scanning, scanProgress, generating, progress, archiving, archiveProgress, etaSec, fullRun]);
+
   useEffect(() => {
     // L'IA locale est OBLIGATOIRE : si le modèle de génération manque, on affiche
     // l'écran de préparation (DL auto, décision Liam 2026-07-30). Le choix du
@@ -441,9 +513,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<BrainProgress>("brain-progress", (e) =>
-      setProgress(e.payload),
-    );
+    const unlisten = listen<BrainProgress>("brain-progress", (e) => {
+      setProgress(e.payload);
+      trackEta("gen", e.payload.current, e.payload.total);
+    });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
@@ -1151,6 +1224,10 @@ function App() {
         />
       )}
 
+      {deniedFolders.length > 0 && (
+        <FolderAccessBanner folders={deniedFolders} onDismiss={() => setDeniedFolders([])} />
+      )}
+
       {!booted ? null : !graph && !generating && !scanning ? (
         <GenerateEmpty
           error={error}
@@ -1188,6 +1265,7 @@ function App() {
               // ci-dessous, pas de la phase.
               phase={scanning ? "scanning" : generating ? "generating" : "idle"}
               caption={busyMessage}
+              progress={busyProgress}
               archiving={archiving}
               spaces={spaces}
               onAddNodeToSpace={handleAddNodeToSpace}

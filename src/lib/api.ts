@@ -117,6 +117,11 @@ export function localFolderSync(): Promise<import("./types").LocalFolderSyncRepo
   return invoke("local_folder_sync");
 }
 
+/** Ouvre le panneau d'autorisation des dossiers (Réglages Système, macOS). */
+export function openPrivacySettings(): Promise<void> {
+  return invoke("open_privacy_settings");
+}
+
 /** Enregistre les credentials OAuth Google (client_id + client_secret) en app data. */
 export function googleDriveSaveCredentials(clientId: string, clientSecret: string): Promise<void> {
   return invoke("google_drive_save_credentials", { clientId, clientSecret });

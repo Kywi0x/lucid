@@ -28,6 +28,34 @@ export function relativeDate(iso: string | null): string {
   return `il y a ${mo} mois`;
 }
 
+/** Temps restant extrapolé du **débit observé** depuis le premier événement de
+ *  l'étape. `null` = trop tôt pour annoncer quoi que ce soit (moins de 3 éléments
+ *  traités ou 5 s de mesure) : une extrapolation sur deux points saute d'une
+ *  minute à une heure entre deux images.
+ *  `now` est passé en paramètre pour rester une fonction pure (donc testable). */
+export function etaSeconds(
+  from: { at: number; current: number },
+  current: number,
+  total: number,
+  now: number,
+): number | null {
+  const done = current - from.current;
+  const elapsed = (now - from.at) / 1000;
+  if (done < 3 || elapsed < 5 || total <= current) return null;
+  return Math.round((elapsed / done) * (total - current));
+}
+
+/** Durée restante en français, arrondie à la grandeur utile ("~2 min").
+ *  Volontairement grossier : annoncer « 1 min 47 s » sur une extrapolation
+ *  donnerait à un ordre de grandeur l'allure d'une garantie. */
+export function humanEta(seconds: number): string {
+  if (seconds < 45) return "moins d'1 min";
+  const min = Math.round(seconds / 60);
+  if (min < 60) return `~${min} min`;
+  const h = Math.floor(min / 60);
+  return `~${h} h ${min % 60} min`;
+}
+
 /** Copie dans le presse-papier. Le plugin Tauri d'abord (les API web —
  *  navigator.clipboard ET execCommand — échouent en silence dans la WKWebView),
  *  puis les replis web pour un éventuel contexte navigateur. */

@@ -32,6 +32,10 @@ export interface LocalFolderSyncReport {
   total: number;
   /** Fichiers illisibles : "chemin — raison". */
   skipped: string[];
+  /** Dossiers refusés par l'OS (macOS : autorisation TCC non accordée). Séparés
+   *  des `skipped` : ici l'utilisateur peut débloquer d'un clic, et tant qu'il
+   *  ne le fait pas le contenu du dossier reste invisible. */
+  denied: string[];
 }
 
 /** Proposition MCP en attente de validation — 5 formes (`action`), un seul

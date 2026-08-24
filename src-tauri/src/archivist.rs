@@ -1211,6 +1211,18 @@ pub const CLUSTER_MIN_LINK: f32 = 0.80;
 /// ~[0.6,1.0], donc un seuil ABSOLU ne sépare pas les thèmes (un cours de
 /// physique et une carte grise sont à 0.78) ; la cohésion au centroïde, si.
 pub const CLUSTER_COHESION_MIN: f32 = 0.84;
+/// Écart au-delà duquel un membre est considéré comme **décroché** du reste de
+/// son groupe, et retiré même si la cohésion moyenne est bonne.
+///
+/// La garde de cohésion raisonne sur une MOYENNE : 4 documents à 0,98 et un
+/// intrus à 0,879 donnent 0,959, très au-dessus du plancher — le groupe est
+/// déclaré sain et personne ne regarde le membre le plus loin. Un intrus isolé
+/// dans un groupe serré est donc structurellement invisible (« Formations
+/// Pharmadvance » avait avalé une étude de marché, 2026-08-24).
+///
+/// Mesuré sur les 12 dossiers du corpus réel de Liam : **2 éjections, dans les
+/// 2 seuls dossiers qu'il a signalés, zéro dégât sur les 10 autres.**
+pub const CLUSTER_OUTLIER_MARGIN: f32 = 0.05;
 
 /// Groupes d'INDICES (dans l'ordre de `vecs`) par **k-NN mutuel + garde de
 /// cohésion**. Remplace le single-linkage par seuil absolu, qui chaînait A~B~C
@@ -1221,6 +1233,12 @@ pub const CLUSTER_COHESION_MIN: f32 = 0.84;
 /// gardée que si elle est cohésive autour de son centroïde. Pur → testable sans
 /// moteur.
 pub fn cluster_indices(vecs: &[Vec<f32>]) -> Vec<Vec<usize>> {
+    cluster_indices_with(vecs, CLUSTER_COHESION_MIN, CLUSTER_OUTLIER_MARGIN)
+}
+
+/// Idem, avec un seuil de cohésion explicite (réglable sans recompilation via
+/// `archivist_tuning.json`).
+pub fn cluster_indices_with(vecs: &[Vec<f32>], cohesion_min: f32, outlier_margin: f32) -> Vec<Vec<usize>> {
     let n = vecs.len();
     if n == 0 { return Vec::new(); }
     let sim = |i: usize, j: usize| crate::ai::llama::cosine(&vecs[i], &vecs[j]);
@@ -1256,7 +1274,7 @@ pub fn cluster_indices(vecs: &[Vec<f32>]) -> Vec<Vec<usize>> {
     // Garde de cohésion sur chaque composante, puis ordre déterministe.
     let mut out: Vec<Vec<usize>> = Vec::new();
     for (_, members) in groups {
-        out.extend(cohesive_split(vecs, members));
+        out.extend(cohesive_split(vecs, members, cohesion_min, outlier_margin));
     }
     for g in &mut out { g.sort(); }
     out.sort_by_key(|g| g[0]);
@@ -1277,14 +1295,36 @@ fn centroid_of(vecs: &[Vec<f32>], idx: &[usize]) -> Vec<f32> {
 /// retirés ET une composante entièrement dissoute reviennent en SINGLETONS —
 /// jamais perdus (l'appelant les enverra en « Non triable » via le filtre
 /// MIN_CLUSTER). Un groupe déjà cohésif est renvoyé tel quel.
-fn cohesive_split(vecs: &[Vec<f32>], mut members: Vec<usize>) -> Vec<Vec<usize>> {
+fn cohesive_split(vecs: &[Vec<f32>], mut members: Vec<usize>, cohesion_min: f32, outlier_margin: f32) -> Vec<Vec<usize>> {
     if members.len() < 2 { return vec![members]; }
     let mut dropped: Vec<usize> = Vec::new();
     loop {
         let c = centroid_of(vecs, &members);
         let sims: Vec<(usize, f32)> = members.iter().map(|&i| (i, crate::ai::llama::cosine(&vecs[i], &c))).collect();
         let avg = sims.iter().map(|(_, s)| s).sum::<f32>() / sims.len() as f32;
-        if avg >= CLUSTER_COHESION_MIN {
+        if avg >= cohesion_min {
+            // Cohésion moyenne atteinte : reste le cas du membre DÉCROCHÉ, que la
+            // moyenne ne peut pas voir. On ne descend jamais sous 3 membres — en
+            // dessous, l'appelant dissoudrait le groupe, ce qui coûterait plus que
+            // l'intrus.
+            if members.len() > 3 {
+                let worst = members
+                    .iter()
+                    .map(|&i| {
+                        let sum_others: f32 = sims.iter().filter(|(j, _)| *j != i).map(|(_, s)| s).sum();
+                        let mean_others = sum_others / (members.len() - 1) as f32;
+                        let s = sims.iter().find(|(j, _)| *j == i).map(|(_, s)| *s).unwrap_or(0.0);
+                        (i, mean_others - s)
+                    })
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some((i, ecart)) = worst {
+                    if ecart > outlier_margin {
+                        members.retain(|&m| m != i);
+                        dropped.push(i);
+                        continue; // un décroché peut en cacher un autre
+                    }
+                }
+            }
             let mut out = vec![members];
             out.extend(dropped.into_iter().map(|m| vec![m]));
             return out;
@@ -1299,10 +1339,70 @@ fn cohesive_split(vecs: &[Vec<f32>], mut members: Vec<usize>) -> Vec<Vec<usize>>
     }
 }
 
+/// Un nom de dossier ne doit promettre que ce que le dossier contient.
+///
+/// Gemma nomme volontiers d'après le client dominant — utile, mais il l'applique
+/// dès qu'un client **revient**, pas quand il **couvre**. Cas réel du 2026-08-24 :
+/// un groupe de 7 devis dont 5 concernent le même client a pris le nom de ce
+/// client, et une estimation de réparation automobile s'est retrouvée rangée sous
+/// une enseigne qui n'a rien à voir. Le regroupement était bon ; c'est le NOM qui
+/// mentait.
+///
+/// **On vérifie la seule chose que le modèle a affirmée** : l'entité qu'il déclare
+/// (`entity`) est-elle vraiment présente dans les documents ? Si elle couvre moins
+/// de 80 % de l'échantillon, ses mots sortent du nom — il reste le mot de type
+/// (« Devis »), qui est honnête.
+///
+/// Première version (matin du 24/08) : le contrôle portait sur **tous** les mots
+/// du nom. Écarté le soir même, sur mesure — un mot de type présent dans 7 docs
+/// sur 11 (64 %) tombait comme un nom d'entité, le nom devenait vide et **le
+/// groupe entier repartait en « Non triable »**. Pire, un mot absent partout
+/// (jugement thématique, invérifiable) survivait à un mot majoritaire. La
+/// couverture ne distingue pas une entité d'un mot commun : 71 % pour un client,
+/// 64 % pour un type — c'est le MODÈLE qui doit dire lequel est lequel, le code
+/// se contente de vérifier sa déclaration.
+///
+/// `entity == None` ⇒ rien n'est promis, le nom passe tel quel.
+pub fn name_supported_by(name: &str, entity: Option<&str>, samples: &[String]) -> Option<String> {
+    if samples.is_empty() { return None; }
+    let core = |w: &str| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+    let Some(entity) = entity.map(str::trim).filter(|e| !e.is_empty() && *e != "null") else {
+        return Some(name.trim().to_string()).filter(|n| !n.is_empty());
+    };
+    let ent_words: Vec<String> = entity.split_whitespace()
+        .map(|w| core(w)).filter(|w| w.chars().count() >= 3).collect();
+    if ent_words.is_empty() { return Some(name.trim().to_string()); }
+
+    let lowered: Vec<String> = samples.iter().map(|s| s.to_lowercase()).collect();
+    // Un document « contient l'entité » dès qu'un de ses mots significatifs y est :
+    // « Novolia SAS » se cite aussi bien « Novolia » tout court.
+    let covered = lowered.iter().filter(|s| ent_words.iter().any(|w| s.contains(w))).count();
+    // 80 % du groupe, **ou** un seul document manquant. Le plancher n'est pas du
+    // confort : sur un groupe de 4, 3/4 = 75 % tombait sous les 80 % et le dossier
+    // « Véhicule Peugeot 208 » — parfaitement cohérent, cohésion 0,96 — était
+    // abandonné parce qu'UN document sur quatre ne citait pas le modèle dans son
+    // extrait (mesuré le 2026-08-24). Le cas d'origine reste refusé : 5/7, il en
+    // manque deux.
+    let missing = samples.len() - covered;
+    if missing <= 1 || covered * 5 >= samples.len() * 4 {
+        return Some(name.trim().to_string()); // l'entité couvre le dossier : nom conservé
+    }
+
+    // Elle n'en couvre qu'une partie : ses mots sortent, le reste du nom demeure.
+    let mut kept: Vec<&str> = name.split_whitespace()
+        .filter(|w| !ent_words.contains(&core(w)))
+        .collect();
+    let is_short = |w: &&str| core(w).chars().count() < 3;
+    while kept.first().is_some_and(is_short) { kept.remove(0); }
+    while kept.last().is_some_and(is_short) { kept.pop(); }
+    if kept.is_empty() { return None; } // le nom N'ÉTAIT que l'entité : on renonce
+    Some(kept.join(" "))
+}
+
 /// Nomme un groupe (Phase 2) : Gemma ne fait QUE ça — donner un nom de dossier
 /// court à partir d'un échantillon des documents du groupe. `samples` = titres
 /// (+ éventuel extrait). Renvoie un label court, ou `None` si réponse inexploitable.
-pub fn ai_name_cluster(engine: &LlamaEngine, samples: &[String]) -> Option<String> {
+pub fn ai_name_cluster(engine: &LlamaEngine, samples: &[String]) -> Option<(String, Option<String>)> {
     if samples.is_empty() { return None; }
     let mut prompt = String::from("Voici des documents d'un même dossier (titre — extrait du contenu) :\n");
     for s in samples.iter().take(12) {
@@ -1310,11 +1410,15 @@ pub fn ai_name_cluster(engine: &LlamaEngine, samples: &[String]) -> Option<Strin
     }
     prompt.push_str(
         "\nDonne un nom de DOSSIER court (2 à 4 mots, français). PRIORITÉ ABSOLUE : si un même CLIENT / \
-         ENTREPRISE / PERSONNE revient dans ces documents, nomme le dossier d'après lui (ex. « Factures \
-         Parabola », « Devis Novolia ») — c'est le nom du client qui compte, PAS un mot de rôle générique \
-         comme « Services », « Prestations », « Documents ». Seulement s'il n'y a AUCUN client identifiable, \
-         donne un nom thématique court (ex. « Factures », « Immobilier »). JAMAIS une phrase ni « Divers ».\n\
-         Renvoie UNIQUEMENT : {\"name\": \"…\"}\n",
+         ENTREPRISE / PERSONNE apparaît dans PRESQUE TOUS les documents ci-dessus, nomme le dossier d'après \
+         lui (ex. « Factures Parabola », « Devis Novolia ») — c'est le nom du client qui compte, PAS un mot \
+         de rôle générique comme « Services », « Prestations », « Documents ». S'il n'apparaît que dans une \
+         PARTIE des documents, ne l'utilise PAS : le dossier contiendrait des documents qui n'ont rien à \
+         voir avec lui. Dans ce cas, ou s'il n'y a aucun client identifiable, donne un nom thématique court \
+         (ex. « Factures », « Immobilier »). JAMAIS une phrase ni « Divers ».\n\
+         Indique séparément le CLIENT / ENTREPRISE / PERSONNE que tu as utilisé dans le nom, ou null \
+         si le nom est purement thématique — il est vérifié dans les documents.\n\
+         Renvoie UNIQUEMENT : {\"name\": \"…\", \"entite\": \"…\" ou null}\n",
     );
     let raw = engine.complete_json(Some(SYSTEM_PROMPT), &prompt, 60).ok()?;
     let js = crate::ai::pipeline::extract_json(&raw)?;
@@ -1327,9 +1431,20 @@ pub fn ai_name_cluster(engine: &LlamaEngine, samples: &[String]) -> Option<Strin
     // trompeur (garde-fou en plus de la cohésion, au cas où un groupe limite
     // passe le seuil).
     const GENERIC: [&str; 8] = ["divers", "varié", "varies", "autre", "document", "fichier", "misc", "général"];
+    // Filtre de couverture AVANT le rejet des fourre-tout : retirer un nom
+    // d'entité peut laisser un mot générique (« Devis Novolia » → « Devis »
+    // reste bon, mais « Dossiers Novolia » → « Dossiers » ne l'est pas).
+    let entity = v.get("entite").and_then(|e| e.as_str()).map(str::to_string);
+    let Some(name) = name_supported_by(name, entity.as_deref(), samples) else {
+        crate::elog!("🗂️ nommage: proposition rejetée (le nom n'était que l'entité, absente d'une partie des documents) — groupe abandonné.");
+        return None;
+    };
     let low = name.to_lowercase();
-    if GENERIC.iter().any(|g| low.contains(g)) { return None; }
-    Some(name.to_string())
+    if GENERIC.iter().any(|g| low.contains(g)) {
+        crate::elog!("🗂️ nommage: proposition rejetée (nom fourre-tout) — groupe abandonné.");
+        return None;
+    }
+    Some((name, entity))
 }
 
 // ─── Tag de domaine (le « sujet », que l'embedding noie sous la forme) ──────
@@ -2612,5 +2727,130 @@ mod tests {
         assert!(parse_taxonomy("pas du json", &valid).is_empty());
         // profondeur excessive (> MAX_TAXO_DEPTH) écartée
         assert!(parse_taxonomy(r#"{"groups": [{"path": "a/b/c/d/e", "themes": ["arch-theme-devis", "arch-theme-invoice"]}]}"#, &valid).is_empty());
+    }
+    // ── Nom de dossier : ce qu'il promet doit être dans le dossier ────────────
+    // Cas réel du 2026-08-24 (noms fictifs ici) : 7 devis, 5 pour le même client,
+    // le dossier prenait le nom du client et avalait une estimation auto.
+
+    fn devis_samples() -> Vec<String> {
+        let mut v: Vec<String> = (0..5)
+            .map(|i| format!("Devis {i} — Proposition commerciale pour Novolia SAS, prestation annuelle."))
+            .collect();
+        v.push("Estimation remplacement radar avant — véhicule, pièces et main d'oeuvre.".to_string());
+        v.push("Devis toiture — remplacement de tuiles, échafaudage compris.".to_string());
+        v
+    }
+
+    #[test]
+    fn nom_de_dossier_retire_le_client_qui_ne_couvre_pas_le_groupe() {
+        let s = devis_samples(); // « novolia » : 5/7 = 71 %, sous le seuil de 80 %
+        assert_eq!(name_supported_by("Devis Novolia", Some("Novolia"), &s).as_deref(), Some("Devis"));
+    }
+
+    /// Cas réel du 2026-08-24 : « Formations Pharmadvance » avait avalé une étude
+    /// de marché. 4 documents à ~0,98 du centroïde, l'intrus à 0,879 — la MOYENNE
+    /// (0,959) passait le plancher de cohésion sans qu'on regarde le décroché.
+    #[test]
+    fn un_membre_decroche_est_retire_meme_si_la_moyenne_est_bonne() {
+        // 4 vecteurs quasi identiques + 1 nettement à l'écart, en 3 dimensions.
+        let serre = vec![
+            vec![1.0, 0.02, 0.0],
+            vec![1.0, 0.00, 0.02],
+            vec![0.99, 0.03, 0.01],
+            vec![1.0, 0.01, 0.03],
+        ];
+        let mut vecs = serre.clone();
+        // L'intrus doit être assez proche pour ÊTRE lié (plancher 0,80) mais assez
+        // loin pour décrocher — sinon le test passerait pour la mauvaise raison.
+        vecs.push(vec![1.0, 0.50, 0.0]); // ~0,89 avec les autres
+        let groupes = cluster_indices_with(&vecs, CLUSTER_COHESION_MIN, CLUSTER_OUTLIER_MARGIN);
+        let garde: Vec<&Vec<usize>> = groupes.iter().filter(|g| g.len() >= 3).collect();
+        assert_eq!(garde.len(), 1, "un seul vrai groupe attendu : {groupes:?}");
+        assert_eq!(garde[0], &vec![0, 1, 2, 3], "l'intrus (index 4) doit être sorti");
+
+        // Marge à 1.0 = garde désactivée : l'intrus reste, preuve que c'est bien
+        // ce critère-là qui l'a retiré (et qu'il est réglable sans recompiler).
+        let sans_garde = cluster_indices_with(&vecs, CLUSTER_COHESION_MIN, 1.0);
+        assert!(sans_garde.iter().any(|g| g.len() == 5), "sans la garde, le groupe reste entier");
+    }
+
+    /// Un groupe de 3 ne se fait jamais amputer : à 2 membres l'appelant le
+    /// dissoudrait, ce qui coûterait plus cher que l'intrus.
+    #[test]
+    fn un_groupe_de_trois_nest_jamais_ampute() {
+        let vecs = vec![
+            vec![1.0, 0.02, 0.0],
+            vec![1.0, 0.00, 0.02],
+            vec![1.0, 0.50, 0.0], // décroché (~0,89), mais on est trois
+        ];
+        let groupes = cluster_indices_with(&vecs, 0.5, CLUSTER_OUTLIER_MARGIN);
+        assert!(groupes.iter().any(|g| g.len() == 3), "les 3 restent ensemble : {groupes:?}");
+    }
+
+    #[test]
+    fn nom_de_dossier_tolere_un_seul_document_sans_lentite() {
+        // Groupe voiture réel : 4 documents, 3 citent le modèle dans leur extrait,
+        // le quatrième a un en-tête d'assureur qui mange les 200 premiers caractères.
+        // 75 % < 80 %, mais un seul manquant : le dossier doit vivre.
+        let mut s: Vec<String> = (0..3).map(|i| format!("Document {i} — Peugeot 208, immatriculation AB-123-CD.")).collect();
+        s.push("Attestation — Assurances Meridian, 3 place du Marché, contrat 447-882-19.".to_string());
+        assert_eq!(name_supported_by("Véhicule Peugeot 208", Some("Peugeot 208"), &s).as_deref(),
+                   Some("Véhicule Peugeot 208"));
+    }
+
+    #[test]
+    fn nom_de_dossier_garde_le_client_qui_couvre_tout() {
+        let s: Vec<String> = (0..6)
+            .map(|i| format!("Facture {i} — Parabola SARL, prestation mensuelle."))
+            .collect();
+        assert_eq!(name_supported_by("Factures Parabola", Some("Parabola SARL"), &s).as_deref(), Some("Factures Parabola"));
+    }
+
+    #[test]
+    fn nom_de_dossier_garde_un_mot_purement_thematique() {
+        // « immobilier » n'apparaît dans AUCUN document : c'est un jugement du
+        // modèle, pas une promesse d'entité. Mesuré : 8 clusters sur 19 en ont un.
+        let s: Vec<String> = ["Compromis de vente — appartement T3, 62 m2.",
+                              "Acte notarié — cession de lot, copropriété."]
+            .iter().map(|x| x.to_string()).collect();
+        assert_eq!(name_supported_by("Immobilier", None, &s).as_deref(), Some("Immobilier"));
+    }
+
+    #[test]
+    fn nom_de_dossier_tolere_un_intrus_isole_sur_un_grand_groupe() {
+        // 9/10 = 90 % : un seul document hors sujet ne fait pas tomber le nom.
+        let mut s: Vec<String> = (0..9).map(|i| format!("Bail {i} — Résidence Kestrel, loyer mensuel.")).collect();
+        s.push("Attestation d'assurance — habitation.".to_string());
+        assert_eq!(name_supported_by("Baux Kestrel", Some("Résidence Kestrel"), &s).as_deref(), Some("Baux Kestrel"));
+    }
+
+    #[test]
+    fn nom_de_dossier_sans_rien_de_soutenu_renonce() {
+        // Les deux mots viennent d'un seul document sur cinq : on ne nomme pas.
+        let mut s: Vec<String> = (0..4).map(|i| format!("Note de service {i} — organisation interne.")).collect();
+        s.push("Kestrel Novolia — protocole d'accord.".to_string());
+        assert_eq!(name_supported_by("Kestrel Novolia", Some("Kestrel Novolia"), &s), None);
+    }
+
+    #[test]
+    fn nom_de_dossier_ne_retire_jamais_le_mot_de_type() {
+        // Régression du 24/08 : « devis » présent dans 7 documents sur 11 (64 %)
+        // tombait comme un nom d'entité, le nom devenait vide et LE GROUPE ENTIER
+        // repartait en « Non triable ». Seule l'entité déclarée est vérifiée.
+        let mut s: Vec<String> = (0..7).map(|i| format!("Devis {i} — proposition commerciale.")).collect();
+        s.extend((0..4).map(|i| format!("Note interne {i} — organisation du service.")));
+        assert_eq!(name_supported_by("Devis Novolia", Some("Novolia"), &s).as_deref(), Some("Devis"));
+        // Et sans entité déclarée, le nom passe tel quel : on ne devine pas.
+        assert_eq!(name_supported_by("Devis Commerciaux", None, &s).as_deref(), Some("Devis Commerciaux"));
+    }
+
+    #[test]
+    fn nom_de_dossier_ne_laisse_pas_un_mot_outil_orphelin() {
+        let s: Vec<String> = (0..5).map(|i| format!("Contrat {i} — prestation de service.")).collect();
+        // « novolia » absent de tous les documents SAUF un : retiré, et le « de »
+        // qui le précédait ne doit pas rester à traîner en fin de nom.
+        let mut s2 = s.clone();
+        s2[0] = "Contrat 0 — prestation Novolia.".to_string();
+        assert_eq!(name_supported_by("Contrats de Novolia", Some("Novolia"), &s2).as_deref(), Some("Contrats"));
     }
 }
