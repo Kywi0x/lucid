@@ -73,7 +73,7 @@ import { notify } from "@/lib/notify";
 import type { ConnectorStatus, Space } from "@/lib/types";
 import { cn, relativeDate, copyText } from "@/lib/utils";
 import { McpConnectGuide } from "@/components/McpConnectGuide";
-import { ensurePersonalMcpUrl } from "@/lib/share";
+import { ensurePersonalMcpUrl, existingPersonalMcpUrl, revokePersonalMcpToken, rotatePersonalMcpUrl } from "@/lib/share";
 
 // ── Brand logos ───────────────────────────────────────────────────────────────
 
@@ -1515,9 +1515,14 @@ export function AiClientsSection() {
   const [error, setError] = useState<string | null>(null);
   const [archiving, setArchiving] = useState(false);
   const [archiveResult, setArchiveResult] = useState<string | null>(null);
+  const [rotating, setRotating] = useState(false);
 
   useEffect(() => {
     mcpManualValidationEnabled().then(setManualValidationState).catch(() => {});
+    // Une URL déjà créée doit être VISIBLE sans rien cliquer : sinon révoquer
+    // exigeait de d'abord copier son URL, ce qui est absurde quand on veut
+    // justement la tuer. Lecture seule — aucune publication du cerveau.
+    existingPersonalMcpUrl().then((u) => { if (u) setMcpUrl(u); }).catch(() => {});
   }, []);
 
   async function handleRunArchivist() {
@@ -1535,6 +1540,41 @@ export function AiClientsSection() {
 
   async function copyUrl(u: string) {
     if (await copyText(u)) { setCopied(true); setTimeout(() => setCopied(false), 2000); }
+  }
+
+  /** Nouvelle URL, l'ancienne meurt. Le geste utile quand l'URL a fuité :
+   *  révoquer seul laisserait les IA muettes sans dire quoi faire ensuite. */
+  async function handleRotate() {
+    if (!confirm("Regénérer l'URL MCP ? L'ancienne cessera de fonctionner immédiatement — il faudra recoller la nouvelle dans chaque IA connectée.")) return;
+    setRotating(true);
+    setError(null);
+    try {
+      const url = await rotatePersonalMcpUrl();
+      if (!url) { setError("Regénération impossible — réessaie après une analyse."); return; }
+      setMcpUrl(url);
+      await copyUrl(url);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setRotating(false);
+    }
+  }
+
+  /** Coupe l'accès sans en rouvrir. Pour « je ne veux plus qu'aucune IA lise
+   *  mon cerveau », pas pour une fuite (là, c'est `handleRotate`). */
+  async function handleRevoke() {
+    if (!confirm("Révoquer l'URL MCP ? Toutes tes IA connectées perdent l'accès à ton cerveau, et aucune nouvelle URL n'est créée.")) return;
+    setRotating(true);
+    setError(null);
+    try {
+      await revokePersonalMcpToken();
+      setMcpUrl(null);
+      localStorage.removeItem("lucid.mcp.connected");
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setRotating(false);
+    }
   }
 
   async function handleGetUrl() {
@@ -1578,6 +1618,25 @@ export function AiClientsSection() {
               className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
             >
               {copied ? <Check className="size-3.5 text-[var(--color-ok)]" /> : <Copy className="size-3.5" />}
+            </button>
+            {/* L'URL EST l'identifiant : si elle fuite, la regénérer est le seul
+                recours. Deux gestes distincts — regénérer garde un connecteur,
+                révoquer coupe tout. */}
+            <button
+              onClick={handleRotate}
+              disabled={rotating}
+              title="Regénérer l'URL (l'ancienne cesse de fonctionner)"
+              className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] disabled:opacity-40"
+            >
+              {rotating ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+            </button>
+            <button
+              onClick={handleRevoke}
+              disabled={rotating}
+              title="Révoquer l'URL (aucune IA n'aura plus accès)"
+              className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-err)] disabled:opacity-40"
+            >
+              <Trash2 className="size-3.5" />
             </button>
           </div>
         ) : (

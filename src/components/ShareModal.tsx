@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { Check, Copy, Globe, Loader2, Lock, Trash2, X } from "lucide-react";
+import { Check, Copy, Globe, Loader2, Lock, RefreshCw, Trash2, X } from "lucide-react";
 import {
   fetchShareState, publishSpace, unpublishSpace, mcpUrl, ensureMcpToken,
+  revokeMcpToken, rotateMcpToken,
   type ShareState,
 } from "@/lib/share";
 import { Bot } from "lucide-react";
@@ -28,6 +29,7 @@ export function ShareModal({ space, subgraph, onClose }: {
   const [copiedMcp, setCopiedMcp] = useState(false);
   const [includeSources, setIncludeSources] = useState(false);
   const [mcpToken, setMcpToken] = useState<string | null>(null);
+  const [rotatingMcp, setRotatingMcp] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -41,6 +43,31 @@ export function ShareModal({ space, subgraph, onClose }: {
       .catch((e) => setError(String(e instanceof Error ? e.message : e)))
       .finally(() => setLoading(false));
   }, [space]);
+
+  /** L'URL du connecteur EST l'identifiant : si elle fuite, la regénérer est le
+   *  seul recours. Regénérer garde un connecteur vivant, révoquer coupe tout. */
+  async function handleRotateMcp() {
+    if (!state) return;
+    if (!confirm("Regénérer l'URL du connecteur IA ? L'ancienne cessera de fonctionner immédiatement — il faudra recoller la nouvelle dans chaque IA connectée.")) return;
+    setRotatingMcp(true); setError(null);
+    try {
+      setMcpToken(await rotateMcpToken(state.id));
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally { setRotatingMcp(false); }
+  }
+
+  async function handleRevokeMcp() {
+    if (!state) return;
+    if (!confirm("Révoquer l'URL du connecteur IA ? Toutes les IA connectées perdent l'accès à ce space, et aucune nouvelle URL n'est créée.")) return;
+    setRotatingMcp(true); setError(null);
+    try {
+      await revokeMcpToken(state.id);
+      setMcpToken(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally { setRotatingMcp(false); }
+  }
 
   function addEmail() {
     const e = emailDraft.trim().toLowerCase();
@@ -233,6 +260,22 @@ export function ShareModal({ space, subgraph, onClose }: {
                         className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
                       >
                         {copiedMcp ? <Check className="size-3.5 text-[var(--color-ok)]" /> : <Copy className="size-3.5" />}
+                      </button>
+                      <button
+                        onClick={handleRotateMcp}
+                        disabled={rotatingMcp}
+                        title="Regénérer l'URL (l'ancienne cesse de fonctionner)"
+                        className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] disabled:opacity-40"
+                      >
+                        {rotatingMcp ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                      </button>
+                      <button
+                        onClick={handleRevokeMcp}
+                        disabled={rotatingMcp}
+                        title="Révoquer l'URL (aucune IA n'aura plus accès)"
+                        className="shrink-0 rounded-md p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-err)] disabled:opacity-40"
+                      >
+                        <Trash2 className="size-3.5" />
                       </button>
                     </div>
                   ) : (

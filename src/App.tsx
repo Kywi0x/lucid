@@ -12,12 +12,14 @@ import {
   Plus,
   Sparkles,
   Loader2,
+  LayoutGrid,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { notify } from "@/lib/notify";
 import { BrainMap, isLeafKind } from "@/components/BrainMap";
 import { CommandPalette } from "@/components/CommandPalette";
 import { FolderView } from "@/components/FolderView";
+import { MosaicMap } from "@/components/MosaicMap";
 import { SpacesPanel, AssistantPanel } from "@/components/LeftSidebar";
 import { SettingsModal } from "@/components/SettingsModal";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -82,7 +84,7 @@ import type {
 } from "@/lib/types";
 import { cn, etaSeconds, relativeDate } from "@/lib/utils";
 
-type View = "map" | "folder";
+type View = "map" | "folder" | "mosaic";
 
 function filterGraphBySpace(graph: BrainGraph, nodeIds: string[]): BrainGraph {
   const idSet = new Set(nodeIds);
@@ -1285,6 +1287,16 @@ function App() {
               query={query}
             />
           )}
+          {view === "mosaic" && displayGraph && (
+            <MosaicMap
+              graph={displayGraph}
+              onSelect={selectNode}
+              selectedId={selectedNode?.id ?? null}
+              query={query}
+              onBackgroundClick={closeDetail}
+              panelOffset={selectedNode && !nodeExpanded ? 480 : 0}
+            />
+          )}
 
           {/* ── Dock de widgets (bord gauche) ── */}
           <div className="absolute left-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2">
@@ -1532,6 +1544,9 @@ function App() {
               </ViewBtn>
               <ViewBtn active={view === "folder"} onClick={() => setView("folder")}>
                 <FolderTree className="size-4" /> Dossiers
+              </ViewBtn>
+              <ViewBtn active={view === "mosaic"} onClick={() => setView("mosaic")}>
+                <LayoutGrid className="size-4" /> Mosaïque
               </ViewBtn>
 
               {/* Recherche ⌘K */}

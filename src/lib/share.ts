@@ -70,6 +70,25 @@ export async function ensureMcpToken(spaceRowId: string): Promise<string | null>
   }
 }
 
+/** Révoque le token MCP d'un space : toute URL en circulation cesse de
+ *  fonctionner (l'edge function répond « token inconnu ou révoqué »).
+ *  Irréversible. La policy `owner revoque son token` autorise ce delete. */
+export async function revokeMcpToken(spaceRowId: string): Promise<void> {
+  if (!supabase) throw new Error("Supabase non configuré (.env).");
+  const { error } = await supabase
+    .from("space_mcp_tokens").delete().eq("space_id", spaceRowId);
+  if (error) throw new Error(error.message);
+}
+
+/** Révoque puis recrée. C'est le geste utile quand une URL a fuité : révoquer
+ *  seul laisserait l'utilisateur sans connecteur, avec ses IA muettes et aucune
+ *  indication de quoi faire ensuite. `space_id` est unique → le delete libère
+ *  la place avant l'insert. */
+export async function rotateMcpToken(spaceRowId: string): Promise<string | null> {
+  await revokeMcpToken(spaceRowId);
+  return ensureMcpToken(spaceRowId);
+}
+
 async function uid(): Promise<string> {
   if (!supabase) throw new Error("Supabase non configuré (.env).");
   const { data } = await supabase.auth.getSession();
@@ -178,16 +197,52 @@ export async function ensurePersonalMcpSpace(): Promise<void> {
 // Ne rattrape RIEN : le try/catch qui renvoyait null ici transformait toute
 // erreur réelle (RLS, session expirée, table manquante) en un message générique
 // « applique les migrations SQL » — fausse piste coûteuse (2026-08-05).
-export async function ensurePersonalMcpUrl(): Promise<string | null> {
+/** Ligne `shared_spaces` du space perso (celui derrière l'URL MCP « Mes IA »).
+ *  Un seul endroit qui la résout — les trois appelants en dépendent. */
+async function personalSpaceId(): Promise<string | null> {
   if (!supabase) return null;
-  await ensurePersonalMcpSpace();
   const owner = await uid();
   const { data, error } = await supabase
     .from("shared_spaces").select("id")
     .eq("owner", owner).eq("title", PERSONAL_SPACE_TITLE).maybeSingle();
   if (error) throw new Error(error.message);
-  if (!data) return null;
-  const token = await ensureMcpToken(data.id as string);
+  return (data?.id as string) ?? null;
+}
+
+export async function ensurePersonalMcpUrl(): Promise<string | null> {
+  if (!supabase) return null;
+  await ensurePersonalMcpSpace();
+  const id = await personalSpaceId();
+  if (!id) return null;
+  const token = await ensureMcpToken(id);
+  return token ? mcpUrl(token) : null;
+}
+
+/** URL MCP personnelle **si elle existe déjà** — lecture seule.
+ *  Ne publie rien et ne crée aucun token, contrairement à
+ *  `ensurePersonalMcpUrl()` qui passe par `ensurePersonalMcpSpace()` (lecture du
+ *  cerveau + upsert). C'est cette version qu'on appelle au montage d'un écran :
+ *  l'autre rendrait l'ouverture d'un onglet de réglages coûteuse. */
+export async function existingPersonalMcpUrl(): Promise<string | null> {
+  if (!supabase) return null;
+  const id = await personalSpaceId();
+  if (!id) return null;
+  const { data } = await supabase
+    .from("space_mcp_tokens").select("token").eq("space_id", id).maybeSingle();
+  return data?.token ? mcpUrl(data.token as string) : null;
+}
+
+/** Coupe l'URL MCP personnelle. Les IA connectées perdent l'accès aussitôt. */
+export async function revokePersonalMcpToken(): Promise<void> {
+  const id = await personalSpaceId();
+  if (id) await revokeMcpToken(id);
+}
+
+/** Nouvelle URL MCP personnelle ; l'ancienne est morte. */
+export async function rotatePersonalMcpUrl(): Promise<string | null> {
+  const id = await personalSpaceId();
+  if (!id) return null;
+  const token = await rotateMcpToken(id);
   return token ? mcpUrl(token) : null;
 }
 
