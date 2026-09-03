@@ -46,14 +46,23 @@ else
   # Auth GitHub API si dispo (évite le rate-limit anonyme sur les runners partagés).
   # ${a[@]+"${a[@]}"} = expansion sûre d'un array vide sous `set -u` (bash 3.2 macOS).
   auth=(); [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-  api=https://api.github.com/repos/ggml-org/llama.cpp/releases/latest
+  # `releases/latest` ne sert plus les builds : depuis 2026-09 il pointe sur une
+  # release "v0.3.0" qui ne contient qu'un `nightly-tag.txt`. Les vraies archives
+  # sont les releases nightly `bXXXXX` → on balaie la liste (triée du plus récent
+  # au plus ancien) et on prend la première qui a l'asset. Même stratégie que
+  # bundle-sidecars.ps1, qui était déjà immune à ce changement.
+  api='https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10'
   url=$(curl -fsSL ${auth[@]+"${auth[@]}"} "$api" \
     | grep -o 'https://[^"]*bin-macos-arm64\.tar\.gz' | head -1 || true)
-  [ -n "$url" ] || { echo "❌ asset llama.cpp macos-arm64 introuvable"; exit 1; }
+  [ -n "$url" ] || { echo "❌ asset llama.cpp macos-arm64 introuvable dans les 10 dernières releases"; exit 1; }
+  echo "   → $(basename "$url")"
   tmp=$(mktemp -d); curl -fsSL ${auth[@]+"${auth[@]}"} "$url" -o "$tmp/llama.tgz"
   tar -xzf "$tmp/llama.tgz" -C "$tmp"
-  cli=$(find "$tmp" -name llama-cli -type f | head -1)
-  [ -n "$cli" ] || { echo "❌ llama-cli introuvable dans l'archive"; exit 1; }
+  # Les builds récents livrent un vrai `llama-completion` (non interactif) ;
+  # repli sur `llama-cli` pour les archives plus anciennes qui n'en ont pas.
+  cli=$(find "$tmp" -name llama-completion -type f | head -1)
+  [ -n "$cli" ] || cli=$(find "$tmp" -name llama-cli -type f | head -1)
+  [ -n "$cli" ] || { echo "❌ ni llama-completion ni llama-cli dans l'archive"; exit 1; }
   cp "$cli" "$BIN_DIR/llama-completion-$TRIPLE"
   # llama-server est dans la même archive (mêmes dylibs @rpath).
   srv=$(find "$tmp" -name llama-server -type f | head -1)
