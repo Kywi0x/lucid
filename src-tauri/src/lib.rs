@@ -6845,7 +6845,11 @@ fn start_watcher(app: tauri::AppHandle) {
                 if let Some((fp, title)) = connectors::apple_notes::changed_fingerprint() {
                     polled.push(("apple-notes", fp, Some(title)));
                 }
-                if let Some(fp) = connectors::google_drive::changed_fingerprint() { polled.push(("google-drive", fp, None)); }
+                // Drive : même traitement que les Notes Apple — le nom du document le
+                // plus récent alimente l'Inbox (vide = rien à nommer, no-op côté Inbox).
+                if let Some((fp, name)) = connectors::google_drive::changed_fingerprint() {
+                    polled.push(("google-drive", fp, Some(name)));
+                }
                 for (source, fp, label) in polled {
                     match fingerprints.insert(source, fp.clone()) {
                         // Drive & Notes Apple = sources DOCUMENT → réveillent l'Archiviste.

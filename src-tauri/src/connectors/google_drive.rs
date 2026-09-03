@@ -782,10 +782,14 @@ fn build_container_path(
 /// dans un dossier exclu déclencherait une resynchro qui ne produirait rien.
 /// C'est ce qui impose de demander `parents` et `mimeType` en plus de
 /// `modifiedTime` — même nombre de requêtes, payload à peine plus gros.
-pub fn changed_fingerprint() -> Option<String> {
+/// Empreinte + nom du document le plus récemment modifié (pour l'Inbox) : sans
+/// ce nom, un changement Drive régénérait le cerveau sans laisser **aucune trace
+/// visible** — succès silencieux, alors que le fs local, lui, alimente l'Inbox.
+/// Le nom sort de la même requête (un champ de plus), donc coût réseau inchangé.
+pub fn changed_fingerprint() -> Option<(String, String)> {
     let access_token = valid_access_token().ok()?;
     let client = http();
-    const FP_FIELDS: &str = "id,mimeType,parents,modifiedTime";
+    const FP_FIELDS: &str = "id,name,mimeType,parents,modifiedTime";
     let sel = selection();
     let scoped = !sel.folders.is_empty();
     let files = if scoped {
@@ -799,6 +803,7 @@ pub fn changed_fingerprint() -> Option<String> {
 
     let mut count = 0usize;
     let mut max_modified = String::new();
+    let mut newest = String::new();
     for f in &files {
         if !scoped && !is_selected(&f.parents, &folder_parents, &known_folders, &sel) {
             continue;
@@ -807,10 +812,12 @@ pub fn changed_fingerprint() -> Option<String> {
         if let Some(m) = &f.modified_time {
             if m.as_str() > max_modified.as_str() {
                 max_modified = m.clone();
+                // Un dossier renommé n'est pas un document à annoncer.
+                if f.mime_type != FOLDER_MIME { newest = f.name.clone(); }
             }
         }
     }
-    Some(format!("{count}:{max_modified}"))
+    Some((format!("{count}:{max_modified}"), newest))
 }
 
 /// id → parent id, sur les seuls dossiers (traversée de la hiérarchie).

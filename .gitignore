@@ -41,3 +41,4 @@ src-tauri/tests/fixtures/
 
 # CLI Supabase — état local de la liaison au projet
 supabase/.temp/
+
