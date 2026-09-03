@@ -142,8 +142,8 @@ export function googleDriveDisconnect(): Promise<void> {
   return invoke("google_drive_disconnect");
 }
 
-/** Synchronise les fichiers Drive. Renvoie [ingérés, total]. */
-export function googleDriveSync(): Promise<[number, number]> {
+/** Synchronise les fichiers Drive. Renvoie [ingérés, total, illisibles]. */
+export function googleDriveSync(): Promise<[number, number, number]> {
   return invoke("google_drive_sync");
 }
 
@@ -169,8 +169,17 @@ export function googleDriveRoots(): Promise<DriveFolder[]> {
 }
 
 /** Contenu direct d'un dossier : sous-dossiers + de quoi l'annoncer. */
+/** Un fichier direct du dossier, nommé (50 max — les compteurs restent complets). */
+export type DriveDoc = {
+  name: string;
+  /** false = format que Lucid ne sait pas lire (affiché grisé, jamais tu). */
+  readable: boolean;
+};
+
 export type DriveChildren = {
   folders: DriveFolder[];
+  /** Fichiers directs, nommés : voir CE qu'il y a dedans, pas juste combien. */
+  files: DriveDoc[];
   /** Fichiers directs que Lucid sait lire. */
   docs: number;
   /** Fichiers directs illisibles — affichés, jamais tus. */

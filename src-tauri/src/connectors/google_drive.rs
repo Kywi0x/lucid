@@ -633,6 +633,10 @@ fn q_safe(raw: &str) -> String {
 #[derive(Serialize)]
 pub struct FolderChildren {
     pub folders: Vec<DriveFolder>,
+    /// Fichiers directs, nommés : un compteur « 2 documents » ne dit pas SI le
+    /// fichier qu'on cherche est là (retour de Liam le 2026-09-03 : « on ne voit
+    /// pas les fichiers du dossier dans la liste »). Borné à FILES_SHOWN.
+    pub files: Vec<DriveDoc>,
     /// Fichiers directs que Lucid sait lire (`drive_kind`).
     pub docs: u32,
     /// Fichiers directs qu'il ne sait pas lire — annoncés, jamais tus (ADR-0015).
@@ -640,6 +644,18 @@ pub struct FolderChildren {
     /// `true` = plafond de pages atteint, les chiffres sont des minorants.
     pub truncated: bool,
 }
+
+/// Un fichier direct, tel qu'annoncé dans le sélecteur.
+#[derive(Serialize)]
+pub struct DriveDoc {
+    pub name: String,
+    /// `false` = format que Lucid ne sait pas lire — affiché quand même, grisé.
+    pub readable: bool,
+}
+
+/// Plafond de noms rendus : au-delà, la liste n'aide plus à décider et les
+/// compteurs (`docs`/`ignored`), eux, restent complets.
+const FILES_SHOWN: usize = 50;
 
 /// Contenu direct d'un dossier (ou d'une unité partagée) : sous-dossiers + ce
 /// qu'il contient. Une requête, bornée à 5 pages.
@@ -655,7 +671,7 @@ pub fn list_children(parent: &str) -> Result<FolderChildren, String> {
         "id,name,mimeType",
         5,
     )?;
-    let mut out = FolderChildren { folders: Vec::new(), docs: 0, ignored: 0, truncated };
+    let mut out = FolderChildren { folders: Vec::new(), files: Vec::new(), docs: 0, ignored: 0, truncated };
     for f in files {
         if f.mime_type == FOLDER_MIME {
             out.folders.push(DriveFolder {
@@ -664,12 +680,16 @@ pub fn list_children(parent: &str) -> Result<FolderChildren, String> {
                 parent: Some(parent.to_string()),
                 shared: false,
             });
-        } else if drive_kind(&f).is_some() {
-            out.docs += 1;
-        } else {
-            out.ignored += 1;
+            continue;
         }
+        let readable = drive_kind(&f).is_some();
+        if readable { out.docs += 1; } else { out.ignored += 1; }
+        out.files.push(DriveDoc { name: f.name, readable });
     }
+    // Lisibles d'abord (ce sont eux qu'on cherche), puis alphabétique — et on
+    // coupe : les compteurs, eux, restent complets.
+    out.files.sort_by(|a, b| b.readable.cmp(&a.readable).then_with(|| a.name.cmp(&b.name)));
+    out.files.truncate(FILES_SHOWN);
     Ok(out)
 }
 
@@ -924,7 +944,10 @@ fn fetch_in_selection(
 
 /// Tous les fichiers Drive (tous formats, drives partagés inclus).
 /// Renvoie (count_ingested, count_total).
-pub fn sync_docs() -> Result<(usize, usize), String> {
+/// Renvoie `(nouveaux, total en cache, format supporté mais sans texte)`.
+/// Le 3e chiffre n'existait que dans le log : un document qui n'arrive jamais
+/// dans le cerveau sans que l'UI le dise = échec silencieux (ADR-0015).
+pub fn sync_docs() -> Result<(usize, usize, usize), String> {
     // Une seule synchro à la fois : la commande manuelle et la génération
     // déclenchée par le watcher ont tourné en parallèle le 18/08/2026 — deux
     // énumérations complètes du Drive et deux écritures du même fichier.
@@ -1074,7 +1097,7 @@ pub fn sync_docs() -> Result<(usize, usize), String> {
     std::fs::write(path, serde_json::to_string(&convs).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
 
-    Ok((new_count, convs.len()))
+    Ok((new_count, convs.len(), unreadable))
 }
 
 const MIME_SLIDES: &str = "application/vnd.google-apps.presentation";
@@ -1212,7 +1235,23 @@ fn export_text(
         return None;
     }
     let text = resp.text().ok()?.trim().to_string();
-    if text.len() < 20 { None } else { Some(text) }
+    // Seuil de 20 caractères CONSERVÉ (décision Liam, 2026-09-03) : un export
+    // quasi vide ne porte aucune connaissance, et l'ingérer polluerait le graphe
+    // d'une bulle vide par brouillon Drive.
+    //
+    // Ce qui manquait n'était pas le seuil mais le fait de le DIRE : le fichier
+    // disparaissait sans un mot côté UI (test Drive de Liam le 2026-09-03, doc
+    // « Test import lucid wallah » de quelques caractères → jamais arrivé, aucune
+    // explication). Le rejet est maintenant nommé ici et compté par `sync_docs`,
+    // qui le remonte jusqu'aux Réglages (ADR-0015).
+    if text.len() < 20 {
+        crate::elog!(
+            "⚠️ export Drive {} : {} caractère(s) de texte, sous le seuil de 20 — trop court pour être exploité.",
+            file.name, text.len(),
+        );
+        return None;
+    }
+    Some(text)
 }
 
 // ─── PowerPoint .pptx → Markdown (pur Rust, parité Mac/Windows — ADR-0015) ────

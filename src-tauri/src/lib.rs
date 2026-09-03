@@ -2631,7 +2631,7 @@ fn open_privacy_settings(app: tauri::AppHandle) -> Result<(), String> {
 
 /// Synchronise les fichiers Drive vers le cache local. Renvoie (nouveaux, total).
 #[tauri::command]
-async fn google_drive_sync() -> Result<(usize, usize), String> {
+async fn google_drive_sync() -> Result<(usize, usize, usize), String> {
     tauri::async_runtime::spawn_blocking(connectors::google_drive::sync_docs)
         .await
         .map_err(|e| format!("Sync interrompue : {e}"))?

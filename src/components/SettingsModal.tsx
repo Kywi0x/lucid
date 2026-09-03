@@ -586,8 +586,11 @@ function ConnectorsSection({
   async function handleGoogleSync() {
     set("google-drive", true); msg("google-drive", "Synchronisation…");
     try {
-      const [newFiles, total] = await googleDriveSync();
-      msg("google-drive", newFiles > 0 ? `${newFiles} nouveaux sur ${total}` : `${total} fichiers en cache`);
+      const [newFiles, total, unreadable] = await googleDriveSync();
+      // Le muet est dit : sinon un document présent dans Drive mais dont on n'a
+      // extrait aucun texte n'arrive jamais dans le cerveau sans explication.
+      const mute = unreadable > 0 ? ` — ${unreadable} sans texte exploitable` : "";
+      msg("google-drive", (newFiles > 0 ? `${newFiles} nouveaux sur ${total}` : `${total} fichiers en cache`) + mute);
       onRefresh();
       if (total > 0) onSyncDone(newFiles > 0);
     } catch (e) { msg("google-drive", `Erreur : ${e}`); }

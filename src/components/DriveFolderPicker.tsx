@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, ChevronRight, Folder, HardDrive, Loader2, Minus, Search, Sigma, Users, X } from "lucide-react";
+import { Check, ChevronRight, File, FileText, Folder, HardDrive, Loader2, Minus, Search, Sigma, Users, X } from "lucide-react";
 import {
   googleDriveRoots,
   googleDriveChildren,
@@ -8,6 +8,7 @@ import {
   googleDriveFolderLabels,
   googleDriveSelection,
   googleDriveSetSelection,
+  type DriveDoc,
   type DriveFolder,
   type DriveFolderCount,
 } from "@/lib/api";
@@ -54,7 +55,7 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
   const [searching, setSearching] = useState(false);
   const [saving, setSaving] = useState(false);
   // Niveau direct, rempli au dépliage (gratuit) ; total récursif, sur clic.
-  const [direct, setDirect] = useState<Map<string, { docs: number; ignored: number; truncated: boolean }>>(new Map());
+  const [direct, setDirect] = useState<Map<string, DirectInfo>>(new Map());
   const [deep, setDeep] = useState<Map<string, DriveFolderCount>>(new Map());
   const [counting, setCounting] = useState<Set<string>>(new Set());
   const dirtyRef = useRef(false);
@@ -128,7 +129,9 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
       const res = await googleDriveChildren(id);
       setKids((prev) => new Map(prev).set(id, res.folders));
       remember(res.folders);
-      setDirect((prev) => new Map(prev).set(id, { docs: res.docs, ignored: res.ignored, truncated: res.truncated }));
+      setDirect((prev) => new Map(prev).set(id, {
+        files: res.files, docs: res.docs, ignored: res.ignored, truncated: res.truncated,
+      }));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -367,6 +370,9 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
 
 // ── Arbre ────────────────────────────────────────────────────────────────────
 
+/** Niveau direct d'un dossier : ce qu'il contient, nommé ET compté. */
+type DirectInfo = { files: DriveDoc[]; docs: number; ignored: number; truncated: boolean };
+
 type TreeProps = {
   nodes: DriveFolder[];
   depth: number;
@@ -374,7 +380,7 @@ type TreeProps = {
   loading: Set<string>;
   selected: Set<string>;
   open: Set<string>;
-  direct: Map<string, { docs: number; ignored: number; truncated: boolean }>;
+  direct: Map<string, DirectInfo>;
   deep: Map<string, DriveFolderCount>;
   counting: Set<string>;
   inheritedFrom: (id: string, sel: Set<string>) => boolean;
@@ -443,23 +449,57 @@ function Tree(p: TreeProps) {
               onToggleExpand={() => p.toggleExpand(f.id)}
               onToggle={() => p.toggle(f.id)}
             />
-            {expanded && (
-              loaded === undefined
-                ? null
-                : loaded.length === 0
-                  ? (
-                    <p
-                      className="py-1 text-[10px] italic text-[var(--color-muted)]"
-                      style={{ paddingLeft: 8 + (p.depth + 1) * 14 + 22 }}
-                    >
-                      aucun sous-dossier
-                    </p>
-                  )
-                  : <Tree {...p} nodes={loaded} depth={p.depth + 1} />
+            {expanded && loaded !== undefined && (
+              <>
+                {/* Les fichiers d'abord : c'est ce que l'utilisateur vient
+                    vérifier (« mon doc est-il bien vu ? »). Un compteur seul ne
+                    répond pas à cette question. */}
+                <Files info={p.direct.get(f.id)} depth={p.depth + 1} />
+                {loaded.length > 0 && <Tree {...p} nodes={loaded} depth={p.depth + 1} />}
+                {loaded.length === 0 && (p.direct.get(f.id)?.files.length ?? 0) === 0 && (
+                  <p
+                    className="py-1 text-[10px] italic text-[var(--color-muted)]"
+                    style={{ paddingLeft: 8 + (p.depth + 1) * 14 + 22 }}
+                  >
+                    dossier vide
+                  </p>
+                )}
+              </>
             )}
           </div>
         );
       })}
+    </>
+  );
+}
+
+/** Fichiers directs d'un dossier déplié — non cochables (on coche des dossiers),
+ *  mais visibles. Les illisibles sont grisés et le disent : jamais tus (ADR-0015). */
+function Files({ info, depth }: { info: DirectInfo | undefined; depth: number }) {
+  if (!info || info.files.length === 0) return null;
+  const hidden = info.docs + info.ignored - info.files.length;
+  return (
+    <>
+      {info.files.map((d) => (
+        <div
+          key={`${d.name}-${d.readable}`}
+          className="flex items-center gap-2 py-0.5 pr-2 text-[11px]"
+          style={{ paddingLeft: 8 + depth * 14 + 22 }}
+          title={d.readable ? undefined : "Format que Lucid ne sait pas lire"}
+        >
+          {d.readable
+            ? <FileText className="size-3 shrink-0 text-[var(--color-muted)]" />
+            : <File className="size-3 shrink-0 text-[var(--color-muted)] opacity-50" />}
+          <span className={cn("min-w-0 truncate", d.readable ? "text-[var(--color-text)]" : "text-[var(--color-muted)] line-through")}>
+            {d.name}
+          </span>
+        </div>
+      ))}
+      {hidden > 0 && (
+        <p className="py-0.5 text-[10px] italic text-[var(--color-muted)]" style={{ paddingLeft: 8 + depth * 14 + 22 }}>
+          … et {hidden} autre{hidden > 1 ? "s" : ""} fichier{hidden > 1 ? "s" : ""}
+        </p>
+      )}
     </>
   );
 }
