@@ -420,6 +420,20 @@ export function archivistWasInterrupted(): Promise<boolean> {
   return invoke("archivist_was_interrupted");
 }
 
+/** Total « rangé sans toi » — 100 % local, ce compteur ne quitte jamais la machine. */
+export interface ArchivistStats {
+  /** Pages déplacées par l'IA et appliquées. */
+  moved: number;
+  /** Doublons absorbés par une fusion. */
+  merged: number;
+  /** Premier comptage (epoch secondes) ; 0 = rien n'a encore été rangé. */
+  since: number;
+}
+
+export function archivistStats(): Promise<ArchivistStats> {
+  return invoke("archivist_stats");
+}
+
 /** Rapports de crash (Sentry) — opt-in, effet au redémarrage de l'app. */
 export function telemetryEnabled(): Promise<boolean> {
   return invoke("telemetry_enabled");

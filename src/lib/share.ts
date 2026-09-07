@@ -199,7 +199,7 @@ export async function ensurePersonalMcpSpace(): Promise<void> {
 // « applique les migrations SQL » — fausse piste coûteuse (2026-08-05).
 /** Ligne `shared_spaces` du space perso (celui derrière l'URL MCP « Mes IA »).
  *  Un seul endroit qui la résout — les trois appelants en dépendent. */
-async function personalSpaceId(): Promise<string | null> {
+export async function personalSpaceId(): Promise<string | null> {
   if (!supabase) return null;
   const owner = await uid();
   const { data, error } = await supabase

@@ -302,6 +302,13 @@ fn archivist_was_interrupted() -> bool {
     ai::llama::app_data_dir().is_some_and(|dir| archivist_marker_path(&dir).exists())
 }
 
+/// Total « rangé sans toi ». Zéro partout tant que rien n'a été appliqué —
+/// aucune valeur de remplissage (règle de la note : des chiffres calculés).
+#[tauri::command]
+fn archivist_stats() -> ArchivistStats {
+    ai::llama::app_data_dir().map(|d| load_archivist_stats(&d)).unwrap_or_default()
+}
+
 /// Rapport de diagnostic Archiviste, à copier/coller pour analyse — **sans aucun
 /// contenu de document** (RGPD). Métriques + distribution des domaines + structure.
 /// `mask` = true : remplace les noms de dossiers (qui peuvent contenir un nom de
@@ -2598,6 +2605,33 @@ async fn google_drive_connect(app: tauri::AppHandle) -> Result<(), String> {
     .map_err(|e| format!("Tâche interrompue : {e}"))?
 }
 
+/// Port loopback du retour OAuth Supabase (connexion Google / Apple au compte
+/// Lucid). **Fixe** — contrairement au flux Drive qui prend un port au hasard :
+/// Supabase valide l'URL de redirection contre une liste déclarée dans son
+/// tableau de bord, et son joker `*` ne couvre pas le numéro de port. Ce port
+/// doit donc rester identique à l'entrée `http://localhost:45711` déclarée
+/// côté Supabase (et à `OAUTH_PORT` dans `src/lib/supabase.ts`).
+const AUTH_OAUTH_PORT: u16 = 45711;
+
+/// Attend le retour du navigateur après une connexion Google/Apple et rend le
+/// code d'autorisation (PKCE) au front, qui l'échange contre une session.
+/// L'écoute démarre dès l'appel : le front ouvre le navigateur juste après,
+/// l'aller-retour chez le fournisseur laisse largement le temps au bind.
+#[tauri::command]
+async fn auth_await_oauth_code() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", AUTH_OAUTH_PORT)).map_err(|e| {
+            format!(
+                "Port {AUTH_OAUTH_PORT} indisponible ({e}) — une autre connexion est \
+                 peut-être déjà en cours. Attends quelques secondes et réessaie."
+            )
+        })?;
+        connectors::google_drive::wait_for_code(listener, "Reviens sur l'écran de connexion et réessaie :")
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
 /// Ouvre le panneau « Fichiers et dossiers » des Réglages Système (macOS), là où
 /// un refus d'autorisation TCC se rallume. Appelé depuis la bannière affichée
 /// quand un dossier du scan est revenu `PermissionDenied`.
@@ -3620,6 +3654,62 @@ fn resolved_proposals_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("mcp_resolved.json")
 }
 
+/// « Rangé sans toi » — cf. coffre LucidFlow, « Relevé d'activité (valeur
+/// mesurée du cerveau) », métrique n°3 : celle qui prouve qu'on a travaillé à
+/// la place de l'utilisateur. Le calcul existait déjà (l'Archiviste propose),
+/// il n'était juste jamais TOTALISÉ.
+///
+/// 100 % local : ce compteur ne sort jamais de la machine (il n'a rien à faire
+/// sur le serveur, contrairement au relevé MCP qui compte ce qui y transitait
+/// déjà). Pas de télémétrie.
+#[derive(Default, serde::Serialize, serde::Deserialize, Clone)]
+pub struct ArchivistStats {
+    /// Pages effectivement déplacées (propositions `move` acceptées).
+    pub moved: u64,
+    /// Doublons fusionnés (propositions `merge` acceptées) — métrique n°5.
+    pub merged: u64,
+    /// Premier comptage, en secondes epoch : permet d'écrire « depuis le … »
+    /// plutôt qu'un total hors sol.
+    pub since: u64,
+}
+
+fn archivist_stats_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("archivist_stats.json")
+}
+
+fn load_archivist_stats(dir: &std::path::Path) -> ArchivistStats {
+    std::fs::read_to_string(archivist_stats_path(dir)).ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default()
+}
+
+/// Incrémente le total. Appelé depuis `resolve_proposal_in`, le SEUL entonnoir
+/// par lequel passent toutes les acceptations (manuelle, « tout accepter »,
+/// mode autonome) — un second point de comptage, ce serait deux chiffres qui
+/// divergent.
+///
+/// Compte les `move` et `merge` QUELLE QUE SOIT leur origine (Archiviste ou
+/// écriture MCP d'une IA) : dans les deux cas, c'est rangé sans que
+/// l'utilisateur ait levé le petit doigt — ce que la métrique promet.
+fn bump_archivist_stats(dir: &std::path::Path, moved: u64, merged: u64) {
+    if moved == 0 && merged == 0 {
+        return;
+    }
+    let mut st = load_archivist_stats(dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if st.since == 0 {
+        st.since = now;
+    }
+    st.moved += moved;
+    st.merged += merged;
+    if let Ok(json) = serde_json::to_string(&st) {
+        let _ = std::fs::write(archivist_stats_path(dir), json);
+    }
+}
+
 fn load_resolved_proposals(dir: &std::path::Path) -> std::collections::HashMap<String, u64> {
     std::fs::read_to_string(resolved_proposals_path(dir)).ok()
         .and_then(|r| serde_json::from_str(&r).ok())
@@ -3720,6 +3810,7 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
             tolerate_already_applied(set_node_parent_in(dir, &target.target_id, &target.new_parent_id))?;
             remove_pending_file(dir, id)?;
             mark_proposal_resolved(dir, id);
+            bump_archivist_stats(dir, 1, 0);
             Ok(vec![target.target_id.clone()])
         }
         "merge" => {
@@ -3731,6 +3822,10 @@ fn resolve_proposal_in(dir: &std::path::Path, id: &str, accept: bool) -> Result<
             };
             remove_pending_file(dir, id)?;
             mark_proposal_resolved(dir, id);
+            // Une fusion range PLUSIEURS fichiers : le groupe entier disparaît
+            // derrière un survivant. `merge_ids.len() - 1` = les doublons
+            // réellement absorbés.
+            bump_archivist_stats(dir, 0, target.merge_ids.len().saturating_sub(1) as u64);
             Ok(ids)
         }
         "link" => {
@@ -3832,6 +3927,13 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
     // le lot, on retombe sur le diff générique pour tout le lot (sûr, plus lent).
     let mut touched_for_write: Vec<String> = Vec::new();
     let mut used_merge = false;
+    // « Rangé sans toi » : ce lot est le chemin du mode AUTONOME, il n'emprunte
+    // pas `resolve_proposal_in`. Les deux chemins appellent le même
+    // `bump_archivist_stats` — un seul totalisateur, deux points d'appel parce
+    // que l'application est dupliquée dans le code depuis toujours.
+    // Cumulé ici, écrit UNE fois en fin de lot.
+    let mut batch_moved: u64 = 0;
+    let mut batch_merged: u64 = 0;
 
     loop {
         let mut progressed = false;
@@ -3900,6 +4002,13 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
             };
             match outcome {
                 Ok(ids) => {
+                    // Seulement en cas de succès RÉEL : la branche zombie plus
+                    // bas n'a rien appliqué, elle ne doit rien compter.
+                    match p.action.as_str() {
+                        "move" => batch_moved += 1,
+                        "merge" => batch_merged += p.merge_ids.len().saturating_sub(1) as u64,
+                        _ => {}
+                    }
                     resolved.extend(ids);
                     let _ = remove_pending_file(dir, &p.id);
                     mark_proposal_resolved(dir, &p.id);
@@ -3933,6 +4042,10 @@ fn resolve_all_pending_in(dir: &std::path::Path) -> Result<Vec<String>, String> 
         return Ok(resolved); // rien n'a progressé (cibles bloquées) : ni snapshot ni écriture
     }
     save_snapshot_in(dir, "mcp_accept"); // un seul snapshot pour tout le lot, juste avant l'écriture
+    // Un seul totalisateur pour tout le lot (pas une écriture disque par
+    // proposition), posé après le garde `resolved.is_empty()` : un lot bloqué
+    // ne compte rien.
+    bump_archivist_stats(dir, batch_moved, batch_merged);
 
     // Les nouveaux nœuds rejoignent les spaces qui "voient" leur parent — même
     // logique que `resolve_proposal_in` (bug des ancêtres du 2026-07-21).
@@ -7118,6 +7231,7 @@ pub fn run() {
             google_drive_save_credentials,
             google_drive_has_credentials,
             google_drive_connect,
+            auth_await_oauth_code,
             google_drive_sync,
             google_drive_disconnect,
             google_drive_roots,
@@ -7200,6 +7314,7 @@ pub fn run() {
             inbox_recent,
             run_archivist,
             archivist_was_interrupted,
+            archivist_stats,
             archivist_diagnostic
         ])
         .build(tauri::generate_context!())

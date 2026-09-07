@@ -1,12 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Network,
-  FolderTree,
+  PanelLeft,
   RefreshCw,
   Search,
   Settings,
-  Layers,
-  MessageCircle,
   History,
   RotateCcw,
   Plus,
@@ -18,9 +16,9 @@ import { listen } from "@tauri-apps/api/event";
 import { notify } from "@/lib/notify";
 import { BrainMap, isLeafKind } from "@/components/BrainMap";
 import { CommandPalette } from "@/components/CommandPalette";
-import { FolderView } from "@/components/FolderView";
 import { MosaicMap } from "@/components/MosaicMap";
-import { SpacesPanel, AssistantPanel } from "@/components/LeftSidebar";
+import { AssistantPanel } from "@/components/LeftSidebar";
+import { Sidebar, SIDEBAR_WIDTH } from "@/components/Sidebar";
 import { SettingsModal } from "@/components/SettingsModal";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { UpdateBanner } from "@/components/UpdateBanner";
@@ -32,6 +30,8 @@ import {
 import { NodeDetail } from "@/components/NodeDetail";
 import { NodePicker } from "@/components/NodePicker";
 import { StarterChecklist, type ChecklistItem } from "@/components/StarterChecklist";
+import { StatsCard } from "@/components/StatsCard";
+import { fetchBrainStats, type BrainStats } from "@/lib/stats";
 import { TimelineBar } from "@/components/TimelineBar";
 import {
   generateBrain,
@@ -63,6 +63,8 @@ import {
   claudeCodeReconnect,
   runArchivist,
   archivistWasInterrupted,
+  archivistStats,
+  type ArchivistStats,
   setArchivistActive,
   type BrainProgress,
   type LocalFolderProgress,
@@ -82,9 +84,9 @@ import type {
   BrainNode,
   ConnectorStatus,
 } from "@/lib/types";
-import { cn, etaSeconds, relativeDate } from "@/lib/utils";
+import { cn, etaSeconds } from "@/lib/utils";
 
-type View = "map" | "folder" | "mosaic";
+type View = "map" | "mosaic";
 
 function filterGraphBySpace(graph: BrainGraph, nodeIds: string[]): BrainGraph {
   const idSet = new Set(nodeIds);
@@ -143,7 +145,15 @@ function App() {
   const [query, setQuery]     = useState("");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [focus, setFocus]     = useState<{ id: string; k: number } | null>(null);
-  const [leftPanel, setLeftPanel]   = useState<"spaces" | "assistant" | null>(null);
+  const [leftPanel, setLeftPanel]   = useState<"assistant" | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Relevé d'activité : compteurs écrits par l'edge function MCP. `null`
+  // tant qu'il n'y a rien de mesuré — jamais de valeur de remplissage.
+  const [brainStats, setBrainStats] = useState<BrainStats | null>(null);
+  const [archStats, setArchStats] = useState<ArchivistStats | null>(null);
+  // Tout le chrome flottant de gauche (dock, assistant, checklist) se cale
+  // derrière la sidebar quand elle est ouverte.
+  const dockLeft = sidebarOpen ? 12 + SIDEBAR_WIDTH + 22 : 60;
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
@@ -440,11 +450,6 @@ function App() {
     () => graph?.nodes.filter((n) => !isLeafKind(n.kind)) ?? [],
     [graph],
   );
-  const lastSync = useMemo(() => {
-    const syncs = connectors.filter((c) => c.last_sync).map((c) => c.last_sync!).sort();
-    return syncs.length ? syncs[syncs.length - 1] : null;
-  }, [connectors]);
-
   // Graphe synthétique du scan : un root "Lucid" + une bulle-feuille par fichier
   // déjà vu. Mêmes composants/animations que le vrai graphe (BrainMap ne fait
   // aucune différence) — donc "petit à petit, comme le canvas fini", pas un
@@ -512,6 +517,20 @@ function App() {
     });
     connectorsStatus().then(setConnectors);
     listSpaces().then(setSpaces);
+    fetchBrainStats().then(setBrainStats).catch(() => {});
+    archivistStats().then(setArchStats).catch(() => {});
+  }, []);
+
+  // Les compteurs MCP bougent PENDANT que l'utilisateur est ailleurs (c'est tout
+  // l'intérêt : l'IA consulte le cerveau sans lui). Relire au retour sur la
+  // fenêtre, sinon la carte reste figée sur l'état du démarrage.
+  useEffect(() => {
+    const refresh = () => {
+      fetchBrainStats().then(setBrainStats).catch(() => {});
+      archivistStats().then(setArchStats).catch(() => {});
+    };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
   }, []);
 
   useEffect(() => {
@@ -706,9 +725,8 @@ function App() {
   const [sharedWithMe, setSharedWithMe] = useState<SharedWithMe[]>([]);
   const [remoteSpaceId, setRemoteSpaceId] = useState<string | null>(null);
   useEffect(() => {
-    if (leftPanel !== "spaces") return;
     fetchSharedWithMe().then(setSharedWithMe).catch(() => {});
-  }, [leftPanel]);
+  }, []);
 
   async function handleSpaceRename(id: string, name: string) {
     await renameSpace(id, name);
@@ -724,6 +742,10 @@ function App() {
   async function refreshGraph() {
     const g = await readBrainGraph();
     if (!g) return;
+    // Seul entonnoir traversé après CHAQUE application de propositions (lot
+    // autonome, « tout accepter », acceptation unitaire) : le total « rangé
+    // sans toi » y est relu, plutôt qu'à trois endroits qui divergeraient.
+    archivistStats().then(setArchStats).catch(() => {});
     setGraph((prev) => {
       // Ne relance l'animation d'apparition (revealKey) QUE si l'ensemble des
       // nœuds a vraiment changé — sinon un rafraîchissement (ex. après chaque
@@ -1217,15 +1239,6 @@ function App() {
   return (
     <div className="relative h-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
 
-      {/* Inbox — flux passif des fichiers récents (placement provisoire, à aligner sur la maquette).
-          Clic → ouvre la page Lucid du fichier (selectNode + focus canvas). */}
-      {booted && graph && !demoMode && (
-        <InboxPanel
-          graph={graph}
-          onOpenNode={(n) => { selectNode(n); setFocus({ id: n.id, k: Date.now() }); }}
-        />
-      )}
-
       {deniedFolders.length > 0 && (
         <FolderAccessBanner folders={deniedFolders} onDismiss={() => setDeniedFolders([])} />
       )}
@@ -1279,14 +1292,6 @@ function App() {
               focus={focus}
             />
           )}
-          {view === "folder" && displayGraph && (
-            <FolderView
-              graph={displayGraph}
-              onSelect={selectNode}
-              selectedId={selectedNode?.id ?? null}
-              query={query}
-            />
-          )}
           {view === "mosaic" && displayGraph && (
             <MosaicMap
               graph={displayGraph}
@@ -1298,23 +1303,43 @@ function App() {
             />
           )}
 
-          {/* ── Dock de widgets (bord gauche) ── */}
-          <div className="absolute left-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2">
-            <DockBtn
-              active={leftPanel === "spaces"}
-              title="Spaces"
-              onClick={() => setLeftPanel((p) => (p === "spaces" ? null : "spaces"))}
-            >
-              <Layers className="size-4" />
-            </DockBtn>
-            <DockBtn
-              active={leftPanel === "assistant"}
-              title="Lucid IA"
-              onClick={() => setLeftPanel((p) => (p === "assistant" ? null : "assistant"))}
-            >
-              <MessageCircle className="size-4" />
-            </DockBtn>
+          {/* ── Sidebar (structure + spaces) ── */}
+          {/* Toujours montée : elle glisse hors cadre au repli, ce qui préserve
+              l'état de pliage de l'arbre et rend le retour instantané. */}
+          <div className="sb-shell absolute bottom-3 left-3 top-3 z-30" data-open={sidebarOpen}>
+              <Sidebar
+                graph={displayGraph}
+                onSelect={selectNode}
+                selectedId={selectedNode?.id ?? null}
+                query={query}
+                onQueryChange={setQuery}
+                onCollapse={() => setSidebarOpen(false)}
+                onOpenChat={() => setLeftPanel((p) => (p ? null : "assistant"))}
+                chatOpen={leftPanel === "assistant"}
+                spaces={spaces}
+                activeSpaceId={activeSpaceId}
+                onSpaceSelect={setActiveSpaceId}
+                onSpaceCreate={handleSpaceCreate}
+                onSpaceShare={setShareSpace}
+                sharedWithMe={sharedWithMe}
+                onOpenShared={(id) => setRemoteSpaceId(id)}
+              />
           </div>
+
+          <button
+            onClick={() => setSidebarOpen(true)}
+            title="Afficher la barre latérale"
+            aria-hidden={sidebarOpen}
+            className={cn(
+              "panel absolute left-3 top-3 z-30 flex size-[38px] items-center justify-center rounded-xl",
+              "text-[var(--color-muted)] transition-all duration-300 hover:text-[var(--color-text)]",
+              sidebarOpen
+                ? "pointer-events-none -translate-x-2 opacity-0"
+                : "translate-x-0 opacity-100 delay-150",
+            )}
+          >
+            <PanelLeft className="size-4" />
+          </button>
 
           {/* ── Timeline temporelle — posée juste au-dessus de la barre d'outils ── */}
           {view === "map" && graph && !generating && timeRange && (
@@ -1330,37 +1355,18 @@ function App() {
 
           {/* ── Panneau outil gauche ── */}
           {leftPanel && (
-            <div className="panel absolute bottom-4 left-16 top-4 z-30 flex w-[360px] flex-col overflow-hidden rounded-2xl animate-slideInLeft">
-              {leftPanel === "spaces" ? (
-                <SpacesPanel
-                  spaces={spaces}
-                  activeSpaceId={activeSpaceId}
-                  onSpaceSelect={setActiveSpaceId}
-                  onSpaceCreate={handleSpaceCreate}
-                  onSpaceShare={setShareSpace}
-                  sharedWithMe={sharedWithMe}
-                  onOpenShared={(id) => { setRemoteSpaceId(id); setLeftPanel(null); }}
-                  onClose={() => setLeftPanel(null)}
-                />
-              ) : (
-                <AssistantPanel
-                  onClose={() => setLeftPanel(null)}
-                  activeSpaceId={activeSpaceId}
-                  onGraphChange={async () => {
-                    await refreshGraph();
-                    listSpaces().then(setSpaces); // le space actif vient de gagner des nœuds
-                  }}
-                />
-              )}
-            </div>
-          )}
-
-          {/* ── HUD (pouls du cerveau) ── */}
-          {view === "map" && graph && !generating && (
-            <div className="pointer-events-none absolute left-4 top-4 z-10 flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-[var(--color-muted)]">
-              <span className="size-1.5 rounded-full bg-[var(--color-ok)]" />
-              {graph.nodes.length} nœuds · {spaces.length} espaces
-              {lastSync && <> · sync {relativeDate(lastSync)}</>}
+            <div
+              className="panel absolute bottom-4 top-4 z-30 flex w-[360px] flex-col overflow-hidden rounded-2xl animate-slideInLeft"
+              style={{ left: dockLeft, transition: "left 320ms var(--sb-ease)" }}
+            >
+              <AssistantPanel
+                onClose={() => setLeftPanel(null)}
+                activeSpaceId={activeSpaceId}
+                onGraphChange={async () => {
+                  await refreshGraph();
+                  listSpaces().then(setSpaces); // le space actif vient de gagner des nœuds
+                }}
+              />
             </div>
           )}
 
@@ -1429,16 +1435,31 @@ function App() {
             </div>
           )}
 
+          {/* ── Relevé d'activité — en haut à gauche, contre la sidebar ── */}
+          {view === "map" && graph && !generating && (
+            <div
+              className="absolute top-3 z-20 w-[254px]"
+              style={{ left: dockLeft, transition: "left 320ms var(--sb-ease)" }}
+            >
+              <StatsCard stats={brainStats} archivist={archStats} />
+            </div>
+          )}
+
           {/* ── Checklist « Bien démarrer » ── */}
-          {view === "map" && graph && !generating && !checklistDismissed && !checklistDone && (
-            <div className="pointer-events-none absolute bottom-4 left-4 z-20">
-              <StarterChecklist
-                items={checklistItems}
-                onDismiss={() => {
-                  localStorage.setItem("lucid.checklist.dismissed", "1");
-                  setChecklistDismissed(true);
-                }}
-              />
+          {view === "map" && graph && !generating && (
+            <div
+              className="pointer-events-none absolute bottom-4 z-20 flex flex-col gap-3"
+              style={{ left: dockLeft, transition: "left 320ms var(--sb-ease)" }}
+            >
+              {!checklistDismissed && !checklistDone && (
+                <StarterChecklist
+                  items={checklistItems}
+                  onDismiss={() => {
+                    localStorage.setItem("lucid.checklist.dismissed", "1");
+                    setChecklistDismissed(true);
+                  }}
+                />
+              )}
             </div>
           )}
 
@@ -1542,9 +1563,6 @@ function App() {
               <ViewBtn active={view === "map"}    onClick={() => setView("map")}>
                 <Network    className="size-4" /> Mind
               </ViewBtn>
-              <ViewBtn active={view === "folder"} onClick={() => setView("folder")}>
-                <FolderTree className="size-4" /> Dossiers
-              </ViewBtn>
               <ViewBtn active={view === "mosaic"} onClick={() => setView("mosaic")}>
                 <LayoutGrid className="size-4" /> Mosaïque
               </ViewBtn>
@@ -1582,6 +1600,14 @@ function App() {
             <div className="absolute right-3 top-3 z-20 flex items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)]/75 px-1.5 py-1 shadow-[var(--shadow-float)] backdrop-blur-md">
               <BetaBadge />
               <SyncBadge />
+              {/* Inbox — flux passif des fichiers récents. Clic → ouvre la page
+                  Lucid du fichier (selectNode + focus canvas). */}
+              {graph && !demoMode && (
+                <InboxPanel
+                  graph={graph}
+                  onOpenNode={(n) => { selectNode(n); setFocus({ id: n.id, k: Date.now() }); }}
+                />
+              )}
               {graph && (
                 <button
                   onClick={() => handleGenerate()}
@@ -1768,30 +1794,6 @@ function relativeTime(ts: number): string {
   if (diff < 3600)  return `il y a ${Math.floor(diff / 60)} min`;
   if (diff < 86400) return `il y a ${Math.floor(diff / 3600)} h`;
   return `il y a ${Math.floor(diff / 86400)} j`;
-}
-
-function DockBtn({
-  active, title, onClick, children,
-}: {
-  active: boolean;
-  title: string;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      className={cn(
-        "panel flex size-[38px] items-center justify-center rounded-xl transition-colors",
-        active
-          ? "text-[var(--color-accent)] !border-[var(--color-accent)]/40"
-          : "text-[var(--color-muted)] hover:text-[var(--color-text)]",
-      )}
-    >
-      {children}
-    </button>
-  );
 }
 
 function ViewBtn({

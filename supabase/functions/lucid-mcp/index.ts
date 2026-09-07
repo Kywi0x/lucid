@@ -139,22 +139,57 @@ export function relevantPassages(content: string, query: string, budget = TARGET
   return out;
 }
 
+/// Compteur d'économie — cf. coffre LucidFlow, « Relevé d'activité (valeur
+/// mesurée du cerveau) ». `raw` = ce qu'aurait coûté le collage brut de la page,
+/// `served` = ce qu'on a réellement renvoyé. L'écart est l'économie, et c'est
+/// une SOUSTRACTION, pas une estimation.
+///
+/// UN SEUL point de comptage, comme tranché dans la note : `contentSection()`
+/// et les extraits de `toolSearch()` — les deux seuls endroits où les deux
+/// tailles sont connues. Deux endroits qui comptent, c'est deux chiffres qui
+/// divergent.
+///
+/// ponytail: accumulateur au niveau module plutôt que passé en paramètre à
+/// travers quatre signatures. Valide UNIQUEMENT parce que toolOverview /
+/// toolSearch / toolNode(s) / contentSection sont toutes SYNCHRONES : aucun
+/// `await` entre `meterReset()` et sa lecture, donc aucun entrelacement
+/// possible même si l'isolat sert plusieurs requêtes. Si l'un de ces outils
+/// devient async, il FAUT passer le compteur en paramètre.
+let meterRaw = 0;
+let meterServed = 0;
+function meterReset(): void { meterRaw = 0; meterServed = 0; }
+function meterAdd(raw: number, served: number): void { meterRaw += raw; meterServed += served; }
+/** Lecture du compteur — sert au contrôle `check-usage.ts`. */
+export function meterSnapshot(): { raw: number; served: number } { return { raw: meterRaw, served: meterServed }; }
+
 /// Rend la section « Contenu » : passages ciblés si `query`, début de page sinon,
 /// page entière (plafonnée) si `full`. Une page déjà courte part telle quelle —
 /// il n'y a rien à économiser.
 function contentSection(content: string, opts: { query?: string; full?: boolean }): string {
-  if (opts.full) return `\n${truncate(content, FULL_MAX)}`;
-  if (content.length <= TARGETED_BUDGET) return `\n${content}`;
+  if (opts.full) {
+    const served = truncate(content, FULL_MAX);
+    meterAdd(content.length, served.length);
+    return `\n${served}`;
+  }
+  // Page déjà courte : servie telle quelle. On la compte quand même (raw ===
+  // served) pour que le ratio reste honnête plutôt que flatté.
+  if (content.length <= TARGETED_BUDGET) {
+    meterAdd(content.length, content.length);
+    return `\n${content}`;
+  }
   const passages = opts.query ? relevantPassages(content, opts.query) : null;
   if (passages) {
+    meterAdd(content.length, passages.length);
     return ` — passages pertinents (${passages.length} des ${content.length} caractères)\n${passages}\n\n` +
       `*Extraits ciblés sur « ${opts.query} ». S'il te manque du contexte, rappelle \`brain_node\` avec \`full: true\`.*`;
   }
   const why = opts.query
     ? `Aucun passage ne matche « ${opts.query} » — début de page renvoyé.`
     : "Passe `query` (les mots de ta recherche) pour recevoir les passages pertinents au lieu du début de page.";
+  const head = truncate(content, BLIND_BUDGET);
+  meterAdd(content.length, head.length);
   return ` — début de page (${Math.min(content.length, BLIND_BUDGET)} des ${content.length} caractères)\n` +
-    `${truncate(content, BLIND_BUDGET)}\n\n*${why} \`full: true\` pour la page entière.*`;
+    `${head}\n\n*${why} \`full: true\` pour la page entière.*`;
 }
 
 export function toolOverview(p: Payload): string {
@@ -238,6 +273,9 @@ export function toolSearch(p: Payload, query: string): string {
     const body = n.content ?? "";
     const excerpt = (relevantPassages(body, query, SEARCH_EXCERPT) ??
       truncate(n.summary || body, SEARCH_EXCERPT)).replace(/\n+/g, " ");
+    // Le scénario « sans Lucid » de la note : coller les pages candidates en
+    // entier. Ici on ne sert qu'un extrait — l'écart, c'est l'économie.
+    meterAdd(body.length, excerpt.length);
     out += `\n- **${n.label}** (\`${n.id}\`, ${n.kind})${n.date ? ` · ${n.date}` : ""} — ${pathOf(n, byId) || "racine"}\n  ${excerpt}\n`;
   }
   out += "\nLis une page complète avec `brain_node`.\n";
@@ -357,6 +395,28 @@ async function spaceIdFromToken(token: string): Promise<string> {
   const rows = await r.json();
   if (!rows.length) throw new Error("token MCP inconnu ou révoqué — republie le space dans Lucid pour en obtenir un");
   return rows[0].space_id as string;
+}
+
+/// Relevé d'activité : un upsert additif sur la ligne (space, jour, outil).
+/// N'échoue JAMAIS la réponse — un compteur indisponible ne doit pas priver
+/// l'utilisateur de sa lecture. Silencieux côté client, visible dans les logs.
+async function recordUsage(spaceId: string, tool: string, raw: number, served: number): Promise<void> {
+  if (raw <= 0 && served <= 0) return;
+  const base = env("SUPABASE_URL");
+  const key = env("SUPABASE_SERVICE_ROLE_KEY");
+  if (!base || !key) return;
+  try {
+    const r = await fetch(`${base}/rest/v1/rpc/mcp_usage_record`, {
+      method: "POST",
+      headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ p_space_id: spaceId, p_tool: tool, p_raw: raw, p_served: served }),
+    });
+    // La migration docs/supabase-mcp-usage.sql n'est peut-être pas appliquée :
+    // on le dit dans les logs plutôt que d'échouer, ou de rester muet.
+    if (!r.ok) console.error(`[mcp_usage] relevé non enregistré (${r.status}) — migration appliquée ?`);
+  } catch (e) {
+    console.error(`[mcp_usage] relevé non enregistré : ${(e as Error).message}`);
+  }
 }
 
 async function loadSpace(spaceId: string): Promise<Payload> {
@@ -725,11 +785,16 @@ export async function handler(req: Request): Promise<Response> {
           return rpcResult(id, { content: [{ type: "text", text }] });
         }
         const payload = await loadSpace(spaceId);
+        // Bloc SYNCHRONE : aucun `await` entre le reset et la lecture du
+        // compteur — c'est ce qui rend l'accumulateur de module sûr.
+        meterReset();
         const text =
           name === "brain_overview" ? toolOverview(payload) :
           name === "brain_search" ? toolSearch(payload, args.query ?? "") :
           name === "brain_node" ? toolNodes(payload, idList(args.node_ids ?? args.node_id), { query: args.query, full: args.full === true || args.full === "true" }) :
           (() => { throw new Error(`tool inconnu : ${name}`); })();
+        const raw = meterRaw, served = meterServed;
+        await recordUsage(spaceId, name, raw, served);
         return rpcResult(id, { content: [{ type: "text", text }] });
       } catch (e) {
         return rpcResult(id, { content: [{ type: "text", text: `Erreur : ${(e as Error).message}` }], isError: true });

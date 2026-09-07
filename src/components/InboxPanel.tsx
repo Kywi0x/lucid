@@ -90,9 +90,9 @@ export function InboxPanel({ graph, onOpenNode }: { graph: BrainGraph | null; on
   }
 
   return (
-    <div className="fixed bottom-4 left-4 z-40">
+    <div className="relative">
       {open && (
-        <div className="mb-2 flex max-h-[50vh] w-80 flex-col overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)]">
+        <div className="absolute right-0 top-full z-40 mt-2 flex max-h-[50vh] w-80 flex-col overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)]">
           <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2.5">
             <span className="text-sm font-semibold text-[var(--color-text)]">Fichiers récents</span>
             <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-muted)]">{entries.length}</span>
@@ -141,16 +141,15 @@ export function InboxPanel({ graph, onOpenNode }: { graph: BrainGraph | null; on
         onClick={() => { setOpen((o) => !o); void refresh(); }}
         title="Fichiers récents (ajoutés / modifiés / supprimés)"
         className={cn(
-          "flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-medium shadow-[var(--shadow-float)] transition-colors",
+          "relative rounded-full p-1.5 transition-colors",
           open
-            ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-            : "border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-muted)] hover:text-[var(--color-text)]",
+            ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+            : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
         )}
       >
         <Inbox className="size-4" />
-        Inbox
         {entries.length > 0 && (
-          <span className="rounded-full bg-[var(--color-accent)] px-1.5 text-[10px] font-semibold text-white">{entries.length}</span>
+          <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-[var(--color-accent)]" />
         )}
       </button>
     </div>

@@ -1,7 +1,6 @@
 import { useState } from "react";
-import { Layers, MessageCircle, Send, Loader2, X, Plus, Share2 } from "lucide-react";
+import { MessageCircle, Send, Loader2, X } from "lucide-react";
 import { askBrain, createStructure } from "@/lib/api";
-import type { Space } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { AiStatusBar, useAiReady, AI_MISSING_HINT } from "./AiStatusBar";
 
@@ -21,127 +20,6 @@ function PanelHeader({ icon, title, onClose }: { icon: React.ReactNode; title: s
           <X className="size-4" />
         </button>
       )}
-    </div>
-  );
-}
-
-// ── SpacesPanel : sélection de l'espace actif (filtre du graphe) ─────────────
-
-const LUCID_SPACE: Space = { id: "lucid", name: "Lucid", node_ids: null };
-
-export function SpacesPanel({
-  spaces,
-  activeSpaceId,
-  onSpaceSelect,
-  onSpaceCreate,
-  onSpaceShare,
-  sharedWithMe = [],
-  onOpenShared,
-  onClose,
-}: {
-  spaces: Space[];
-  activeSpaceId: string | null;
-  onSpaceSelect: (id: string | null) => void;
-  onSpaceCreate: (name: string) => Promise<void>;
-  /** Ouvre la modale de partage du space (public / privé sur invitation). */
-  onSpaceShare?: (space: Space) => void;
-  /** Spaces que d'autres ont partagés avec moi (lecture seule). */
-  sharedWithMe?: { id: string; title: string }[];
-  onOpenShared?: (id: string) => void;
-  onClose?: () => void;
-}) {
-  const all = [LUCID_SPACE, ...spaces.filter((s) => s.id !== "lucid")];
-  const [creating, setCreating] = useState(false);
-  const [newName, setNewName] = useState("");
-
-  async function submitCreate() {
-    const name = newName.trim();
-    if (!name) { setCreating(false); return; }
-    await onSpaceCreate(name);
-    setNewName("");
-    setCreating(false);
-  }
-
-  return (
-    <div className="flex h-full flex-col">
-      <PanelHeader icon={<Layers className="size-3.5" />} title="Spaces" onClose={onClose} />
-      <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3">
-        {all.map((s) => {
-          const isActive = s.id === "lucid" ? (activeSpaceId == null || activeSpaceId === "lucid") : activeSpaceId === s.id;
-          const shareable = s.id !== "lucid" && !!onSpaceShare;
-          return (
-            <div
-              key={s.id}
-              onClick={() => onSpaceSelect(s.id === "lucid" ? null : s.id)}
-              className={cn(
-                "group flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition-colors",
-                isActive
-                  ? "border-[var(--color-accent)]/40 bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                  : "border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text)] hover:bg-[var(--color-surface-2)]",
-              )}
-            >
-              <span className="flex-1 truncate text-xs font-medium">{s.name}</span>
-              {shareable && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); onSpaceShare!(s); }}
-                  title="Partager ce space"
-                  className="shrink-0 rounded-md p-1 text-[var(--color-muted)] opacity-0 transition-all hover:text-[var(--color-accent)] group-hover:opacity-100"
-                >
-                  <Share2 className="size-3.5" />
-                </button>
-              )}
-              <span className="shrink-0 font-mono text-[9px] uppercase tracking-wider opacity-60">
-                {s.node_ids ? `${s.node_ids.length}` : "tout"}
-              </span>
-            </div>
-          );
-        })}
-        {creating ? (
-          <input
-            autoFocus
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") submitCreate();
-              if (e.key === "Escape") { setNewName(""); setCreating(false); }
-            }}
-            onBlur={submitCreate}
-            placeholder="Nom du space…"
-            className="rounded-lg border border-[var(--color-accent)]/50 bg-[var(--color-bg)] px-2.5 py-2 text-xs text-[var(--color-text)] outline-none"
-          />
-        ) : (
-          <button
-            onClick={() => setCreating(true)}
-            className="flex items-center gap-2 rounded-lg border border-dashed border-[var(--color-border)] px-2.5 py-2 text-left text-xs text-[var(--color-muted)] transition-colors hover:border-[var(--color-accent)]/40 hover:text-[var(--color-accent)]"
-          >
-            <Plus className="size-3.5" />
-            Nouveau space
-          </button>
-        )}
-        {sharedWithMe.length > 0 && (
-          <div className="pt-3">
-            <p className="mb-1.5 px-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
-              Partagés avec moi ({sharedWithMe.length})
-            </p>
-            {sharedWithMe.map((s) => (
-              <button
-                key={s.id}
-                onClick={() => onOpenShared?.(s.id)}
-                className="flex w-full items-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--color-surface-2)]"
-              >
-                <Share2 className="size-3 shrink-0 text-[var(--color-muted)]" />
-                <span className="flex-1 truncate text-xs font-medium text-[var(--color-text)]">{s.title}</span>
-                <span className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-[var(--color-muted)]">
-                  invité
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
-        <p className="px-1 pt-2 text-[11px] leading-relaxed text-[var(--color-muted)]">
-          Renommer ou supprimer : Paramètres → Spaces.
-        </p>
-      </div>
     </div>
   );
 }

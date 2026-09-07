@@ -295,7 +295,7 @@ pub fn prepare_connect() -> Result<(TcpListener, String, String, String), String
 /// Attend la redirection OAuth, extrait le code et l'échange contre des tokens.
 /// `code_verifier` = celui généré par `prepare_connect` (PKCE).
 pub fn finish_connect(listener: TcpListener, redirect_uri: &str, code_verifier: &str) -> Result<(), String> {
-    let code = wait_for_code(listener)?;
+    let code = wait_for_code(listener, "Relance « Connecter Google Drive » :")?;
 
     let client = http();
     let cid = google_client_id();
@@ -339,7 +339,10 @@ pub fn finish_connect(listener: TcpListener, redirect_uri: &str, code_verifier: 
 ///    le redirect, et la connexion échouait sur « Code OAuth introuvable » alors
 ///    que l'autorisation arrivait une seconde plus tard. On sert les intruses et
 ///    on continue d'écouter.
-fn wait_for_code(listener: TcpListener) -> Result<String, String> {
+///
+/// `timeout_hint` : quoi relancer si rien n'arrive — le socket sert aussi la
+/// connexion du compte (Google/Apple), où « Connecter Google Drive » n'existe pas.
+pub(crate) fn wait_for_code(listener: TcpListener, timeout_hint: &str) -> Result<String, String> {
     // 5 min : le temps de choisir un compte Google et de lire l'écran de consentement.
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
     let started = std::time::Instant::now();
@@ -352,8 +355,10 @@ fn wait_for_code(listener: TcpListener) -> Result<String, String> {
             Ok(pair) => pair,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if started.elapsed() >= DEADLINE {
-                    return Err("Aucune autorisation Google reçue au bout de 5 minutes.                                 Relance « Connecter Google Drive » : l'onglet d'autorisation                                 doit être laissé ouvert jusqu'au message de succès."
-                        .to_string());
+                    return Err(format!(
+                        "Aucune autorisation reçue au bout de 5 minutes. {timeout_hint} \
+                         L'onglet d'autorisation doit être laissé ouvert jusqu'au message de succès."
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
@@ -1785,7 +1790,7 @@ mod tests {
             b.write_all(b"GET /?code=SECRET42&scope=drive.readonly HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
         });
 
-        assert_eq!(wait_for_code(listener).unwrap(), "SECRET42");
+        assert_eq!(wait_for_code(listener, "Relance :").unwrap(), "SECRET42");
         client.join().unwrap();
     }
 
@@ -1799,7 +1804,7 @@ mod tests {
             let mut a = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
             a.write_all(b"GET /?error=access_denied HTTP/1.1\r\n\r\n").unwrap();
         });
-        assert!(wait_for_code(listener).is_err());
+        assert!(wait_for_code(listener, "Relance :").is_err());
         client.join().unwrap();
     }
 
