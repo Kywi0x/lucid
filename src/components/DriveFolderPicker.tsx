@@ -13,6 +13,7 @@ import {
   type DriveFolderCount,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { Tile } from "@/components/ConnectorTile";
 
 type Props = {
   onClose: () => void;
@@ -222,147 +223,125 @@ export function DriveFolderPicker({ onClose, onSaved }: Props) {
   const treeProps = { kids, loading, selected, open, direct, deep, counting, inheritedFrom, hasSelectedDescendant, toggleExpand, toggle, count };
 
   return (
-    <div className="absolute inset-0 z-20 flex flex-col justify-end bg-black/20" onClick={closeGuarded}>
-      <div
-        className="m-3 flex max-h-[85%] flex-col overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)]"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-4 py-3">
-          <div className="flex-1">
-            <div className="text-sm font-semibold">Dossiers à indexer</div>
-            <p className="text-[11px] text-[var(--color-muted)]">
-              Lucid ne lira que ce que tu coches. Aucune case = tout le Drive.
-            </p>
-            {/* Vérifié le 18/08/2026 : décocher retire le dossier du suivi, mais
-                les documents restent dans brain.db. Le taire ferait croire à une
-                suppression — ou à une conservation, selon ce que l'utilisateur
-                imagine. Même règle que les sources passées en stand-by le 06/08. */}
-            <p className="mt-0.5 text-[10px] text-[var(--color-muted)]">
-              Décocher arrête le suivi — les documents déjà indexés restent dans ton
-              cerveau, mais ne seront plus mis à jour.
-            </p>
-          </div>
-          <button
-            onClick={closeGuarded}
-            className="rounded-lg p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] transition-colors"
-          >
-            <X className="size-4" />
-          </button>
-        </div>
+    // Panneau posé DANS la feuille des connecteurs (volet droit), plus une
+    // modale au-dessus d'une modale : le choix des dossiers appartient au
+    // connecteur Drive, pas à un écran qui flotte par-dessus (retour Liam,
+    // 2026-09-15).
+    <div className="detail h-full min-h-0" style={{ gap: 12 }}>
+      <div className="d-top">
+        <Tile id="google-drive" size="md" />
+        <span className="col">
+          <span className="nm">Dossiers à indexer</span>
+          <span className="d-state">
+            {selected.size === 0
+              ? "Aucune case cochée — tout le Drive est lu"
+              : `${selected.size} dossier${s(selected.size)} suivi${s(selected.size)}`}
+          </span>
+        </span>
+        <button className="d-close" onClick={closeGuarded}>Retour</button>
+      </div>
 
-        {/* Recherche */}
-        <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-2">
-          {searching
-            ? <Loader2 className="size-3.5 shrink-0 animate-spin text-[var(--color-muted)]" />
-            : <Search className="size-3.5 shrink-0 text-[var(--color-muted)]" />}
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Chercher un dossier par nom…"
-            className="w-full bg-transparent text-xs text-[var(--color-text)] outline-none placeholder:text-[var(--color-muted)]"
-          />
-        </div>
+      {/* Vérifié le 18/08/2026 : décocher retire le dossier du suivi, mais les
+          documents restent dans brain.db. Le taire ferait croire à une
+          suppression — ou à une conservation, selon ce qu'on imagine. */}
+      <p className="note">
+        Lucid ne lira que ce que tu coches. Décocher arrête le suivi : les documents déjà
+        indexés restent dans ton cerveau, mais ne seront plus mis à jour.
+      </p>
 
-        {/* Ce qui est réellement synchronisé — la question de Liam : « voir les
-            dossiers synchronisés et pouvoir les desync ». L'arbre paresseux ne
-            peut pas la montrer (un dossier coché en profondeur n'est pas chargé),
-            cette liste si. */}
-        {selected.size > 0 && (
-          <div className="flex flex-wrap gap-1.5 border-b border-[var(--color-border)] px-4 py-2">
-            <span className="w-full text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">
-              Dossiers indexés ({selected.size})
-            </span>
+      <label className="sh-search" style={{ marginLeft: 0, width: "100%" }}>
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Chercher un dossier par nom…"
+          aria-label="Chercher un dossier"
+        />
+        {searching
+          ? <Loader2 className="size-3.5 shrink-0 animate-spin" />
+          : <Search className="size-3.5 shrink-0" />}
+      </label>
+
+      {/* Ce qui est réellement synchronisé — l'arbre paresseux ne peut pas le
+          montrer (un dossier coché en profondeur n'est pas chargé), cette
+          liste si. */}
+      {selected.size > 0 && (
+        <div className="grp" style={{ gap: 6 }}>
+          <span className="lbl3">Dossiers indexés ({selected.size})</span>
+          <div className="pills">
             {[...selected].map((id) => (
               <button
                 key={id}
+                className="pill-ok"
                 onClick={() => toggle(id)}
                 title="Retirer de la sélection"
-                className="flex max-w-full items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-surface-2)] px-2 py-0.5 text-[11px] text-[var(--color-text)] hover:border-[var(--color-err)] hover:text-[var(--color-err)] transition-colors"
               >
                 <Folder className="size-3 shrink-0" />
                 <span className="truncate">{byId.get(id)?.name ?? "dossier…"}</span>
-                <X className="size-3 shrink-0" />
+                <X className="size-3 shrink-0 opacity-60" />
               </button>
             ))}
           </div>
+        </div>
+      )}
+
+      <div className="card" style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "6px 4px" }}>
+        {error && <p className="note warn" style={{ padding: "10px 12px" }}>{error}</p>}
+
+        {!roots && !error && (
+          <p className="note" style={{ display: "flex", alignItems: "center", gap: 8, padding: "18px 12px" }}>
+            <Loader2 className="size-3.5 animate-spin" /> Lecture des dossiers…
+          </p>
         )}
 
-        {/* Arbre */}
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-          {error && <p className="px-2 py-3 text-xs text-[var(--color-err)]">{error}</p>}
+        {hits !== null ? (
+          hits.length === 0
+            ? <p className="note" style={{ padding: "18px 12px" }}>Aucun dossier ne correspond.</p>
+            // Même composant que l'arbre : un résultat de recherche se déplie
+            // comme un dossier ordinaire (il ne le faisait pas — 18/08/2026).
+            : <Tree nodes={hits} depth={0} {...treeProps} />
+        ) : roots && (
+          <>
+            <Tree nodes={mine} depth={0} {...treeProps} />
 
-          {!roots && !error && (
-            <p className="flex items-center gap-2 px-2 py-6 text-xs text-[var(--color-muted)]">
-              <Loader2 className="size-3.5 animate-spin" /> Lecture des dossiers…
-            </p>
-          )}
+            {shared.length > 0 && (
+              <>
+                <p className="lbl3" style={{ display: "flex", alignItems: "center", gap: 6, padding: "10px 8px 4px" }}>
+                  <Users className="size-3" /> Partagés avec moi
+                </p>
+                <Tree nodes={shared} depth={0} {...treeProps} />
+              </>
+            )}
 
-          {hits !== null ? (
-            hits.length === 0
-              ? <p className="px-2 py-6 text-xs text-[var(--color-muted)]">Aucun dossier ne correspond.</p>
-              // Même composant que l'arbre : un résultat de recherche se déplie
-              // comme un dossier ordinaire (il ne le faisait pas — 18/08/2026).
-              : <Tree nodes={hits} depth={0} {...treeProps} />
-          ) : roots && (
-            <>
-              <Tree nodes={mine} depth={0} {...treeProps} />
-
-              {shared.length > 0 && (
-                <>
-                  <p className="mt-3 flex items-center gap-1.5 px-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-muted)]">
-                    <Users className="size-3" /> Partagés avec moi
-                  </p>
-                  <Tree nodes={shared} depth={0} {...treeProps} />
-                </>
-              )}
-
-              {/* Sans cette case, les fichiers de la racine disparaîtraient sans un mot. */}
-              <div className="mt-3 border-t border-[var(--color-border)] pt-2">
-                <button
-                  onClick={() => setOrphans((v) => !v)}
-                  className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-[var(--color-surface-2)] transition-colors"
-                >
-                  <Box state={orphans ? "on" : "off"} />
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-xs text-[var(--color-text)]">
-                      Fichiers sans dossier
-                    </span>
-                    <span className="block text-[10px] text-[var(--color-muted)]">
-                      À la racine du Drive ou dans un partage non listé
-                    </span>
-                  </span>
-                </button>
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Pied */}
-        <div className="flex flex-col gap-2 border-t border-[var(--color-border)] px-4 py-3">
-          <span className="text-[11px] text-[var(--color-muted)]">
-            {selected.size === 0
-              ? "Tout le Drive sera indexé"
-              : `${selected.size} dossier${selected.size > 1 ? "s" : ""} sélectionné${selected.size > 1 ? "s" : ""}`}
-          </span>
-
-          <div className="flex gap-1.5">
+            {/* Sans cette case, les fichiers de la racine disparaîtraient sans un mot. */}
             <button
-              onClick={() => { setSelected(new Set()); setOrphans(false); }}
-              className="flex-1 rounded-lg border border-[var(--color-border)] px-3 py-2 text-xs font-medium text-[var(--color-muted)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] transition-colors"
+              onClick={() => setOrphans((v) => !v)}
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition-colors hover:bg-[var(--sb-hover)]"
+              style={{ marginTop: 6, borderTop: "0.5px solid var(--hairline)" }}
             >
-              Tout indexer
+              <Box state={orphans ? "on" : "off"} />
+              <span className="min-w-0 flex-1">
+                <span className="block text-xs text-[var(--sb-text)]">Fichiers sans dossier</span>
+                <span className="block text-[10px] text-[var(--sb-label)]">
+                  À la racine du Drive ou dans un partage non listé
+                </span>
+              </span>
             </button>
-            <button
-              onClick={save}
-              disabled={saving || !dirty}
-              className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-[var(--color-accent)] px-3 py-2 text-xs font-medium text-white hover:bg-[var(--color-accent-hover)] disabled:opacity-50 transition-colors"
-            >
-              {saving && <Loader2 className="size-3.5 animate-spin" />}
-              Enregistrer
-            </button>
-          </div>
-        </div>
+          </>
+        )}
+      </div>
+
+      <div className="acts">
+        <button className="btn" onClick={() => { setSelected(new Set()); setOrphans(false); }}>
+          Tout indexer
+        </button>
+        <button className="btn primary" onClick={save} disabled={saving || !dirty}>
+          {saving && <Loader2 className="inline size-3 animate-spin" />} Enregistrer
+        </button>
+        <span className="note" style={{ alignSelf: "center" }}>
+          {selected.size === 0
+            ? "Tout le Drive sera indexé"
+            : `${selected.size} dossier${s(selected.size)} sélectionné${s(selected.size)}`}
+        </span>
       </div>
     </div>
   );

@@ -68,8 +68,15 @@ export interface BrainNode {
   community?: number;
   parent_id?: string | null;
   synthesized_at?: string | null;
-  /** Date (YYYY-MM-DD) d'apparition — feuilles/notes ; absente = toujours visible (timeline). */
+  /** Date (YYYY-MM-DD) du contenu source : dernier message d'une conversation,
+   *  date de modification d'un fichier. Bouge dès que la source est touchée,
+   *  même sans changement réel — ce n'est PAS « quand c'est entré dans Lucid ». */
   date?: string | null;
+  /** Estampille (epoch secondes) posée par le backend quand le nœud a vraiment
+   *  changé (cf. `node_unchanged` côté Rust) : un nœud identique garde la
+   *  sienne d'une régénération à l'autre. C'est le seul signal honnête de
+   *  « nouveau dans le cerveau ». */
+  updated_at?: number | null;
   content?: string;
   /** Texte source embarqué par le pipeline (fichier, conversation…). */
   source_text?: string;

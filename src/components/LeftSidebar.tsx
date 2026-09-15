@@ -7,23 +7,6 @@ import { AiStatusBar, useAiReady, AI_MISSING_HINT } from "./AiStatusBar";
 // Panneaux ouverts par le dock de widgets (bord gauche). La gestion des
 // connecteurs / spaces / modèle vit dans SettingsModal — ici : usage quotidien.
 
-function PanelHeader({ icon, title, onClose }: { icon: React.ReactNode; title: string; onClose?: () => void }) {
-  return (
-    <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3.5 py-2.5">
-      <span className="text-[var(--color-accent)]">{icon}</span>
-      <span className="flex-1 text-xs font-semibold">{title}</span>
-      {onClose && (
-        <button
-          onClick={onClose}
-          className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-        >
-          <X className="size-4" />
-        </button>
-      )}
-    </div>
-  );
-}
-
 // ── AssistantPanel : chat IA locale sur le brain.md ──────────────────────────
 
 interface ChatMsg { role: "user" | "assistant"; text: string; }
@@ -58,57 +41,54 @@ export function AssistantPanel({ onClose, onGraphChange, activeSpaceId }: { onCl
   }
 
   return (
-    <div className="flex h-full flex-col">
-      <PanelHeader icon={<MessageCircle className="size-3.5" />} title="Lucid IA" onClose={onClose} />
-      <div className="flex-1 space-y-2 overflow-y-auto p-3">
+    <>
+      <div className="chat-head">
+        <span className="bi"><MessageCircle className="size-[15px]" /></span>
+        <span className="t">Lucid IA</span>
+        {onClose && (
+          <button className="icon-btn" onClick={onClose} aria-label="Fermer">
+            <X className="size-4" />
+          </button>
+        )}
+      </div>
+
+      <div className="chat-log">
         {messages.length === 0 && (
-          <p className="px-1 pt-2 text-xs leading-relaxed text-[var(--color-muted)]">
+          <p className="chat-hint">
             Pose une question sur ton second cerveau — l'IA locale répond à partir
             de ton <code>brain.md</code>. Tu peux aussi lui demander de créer des
             pages : « crée une structure pour gérer un projet web ».
           </p>
         )}
         {messages.map((m, i) => (
-          <div
-            key={i}
-            className={cn(
-              "rounded-lg px-3 py-2 text-xs leading-relaxed",
-              m.role === "user"
-                ? "bg-[var(--color-accent-soft)]"
-                : "border border-[var(--color-border)] bg-[var(--color-bg)]",
-            )}
-          >
-            <span className="whitespace-pre-wrap break-words">{m.text}</span>
-          </div>
+          <div key={i} className={cn("bub", m.role === "user" ? "me" : "ai")}>{m.text}</div>
         ))}
         {loading && (
-          <div className="flex items-center gap-2 px-1 text-xs text-[var(--color-muted)]">
-            <Loader2 className="size-3.5 animate-spin" /> réflexion…
+          <div className="chat-wait">
+            <span className="dots"><i /><i /><i /></span> réflexion…
           </div>
         )}
       </div>
-      <div className="shrink-0 border-t border-[var(--color-border)] p-2">
-        <div className="flex items-end gap-1.5">
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-            rows={1}
-            disabled={aiOk === false}
-            placeholder={aiOk === false ? AI_MISSING_HINT : "Demander…"}
-            className="max-h-24 min-h-9 flex-1 resize-none rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-xs outline-none placeholder:text-[var(--color-muted)] focus:border-[var(--color-accent)] disabled:opacity-50"
-          />
-          <button
-            onClick={send}
-            disabled={loading || !input.trim() || aiOk === false}
-            title={aiOk === false ? AI_MISSING_HINT : undefined}
-            className="flex size-9 items-center justify-center rounded-md bg-[var(--color-accent)] text-white disabled:opacity-50"
-          >
-            <Send className="size-4" />
-          </button>
-        </div>
-        <AiStatusBar input={input} />
+
+      <div className="chat-in">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          rows={1}
+          disabled={aiOk === false}
+          placeholder={aiOk === false ? AI_MISSING_HINT : "Demander…"}
+        />
+        <button
+          className="send"
+          onClick={send}
+          disabled={loading || !input.trim() || aiOk === false}
+          title={aiOk === false ? AI_MISSING_HINT : undefined}
+        >
+          {loading ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
+        </button>
       </div>
-    </div>
+      <AiStatusBar input={input} />
+    </>
   );
 }

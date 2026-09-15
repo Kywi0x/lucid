@@ -5,13 +5,13 @@ import { Inbox, FilePlus2, FilePen, FileX2 } from "lucide-react";
 import { inboxRecent, type InboxEntry } from "@/lib/api";
 import { notify } from "@/lib/notify";
 import { cn } from "@/lib/utils";
-import { ConnectorLogo } from "@/components/SettingsModal";
+import { Tile } from "@/components/ConnectorTile";
 import type { BrainGraph, BrainNode } from "@/lib/types";
 
 // ponytail: skeleton fonctionnel (structure + logique). Placement/skin à aligner
 // sur la maquette Figma de Liam — flux PASSIF (visibilité), jamais de validation.
 
-// Source Inbox (backend) → id connecteur (pour réutiliser ConnectorLogo).
+// Source Inbox (backend) → id connecteur (pour réutiliser la tuile du dock).
 const CONNECTOR_ID: Record<string, string> = {
   local: "local-folder",
   obsidian: "obsidian",
@@ -118,7 +118,7 @@ export function InboxPanel({ graph, onOpenNode }: { graph: BrainGraph | null; on
                       clickable ? "hover:bg-[var(--color-surface-2)] transition-colors" : "cursor-default opacity-60",
                     )}
                   >
-                    <ConnectorLogo id={CONNECTOR_ID[e.source] ?? e.source} />
+                    <Tile id={CONNECTOR_ID[e.source] ?? e.source} size="sm" />
                     <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text)]">{e.name}</span>
                     {e.count > 1 && (
                       <span

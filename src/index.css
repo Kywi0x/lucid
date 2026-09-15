@@ -1,5 +1,8 @@
 @import "tailwindcss";
 @import "@xyflow/react/dist/style.css";
+/* Design de la maquette validée (matières, sidebar, dock, sheets…) —
+   voir src/design.css. Importé ici pour passer APRÈS le reset Tailwind. */
+@import "./design.css";
 
 /* ─── Thème (clair par défaut, sombre via OS ou [data-theme="dark"]) ─────────
    Gris biaisés bleu (jamais neutres purs). Les tokens --canvas-* sont lus par
@@ -116,82 +119,15 @@ body {
   background: transparent;
 }
 
-/* ── Panel : la matière unique du chrome flottant (theme-aware via tokens) ──
-   ponytail: opaque + zéro backdrop-filter. Le blur composite est lent/instable
-   sur WebView2 (Windows) — quand il ne compose pas, le fond translucide laisse
-   voir le contenu dessous (modales « transparentes »). Surface pleine = fix
-   perf ET lisibilité d'un coup. Remettre le glass = coût GPU + bug Windows. */
+/* ── Panel : surface opaque, pour ce que la maquette ne couvre pas encore
+   (écran d'installation, bandeaux, toasts). Le chrome de la maquette utilise
+   `.lg` (verre) et `.surface` (contenu) — voir src/design.css, qui embarque
+   son propre repli `@supports not (backdrop-filter)` : si WebView2 ne compose
+   pas le flou, la surface redevient pleine plutôt que translucide illisible. */
 .panel {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   box-shadow: var(--shadow-float);
-}
-
-/* ── Glass : matière de la sidebar (maquette Figma « Lucid v2 ») ────────────
-   Volontairement SÉPARÉ de `.panel`, qui reste opaque : le blur sur toutes les
-   modales était le problème WebView2. Ici un seul élément est composité, et le
-   @supports rend une surface pleine si le moteur ne sait pas flouter — jamais
-   un panneau transparent illisible (règle parité Mac/Windows). */
-.glass {
-  background: rgba(245, 245, 245, 0.2);
-  border: 0.5px solid rgba(255, 255, 255, 0.9);
-  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.12);
-  backdrop-filter: blur(28px) saturate(180%);
-  -webkit-backdrop-filter: blur(28px) saturate(180%);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .glass {
-    background: rgba(74, 74, 74, 0.2);
-    border-color: rgba(255, 255, 255, 0.08);
-    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.4);
-  }
-}
-
-:root[data-theme="dark"] .glass {
-  background: rgba(74, 74, 74, 0.2);
-  border-color: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.4);
-}
-
-@supports not (backdrop-filter: blur(1px)) {
-  .glass {
-    background: var(--color-surface);
-    border-color: var(--color-border);
-  }
-}
-
-/* ── Sidebar : gris NEUTRES de la maquette Figma ────────────────────────────
-   Les tokens globaux --color-* sont volontairement biaisés bleu (DA du canvas) ;
-   la sidebar, elle, est en gris purs (#808080 libellés, #b7b7b7 chevrons,
-   #e5e7eb champs). Scopé ici pour ne pas déteindre sur le reste de l'app. */
-.sidebar,
-.statscard {
-  --sb-text: #1e1e1e;
-  --sb-label: #808080;
-  --sb-icon: #b7b7b7;
-  --sb-field: #e5e7eb;
-  --sb-placeholder: #9ca3af;
-  --sb-hover: rgba(0, 0, 0, 0.05);
-  --sb-track: #eaeaea;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .sidebar,
-  :root:not([data-theme="light"]) .statscard {
-    --sb-text: #ffffff;
-    --sb-field: rgba(229, 231, 235, 0.5);
-    --sb-hover: rgba(255, 255, 255, 0.07);
-    --sb-track: rgba(255, 255, 255, 0.12);
-  }
-}
-
-:root[data-theme="dark"] .sidebar,
-:root[data-theme="dark"] .statscard {
-  --sb-text: #ffffff;
-  --sb-field: rgba(229, 231, 235, 0.5);
-  --sb-hover: rgba(255, 255, 255, 0.07);
-  --sb-track: rgba(255, 255, 255, 0.12);
 }
 
 /* ── Micro-animations de la sidebar ────────────────────────────────────────
@@ -213,19 +149,6 @@ body {
 .sb-collapse[data-open="true"] {
   grid-template-rows: 1fr;
   opacity: 1;
-}
-
-/* Glissement de la sidebar entière : elle reste montée (l'arbre garde son
-   état de pliage), elle sort du cadre et cesse de capter les clics. */
-.sb-shell {
-  transition:
-    transform 320ms var(--sb-ease),
-    opacity 220ms var(--sb-ease);
-}
-.sb-shell[data-open="false"] {
-  transform: translateX(calc(-100% - 12px));
-  opacity: 0;
-  pointer-events: none;
 }
 
 /* Pression légère, façon bouton macOS. */

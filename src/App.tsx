@@ -1,16 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Network,
-  PanelLeft,
   RefreshCw,
   Search,
-  Settings,
   History,
   RotateCcw,
-  Plus,
   Sparkles,
   Loader2,
-  LayoutGrid,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { notify } from "@/lib/notify";
@@ -18,12 +13,20 @@ import { BrainMap, isLeafKind } from "@/components/BrainMap";
 import { CommandPalette } from "@/components/CommandPalette";
 import { MosaicMap } from "@/components/MosaicMap";
 import { AssistantPanel } from "@/components/LeftSidebar";
+import { IconSidebarLeft } from "@/components/icons";
+import { Cluster } from "@/components/Cluster";
+import { Dock } from "@/components/Dock";
+import { Launchpad } from "@/components/Launchpad";
+import { NotificationCenter } from "@/components/NotificationCenter";
+import {
+  buildNotifications, dismissNotif, clearDismissable, openVisit,
+  markArchivistSeen, markVersionSeen, rememberSkipped, whenLabel,
+  type NotifItem,
+} from "@/lib/notifications";
+import { getVersion } from "@tauri-apps/api/app";
 import { Sidebar, SIDEBAR_WIDTH } from "@/components/Sidebar";
 import { SettingsModal } from "@/components/SettingsModal";
-import { ThemeToggle } from "@/components/ThemeToggle";
 import { UpdateBanner } from "@/components/UpdateBanner";
-import { BetaBadge } from "@/components/BetaBadge";
-import { SyncBadge } from "@/components/SyncBadge";
 import {
   GenerateEmpty,
 } from "@/components/BrainView";
@@ -32,7 +35,6 @@ import { NodePicker } from "@/components/NodePicker";
 import { StarterChecklist, type ChecklistItem } from "@/components/StarterChecklist";
 import { StatsCard } from "@/components/StatsCard";
 import { fetchBrainStats, type BrainStats } from "@/lib/stats";
-import { TimelineBar } from "@/components/TimelineBar";
 import {
   generateBrain,
   readBrainGraph,
@@ -78,13 +80,12 @@ import { supabase } from "@/lib/supabase";
 import type { McpProposal, SnapshotInfo, Space } from "@/lib/types";
 import { SetupScreen } from "@/components/SetupScreen";
 import { FolderAccessBanner } from "@/components/FolderAccessBanner";
-import { InboxPanel } from "@/components/InboxPanel";
 import type {
   BrainGraph,
   BrainNode,
   ConnectorStatus,
 } from "@/lib/types";
-import { cn, etaSeconds } from "@/lib/utils";
+import { etaSeconds } from "@/lib/utils";
 
 type View = "map" | "mosaic";
 
@@ -115,30 +116,9 @@ const SNAPSHOT_REASON_LABELS: Record<string, string> = {
   manual: "Manuel",
 };
 
-/** Libellé + détail d'une proposition MCP dans le panneau, selon son `action`
- *  (create garde le comportement historique : titre = label, détail = parent). */
-function describeProposal(
-  p: import("@/lib/types").McpProposal,
-  labelOf: (id: string) => string,
-): { title: string; detail: string } {
-  switch (p.action) {
-    case "update":
-      return { title: `Modifier « ${labelOf(p.target_id)} »`, detail: "" };
-    case "move":
-      return { title: `Déplacer « ${labelOf(p.target_id)} »`, detail: `→ ${labelOf(p.new_parent_id)}` };
-    case "merge": {
-      const [survivor, ...rest] = p.merge_ids;
-      return {
-        title: `Fusionner ${p.merge_ids.length} pages`,
-        detail: `${rest.map(labelOf).join(", ")} → ${labelOf(survivor)}`,
-      };
-    }
-    case "link":
-      return { title: `Lier « ${labelOf(p.target_id)} » ↔ « ${labelOf(p.link_target)} »`, detail: p.relation || "" };
-    default:
-      return { title: p.label, detail: `→ ${labelOf(p.parent_id)}` };
-  }
-}
+/** Début de la « visite » courante, figé au chargement : « depuis ta dernière
+ *  visite » parle de ce qui est arrivé pendant que l'app était fermée. */
+const VISIT_START = openVisit();
 
 function App() {
   const [view, setView]       = useState<View>("map");
@@ -153,8 +133,27 @@ function App() {
   const [archStats, setArchStats] = useState<ArchivistStats | null>(null);
   // Tout le chrome flottant de gauche (dock, assistant, checklist) se cale
   // derrière la sidebar quand elle est ouverte.
-  const dockLeft = sidebarOpen ? 12 + SIDEBAR_WIDTH + 22 : 60;
+  const dockLeft = sidebarOpen ? 12 + SIDEBAR_WIDTH + 14 : 56;
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // ── Centre de notifications ──
+  // `visitStart` est figé au démarrage : « depuis ta dernière visite » parle de
+  // ce qui est arrivé pendant que l'app était fermée, pas de ce qu'on vient de
+  // voir défiler. Le Launchpad (dock) remplace l'écran Sources des Réglages.
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifItems, setNotifItems] = useState<NotifItem[]>([]);
+  const [appVersion, setAppVersion] = useState("");
+  const [statsBump, setStatsBump] = useState(false);
+  /** Launchpad : `null` = fermé, "" = grille, id = détail d'une source. */
+  const [launchpad, setLaunchpad] = useState<string | null>(null);
+  // Tenue du panneau de page : colonne à droite (424 px) tant qu'il y a la
+  // place, pleine page en dessous de 1240 px — sinon la note devient illisible
+  // (et, avant la maquette, carrément inouvrable).
+  const [winW, setWinW] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setWinW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
   const [graph, setGraph]           = useState<BrainGraph | null>(null);
@@ -208,8 +207,6 @@ function App() {
   // `runArchivistNow`, sans dupliquer sa logique (manuel/autonome, notify,
   // suivi des propositions bloquées).
   const scheduleMcpTickRef = useRef<() => void>(() => {});
-  // Timeline : curseur temporel (epoch ms) ; null = timeline fermée.
-  const [timeCutoff, setTimeCutoff] = useState<number | null>(null);
   const [error, setError]         = useState<string | null>(null);
 
   const [selectedNode, setSelectedNode] = useState<BrainNode | null>(null);
@@ -315,6 +312,9 @@ function App() {
       // l'Archiviste passé, pour ne pas se faire écraser par son propre toast.
       const report = await localFolderSync();
       scanSkippedRef.current = report.skipped;
+      // Alimente la carte « fichiers illisibles » du centre de notifications :
+      // le toast passe, la carte reste tant qu'on ne l'a pas traitée.
+      rememberSkipped(report.skipped);
       if (report.skipped.length) console.warn("Scan initial — fichiers illisibles :", report.skipped);
       setDeniedFolders(report.denied ?? []);
       if (report.denied?.length) console.warn("Scan initial — dossiers refusés par l'OS :", report.denied);
@@ -615,7 +615,6 @@ function App() {
     setError(null);
     setProgress(null);
     setPartialGraph(null);
-    setTimeCutoff(null);
     try {
       // Sync tous les connecteurs connectés avant de régénérer.
       if (!opts?.skipSync) {
@@ -672,17 +671,25 @@ function App() {
         else { setQuery(""); setPaletteOpen(true); }
         return;
       }
+      // ⌘, ouvre les Réglages (raccourci macOS, repris de la maquette).
+      if ((e.metaKey || e.ctrlKey) && e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen(true);
+        return;
+      }
       if (e.key !== "Escape") return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
       if (settingsOpen) setSettingsOpen(false);
       else if (paletteOpen) closePalette();
+      else if (notifOpen) setNotifOpen(false);
+      else if (historyOpen) setHistoryOpen(false);
       else if (nodeExpanded) setNodeExpanded(false);
       else if (selectedNode) closeDetail();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [settingsOpen, paletteOpen, nodeExpanded, selectedNode]);
+  }, [settingsOpen, paletteOpen, nodeExpanded, selectedNode, notifOpen, historyOpen]);
 
   async function handleOpenHistory() {
     setHistoryOpen((o) => !o);
@@ -991,20 +998,6 @@ function App() {
     return () => { unlisten.then((fn) => fn()); };
   }, [needsSetup]);
 
-  async function handleProposal(id: string, accept: boolean) {
-    try {
-      const ids = await resolveMcpProposal(id, accept);
-      // Purge les lignes Supabase de toute la chaîne résolue (si distante) :
-      // sinon le poll de rapatriement les ré-importerait en bulles zombies.
-      supabase?.from("mcp_proposals").delete().in("id", ids).then(() => {}, () => {});
-      setProposals(await listMcpProposals());
-      // L'acceptation peut enrôler le nœud dans des spaces (côté Rust) →
-      // recharger les deux, sinon la vue filtre avec l'ancien node_ids.
-      if (accept) { await refreshGraph(); setSpaces(await listSpaces()); }
-      showToast(accept ? `${ids.length > 1 ? `${ids.length} propositions acceptées` : "Proposition acceptée"} ✓` : "Proposition refusée");
-    } catch (e) { showToast(String(e)); }
-  }
-
   async function handleAllProposals(accept: boolean) {
     // Accepter : un seul cycle lecture/écriture pour tout le lot (pas une
     // boucle par proposition, cf. resolveAllMcpProposals). Refuser reste une
@@ -1081,6 +1074,94 @@ function App() {
     setSpaces((prev) => prev.filter((s) => s.id !== id));
     if (activeSpaceId === id) setActiveSpaceId(null);
   }
+
+  // ── Centre de notifications : construction à partir de l'état réel ──────────
+  // Aucune carte inventée : connecteurs, graphe, relevé MCP, compteurs de
+  // l'Archiviste, snapshots et dernier rapport de scan. Cf. lib/notifications.ts.
+  useEffect(() => { getVersion().then(setAppVersion).catch(() => {}); }, []);
+  useEffect(() => { listSnapshots().then(setSnapshots).catch(() => {}); }, [graph]);
+  useEffect(() => {
+    setNotifItems(buildNotifications({
+      connectors, graph, stats: brainStats, archivist: archStats,
+      proposals, snapshots, version: appVersion, visitStart: VISIT_START,
+    }));
+  }, [connectors, graph, brainStats, archStats, proposals, snapshots, appVersion]);
+
+  /** Le reflet qui suit le curseur sur les surfaces de verre (`.lg`). Une seule
+   *  écoute déléguée : les panneaux sont montés/démontés en permanence. */
+  useEffect(() => {
+    let raf = 0;
+    function move(e: PointerEvent) {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        const el = (e.target as HTMLElement)?.closest?.(".lg") as HTMLElement | null;
+        if (el) {
+          const r = el.getBoundingClientRect();
+          el.style.setProperty("--mx", `${((e.clientX - r.left) / r.width) * 100}%`);
+          el.dataset.lit = "true";
+          el.style.setProperty("--my", `${((e.clientY - r.top) / r.height) * 100}%`);
+          for (const other of Array.from(document.querySelectorAll<HTMLElement>('.lg[data-lit="true"]'))) {
+            if (other !== el) other.dataset.lit = "false";
+          }
+        } else {
+          for (const other of Array.from(document.querySelectorAll<HTMLElement>('.lg[data-lit="true"]'))) {
+            other.dataset.lit = "false";
+          }
+        }
+        raf = 0;
+      });
+    }
+    document.addEventListener("pointermove", move);
+    return () => { document.removeEventListener("pointermove", move); cancelAnimationFrame(raf); };
+  }, []);
+
+  /** Ce que fait le bouton d'une carte de notification. Une action qui ne mène
+   *  nulle part n'existe pas : chaque verbe ouvre vraiment quelque chose. */
+  function handleNotifGo(go: string, done: () => void) {
+    const [verb, arg] = go.split(":");
+    if (verb === "node") {
+      const n = graph?.nodes.find((x) => x.id === arg);
+      if (n) { setNotifOpen(false); selectNode(n); setFocus({ id: n.id, k: Date.now() }); }
+      return;
+    }
+    if (verb === "connect" || verb === "skipped") {
+      setNotifOpen(false);
+      setLaunchpad(verb === "skipped" ? "local-folder" : arg);
+      return;
+    }
+    if (verb === "stats") {
+      setNotifOpen(false);
+      setStatsBump(true);
+      setTimeout(() => setStatsBump(false), 520);
+      return;
+    }
+    if (verb === "tidy") { void handleAllProposals(arg === "yes"); done(); return; }
+    if (verb === "restore") { void handleRestore(arg); done(); return; }
+    if (verb === "history") { setNotifOpen(false); void handleOpenHistory(); return; }
+    done();
+  }
+
+  /** Effacer l'historique : seul le compte rendu part, jamais ce qui attend une
+   *  décision (la carte « À traiter » n'a pas de bouton de fermeture en lot). */
+  function clearNotifs() {
+    clearDismissable(notifItems);
+    if (archStats) markArchivistSeen(archStats);
+    if (appVersion) markVersionSeen(appVersion);
+    setNotifItems((items) => items.filter((n) => n.sec === "À traiter"));
+  }
+
+  /** Pied du centre : l'état réel des sources. Pas de « dernière vérification » —
+   *  cette date n'existe pas encore côté Rust (cf. `connMeta`). */
+  const notifFooter = useMemo(() => {
+    const dead = connectors.filter((c) => c.reconnect_reason).length;
+    const last = connectors
+      .map((c) => (c.last_sync ? Date.parse(c.last_sync) : 0))
+      .reduce((a, b) => Math.max(a, b), 0);
+    const when = last ? ` · contenu le plus récent ${whenLabel(last)}` : "";
+    return dead
+      ? `${dead} source${dead > 1 ? "s" : ""} à reconnecter${when}`
+      : `Tout est à jour${when}`;
+  }, [connectors]);
 
   const checklistItems: ChecklistItem[] = useMemo(() => [
     {
@@ -1182,53 +1263,11 @@ function App() {
     return { ...displayGraph, nodes, edges };
   }, [displayGraph, proposals, wikilinkEdges]);
 
-  // ── Timeline : bornes temporelles du cerveau (nœuds datés) ──
-  const timeRange = useMemo(() => {
-    const ds = (graph?.nodes ?? [])
-      .filter((n) => n.date)
-      .map((n) => new Date(n.date!).getTime());
-    if (ds.length < 2) return null;
-    const min = Math.min(...ds), max = Math.max(...ds);
-    return min < max ? { min, max } : null;
-  }, [graph]);
-
-  // Curseur quantisé au jour : pendant le replay (rAF), le graphe filtré n'est
-  // recalculé qu'au franchissement d'un jour — pas à chaque frame.
-  const cutoffDate = timeCutoff === null ? null : new Date(timeCutoff).toISOString().slice(0, 10);
-
-  // Graphe filtré au curseur : une feuille/note datée n'existe qu'après sa date,
-  // un conteneur n'existe que s'il a au moins un descendant visible.
-  const timelineGraph = useMemo(() => {
-    if (!graphWithGhosts || cutoffDate === null) return graphWithGhosts;
-    const cutoff = cutoffDate;
-    const byId = new Map(graphWithGhosts.nodes.map((n) => [n.id, n]));
-    const kids = new Map<string, string[]>();
-    for (const n of graphWithGhosts.nodes) {
-      if (!n.parent_id) continue;
-      const a = kids.get(n.parent_id);
-      if (a) a.push(n.id); else kids.set(n.parent_id, [n.id]);
-    }
-    const memo = new Map<string, boolean>();
-    const vis = (id: string): boolean => {
-      const got = memo.get(id);
-      if (got !== undefined) return got;
-      const n = byId.get(id);
-      let v: boolean;
-      if (!n || n.kind === "root") v = true;
-      else if (n.date) v = n.date <= cutoff;
-      else {
-        const k = kids.get(id);
-        // Sans date : conteneur → suit ses enfants ; feuille/note ancienne → toujours là.
-        v = !k || k.length === 0 ? true : k.some(vis);
-      }
-      memo.set(id, v);
-      return v;
-    };
-    const nodes = graphWithGhosts.nodes.filter((n) => vis(n.id));
-    const set = new Set(nodes.map((n) => n.id));
-    const edges = graphWithGhosts.edges.filter((e) => set.has(e.source) && set.has(e.target));
-    return { ...graphWithGhosts, nodes, edges };
-  }, [graphWithGhosts, cutoffDate]);
+  // Panneau de page : largeur de la colonne reprise de la maquette (PEEK_W).
+  const PEEK_W = 424;
+  const pageNarrow = winW <= 1240;
+  const pageFull = nodeExpanded || pageNarrow;
+  const pageLeft = pageFull ? dockLeft : Math.max(dockLeft, winW - 12 - PEEK_W);
 
   if (needsSetup) {
     return (
@@ -1260,7 +1299,7 @@ function App() {
               graph={
                 scanning ? scanGraph :
                 (generating && partialGraph) ||
-                timelineGraph ||
+                graphWithGhosts ||
                 { nodes: [], edges: [], markdown: "", report: "", generated_at: "" }
               }
               onSelect={generating || scanning ? () => {} : selectNode}
@@ -1288,7 +1327,7 @@ function App() {
               onDeleteNode={handleDeleteNode}
               onImportFiles={handleImportDrop}
               onBackgroundClick={closeDetail}
-              panelOffset={selectedNode && !nodeExpanded ? 480 : 0}
+              panelOffset={selectedNode && !pageFull ? PEEK_W + 24 : 0}
               focus={focus}
             />
           )}
@@ -1299,14 +1338,14 @@ function App() {
               selectedId={selectedNode?.id ?? null}
               query={query}
               onBackgroundClick={closeDetail}
-              panelOffset={selectedNode && !nodeExpanded ? 480 : 0}
+              panelOffset={selectedNode && !pageFull ? PEEK_W + 24 : 0}
             />
           )}
 
           {/* ── Sidebar (structure + spaces) ── */}
           {/* Toujours montée : elle glisse hors cadre au repli, ce qui préserve
               l'état de pliage de l'arbre et rend le retour instantané. */}
-          <div className="sb-shell absolute bottom-3 left-3 top-3 z-30" data-open={sidebarOpen}>
+          <div className="sb-shell" data-open={sidebarOpen}>
               <Sidebar
                 graph={displayGraph}
                 onSelect={selectNode}
@@ -1314,6 +1353,7 @@ function App() {
                 query={query}
                 onQueryChange={setQuery}
                 onCollapse={() => setSidebarOpen(false)}
+                onOpenSettings={() => setSettingsOpen(true)}
                 onOpenChat={() => setLeftPanel((p) => (p ? null : "assistant"))}
                 chatOpen={leftPanel === "assistant"}
                 spaces={spaces}
@@ -1328,37 +1368,17 @@ function App() {
 
           <button
             onClick={() => setSidebarOpen(true)}
+            className="reopen lg"
+            hidden={sidebarOpen}
             title="Afficher la barre latérale"
-            aria-hidden={sidebarOpen}
-            className={cn(
-              "panel absolute left-3 top-3 z-30 flex size-[38px] items-center justify-center rounded-xl",
-              "text-[var(--color-muted)] transition-all duration-300 hover:text-[var(--color-text)]",
-              sidebarOpen
-                ? "pointer-events-none -translate-x-2 opacity-0"
-                : "translate-x-0 opacity-100 delay-150",
-            )}
+            aria-label="Ouvrir la barre latérale"
           >
-            <PanelLeft className="size-4" />
+            <IconSidebarLeft className="size-[18px]" />
           </button>
 
-          {/* ── Timeline temporelle — posée juste au-dessus de la barre d'outils ── */}
-          {view === "map" && graph && !generating && timeRange && (
-            <div className="pointer-events-none absolute inset-x-0 bottom-[4.75rem] z-10 flex justify-center">
-              <TimelineBar
-                min={timeRange.min}
-                max={timeRange.max}
-                value={timeCutoff ?? timeRange.max}
-                onChange={(v) => setTimeCutoff(v >= timeRange.max ? null : v)}
-              />
-            </div>
-          )}
-
-          {/* ── Panneau outil gauche ── */}
+          {/* ── Chat du cerveau (Lucid IA) : prend la colonne du relevé ── */}
           {leftPanel && (
-            <div
-              className="panel absolute bottom-4 top-4 z-30 flex w-[360px] flex-col overflow-hidden rounded-2xl animate-slideInLeft"
-              style={{ left: dockLeft, transition: "left 320ms var(--sb-ease)" }}
-            >
+            <div className="brain-chat chat lg" style={{ left: dockLeft }}>
               <AssistantPanel
                 onClose={() => setLeftPanel(null)}
                 activeSpaceId={activeSpaceId}
@@ -1370,79 +1390,14 @@ function App() {
             </div>
           )}
 
-          {/* ── Panneau propositions MCP (validation) ── */}
-          {proposals.length > 0 && graph && (
-            <div className="panel absolute bottom-6 right-6 z-30 w-[320px] overflow-hidden rounded-2xl">
-              <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2.5">
-                <p className="text-sm font-semibold text-[var(--color-text)]">
-                  <span className="mr-1.5 inline-block size-2 animate-pulse rounded-full bg-[#e0a33c]" />
-                  {proposals.length} proposition{proposals.length > 1 ? "s" : ""} de votre IA
-                </p>
-                <div className="flex gap-1">
-                  <button onClick={() => handleAllProposals(true)}
-                    className="rounded-md bg-[var(--color-accent)] px-2 py-1 text-[11px] text-white hover:bg-[var(--color-accent-hover)]">
-                    Tout accepter
-                  </button>
-                  <button onClick={() => handleAllProposals(false)}
-                    className="rounded-md px-2 py-1 text-[11px] text-[var(--color-muted)] hover:bg-[var(--color-surface-2)]">
-                    Tout refuser
-                  </button>
-                </div>
-              </div>
-              <div className="max-h-72 overflow-y-auto">
-                {proposals.map((p) => {
-                  const labelOf = (id: string) => {
-                    if (!id) return id;
-                    const n = graphWithGhosts?.nodes.find((n) => n.id === id);
-                    return n ? (n.kind === "root" ? "Lucid (racine)" : n.label) : id;
-                  };
-                  const { title, detail } = describeProposal(p, labelOf);
-                  return (
-                    <div key={p.id} className="border-b border-[var(--color-border)] px-4 py-2.5 last:border-b-0">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="truncate text-sm text-[var(--color-text)]">
-                            {p.action !== "create" && (
-                              <span className="mr-1 inline-block size-1.5 rounded-full bg-[#f97316]" />
-                            )}
-                            {title}
-                          </p>
-                          {detail && <p className="truncate text-[11px] text-[var(--color-muted)]">{detail}</p>}
-                        </div>
-                        <div className="flex shrink-0 gap-1">
-                          <button onClick={() => handleProposal(p.id, true)} title="Accepter"
-                            className="rounded-md border border-[var(--color-border)] px-2 py-0.5 text-sm text-[var(--color-ok,#3fb96b)] hover:bg-[var(--color-surface-2)]">
-                            ✓
-                          </button>
-                          <button onClick={() => handleProposal(p.id, false)} title="Refuser"
-                            className="rounded-md border border-[var(--color-border)] px-2 py-0.5 text-sm text-[var(--color-muted)] hover:bg-[var(--color-surface-2)]">
-                            ✗
-                          </button>
-                        </div>
-                      </div>
-                      {p.content && (
-                        <details className="mt-1">
-                          <summary className="cursor-pointer text-[11px] text-[var(--color-muted)]">aperçu du contenu</summary>
-                          <p className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap text-[11px] text-[var(--color-muted)]">
-                            {p.content.slice(0, 600)}{p.content.length > 600 ? "…" : ""}
-                          </p>
-                        </details>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* ── Relevé d'activité — en haut à gauche, contre la sidebar ── */}
+          {/* ── Relevé d'activité — colonne de gauche, contre la sidebar ── */}
           {view === "map" && graph && !generating && (
-            <div
-              className="absolute top-3 z-20 w-[254px]"
-              style={{ left: dockLeft, transition: "left 320ms var(--sb-ease)" }}
-            >
-              <StatsCard stats={brainStats} archivist={archStats} />
-            </div>
+            <StatsCard
+              stats={brainStats}
+              archivist={archStats}
+              className={statsBump ? "bump" : undefined}
+              style={{ left: dockLeft, opacity: leftPanel ? 0 : 1, pointerEvents: leftPanel ? "none" : undefined }}
+            />
           )}
 
           {/* ── Checklist « Bien démarrer » ── */}
@@ -1550,147 +1505,99 @@ function App() {
             />
           )}
 
-          {/* ── Barre flottante bas-centre ── */}
-          <div className="pointer-events-none absolute bottom-4 left-1/2 z-10 -translate-x-1/2">
-            <div className="panel pointer-events-auto flex items-center gap-1 rounded-2xl px-3 py-2">
-              {/* Marque */}
-              <div className="mr-1 flex items-center gap-2 pl-1.5 pr-3 border-r border-[var(--color-border)]">
-                <span className="size-2 rounded-full bg-[var(--color-accent)] shadow-[0_0_8px_var(--color-accent)]" />
-                <span className="font-mono text-xs font-semibold tracking-[0.2em]">LUCID</span>
-              </div>
+          {/* ── Dock : les sources branchées, en bas au centre ── */}
+          <Dock
+            connectors={connectors}
+            onOpenLaunchpad={() => setLaunchpad("")}
+            onOpenConnector={(id) => setLaunchpad(id)}
+            view={view}
+            onToggleView={() => setView((v) => (v === "map" ? "mosaic" : "map"))}
+            onCreate={graph ? () => { setNoteTitle(""); setNoteParent(rootId); setImportError(null); setNoteOpen(true); } : undefined}
+          />
 
-              {/* Modes */}
-              <ViewBtn active={view === "map"}    onClick={() => setView("map")}>
-                <Network    className="size-4" /> Mind
-              </ViewBtn>
-              <ViewBtn active={view === "mosaic"} onClick={() => setView("mosaic")}>
-                <LayoutGrid className="size-4" /> Mosaïque
-              </ViewBtn>
+          {/* ── Launchpad : le seul écran qui parle des sources ── */}
+          {launchpad !== null && (
+            <Launchpad
+              connectors={connectors}
+              initialId={launchpad || null}
+              onRefresh={() => connectorsStatus().then(setConnectors)}
+              onSyncDone={(hadNew) => { void handleGenerate({ skipSync: true }).then(() => { if (hadNew) void runArchivistNow({ silent: true }); }); }}
+              onClose={() => { setLaunchpad(null); connectorsStatus().then(setConnectors); }}
+            />
+          )}
 
-              {/* Recherche ⌘K */}
-              <div className="ml-1 flex items-center pl-3 border-l border-[var(--color-border)]">
-                <button
-                  onClick={() => { setQuery(""); setPaletteOpen(true); }}
-                  className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-                >
-                  <Search className="size-4" />
-                  <kbd className="rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[9px]">⌘K</kbd>
-                </button>
-              </div>
-
-              {/* Créer — l'action primaire, mise en avant */}
-              {graph && (
-                <div className="ml-1 flex items-center pl-3 border-l border-[var(--color-border)]">
-                  <button
-                    onClick={() => { setNoteTitle(""); setNoteParent(rootId); setImportError(null); setNoteOpen(true); }}
-                    title="Nouvelle note ou import de fichier"
-                    className="flex size-8 items-center justify-center rounded-full bg-[var(--color-accent)] text-white shadow-sm transition-transform hover:scale-105"
-                  >
-                    <Plus className="size-4" />
-                  </button>
-                </div>
-              )}
-
-            </div>
-          </div>
-
-          {/* ── Actions app (haut droite, façon Notion) : régénérer, snapshots,
-                 paramètres, thème. Masqué quand le panneau détail est ouvert. ── */}
-          {!selectedNode && (
-            <div className="absolute right-3 top-3 z-20 flex items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)]/75 px-1.5 py-1 shadow-[var(--shadow-float)] backdrop-blur-md">
-              <BetaBadge />
-              <SyncBadge />
-              {/* Inbox — flux passif des fichiers récents. Clic → ouvre la page
-                  Lucid du fichier (selectNode + focus canvas). */}
-              {graph && !demoMode && (
-                <InboxPanel
-                  graph={graph}
-                  onOpenNode={(n) => { selectNode(n); setFocus({ id: n.id, k: Date.now() }); }}
-                />
-              )}
-              {graph && (
-                <button
-                  onClick={() => handleGenerate()}
-                  title="Régénérer le cerveau (sync des sources)"
-                  className="rounded-full p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-                >
+          {/* ── Cluster haut-droite : notifications · réglages · thème ──
+                 Les trois gestes propres à l'app (régénérer, Archiviste,
+                 historique) restent là, dans la même matière. ── */}
+          <Cluster
+            pending={notifItems.filter((n) => n.sec === "À traiter").length}
+            hasNews={notifItems.length > 0}
+            notifOpen={notifOpen}
+            onToggleNotif={() => setNotifOpen((o) => !o)}
+            onOpenSettings={() => setSettingsOpen(true)}
+            extra={graph ? (
+              <>
+                <button onClick={() => handleGenerate()} title="Régénérer le cerveau (sync des sources)" aria-label="Régénérer">
                   <RefreshCw className="size-4" />
                 </button>
-              )}
-              {graph && (
                 <button
                   onClick={() => runArchivistNow()}
                   disabled={archiving}
                   title={archiving ? "L'Archiviste travaille…" : "Lancer l'Archiviste (ranger/fusionner les pages)"}
-                  className={cn(
-                    "rounded-full p-1.5 transition-colors disabled:cursor-not-allowed",
-                    archiving
-                      ? "text-[var(--color-accent)]"
-                      : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
-                  )}
+                  style={archiving ? { color: "var(--color-accent)" } : undefined}
                 >
                   {archiving ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
                 </button>
-              )}
-              <div className="relative">
-                <button
-                  onClick={handleOpenHistory}
-                  title="Historique des snapshots"
-                  className={cn(
-                    "rounded-full p-1.5 transition-colors",
-                    historyOpen
-                      ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                      : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
-                  )}
-                >
+                <button onClick={handleOpenHistory} title="Historique des snapshots" aria-expanded={historyOpen}>
                   <History className="size-4" />
                 </button>
-                {historyOpen && (
-                  <div className="absolute right-0 top-full mt-2 w-72 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)] overflow-hidden">
-                    <div className="px-3 py-2 border-b border-[var(--color-border)] text-xs font-semibold text-[var(--color-muted)] uppercase tracking-wider">
-                      Snapshots
-                    </div>
-                    {snapshots.length === 0 ? (
-                      <p className="px-3 py-4 text-xs text-[var(--color-muted)] text-center">
-                        Aucun snapshot — régénère le graphe pour en créer un.
-                      </p>
-                    ) : (
-                      <ul className="max-h-64 overflow-y-auto">
-                        {snapshots.map((s) => (
-                          <li key={s.id} className="flex items-center justify-between gap-2 px-3 py-2 hover:bg-[var(--color-surface-2)] transition-colors">
-                            <div className="min-w-0">
-                              <p className="text-xs font-medium text-[var(--color-text)] truncate">
-                                {relativeTime(s.created_at)}
-                              </p>
-                              <p className="text-[10px] text-[var(--color-muted)]">
-                                {s.node_count} nœuds · {SNAPSHOT_REASON_LABELS[s.reason] ?? s.reason}
-                              </p>
-                            </div>
-                            <button
-                              onClick={() => handleRestore(s.id)}
-                              disabled={restoring}
-                              title="Restaurer ce snapshot"
-                              className="shrink-0 flex items-center gap-1 rounded-lg px-2 py-1 text-[10px] font-medium text-[var(--color-accent)] hover:bg-[var(--color-accent-soft)] transition-colors disabled:opacity-40"
-                            >
-                              <RotateCcw className="size-3" />
-                              Restaurer
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
+              </>
+            ) : undefined}
+          />
+
+          {historyOpen && (
+            <div className="surface absolute right-3 top-[58px] z-40 w-72 overflow-hidden rounded-2xl">
+              <div className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--sb-label)]">
+                Snapshots
               </div>
-              <button
-                onClick={() => setSettingsOpen(true)}
-                title="Paramètres"
-                className="rounded-full p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)] transition-colors"
-              >
-                <Settings className="size-4" />
-              </button>
-              <ThemeToggle />
+              {snapshots.length === 0 ? (
+                <p className="px-3 py-4 text-center text-xs text-[var(--sb-label)]">
+                  Aucun snapshot — régénère le graphe pour en créer un.
+                </p>
+              ) : (
+                <ul className="max-h-64 overflow-y-auto">
+                  {snapshots.map((s) => (
+                    <li key={s.id} className="flex items-center justify-between gap-2 px-3 py-2 hover:bg-[var(--sb-hover)]">
+                      <div className="min-w-0">
+                        <p className="truncate text-xs font-medium">{relativeTime(s.created_at)}</p>
+                        <p className="text-[10px] text-[var(--sb-label)]">
+                          {s.node_count} nœuds · {SNAPSHOT_REASON_LABELS[s.reason] ?? s.reason}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => handleRestore(s.id)}
+                        disabled={restoring}
+                        title="Restaurer ce snapshot"
+                        className="mini-btn shrink-0"
+                      >
+                        <RotateCcw className="inline size-3" /> Restaurer
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
+          )}
+
+          {notifOpen && (
+            <NotificationCenter
+              items={notifItems}
+              footer={notifFooter}
+              onDismiss={(id) => { dismissNotif(id); setNotifItems((l) => l.filter((n) => n.id !== id)); }}
+              onClear={clearNotifs}
+              onGo={handleNotifGo}
+              onClose={() => setNotifOpen(false)}
+            />
           )}
 
           {/* ── Space partagé avec moi, ouvert en lecture seule ── */}
@@ -1731,23 +1638,21 @@ function App() {
             />
           )}
 
-          {/* ── Panneau détail (montage unique : panneau ⇄ plein écran) ── */}
+          {/* ── Panneau de page (colonne ⇄ pleine page, maquette « app vivante ») ── */}
           {selectedNode && (
             <div
-              className={cn(
-                "absolute overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)] shadow-[var(--shadow-float)]",
-                nodeExpanded
-                  ? "inset-3 z-40 rounded-2xl"
-                  : "bottom-3 right-3 top-3 z-10 w-[480px] rounded-xl animate-slideInRight",
-              )}
+              className="page surface"
+              data-mode={pageFull ? "full" : "peek"}
+              data-narrow={pageNarrow || undefined}
+              style={{ left: pageLeft }}
             >
               <NodeDetail
                 node={selectedNode}
                 graph={graph}
                 onSelect={setSelectedNode}
                 onClose={closeDetail}
-                expanded={nodeExpanded}
-                onExpand={() => setNodeExpanded((v) => !v)}
+                expanded={pageFull}
+                onExpand={pageNarrow ? undefined : () => setNodeExpanded((v) => !v)}
                 onContentSaved={handleContentSaved}
                 onCreateNote={handleCreateNote}
                 onNodeRenamed={handleNodeRenamed}
@@ -1794,28 +1699,6 @@ function relativeTime(ts: number): string {
   if (diff < 3600)  return `il y a ${Math.floor(diff / 60)} min`;
   if (diff < 86400) return `il y a ${Math.floor(diff / 3600)} h`;
   return `il y a ${Math.floor(diff / 86400)} j`;
-}
-
-function ViewBtn({
-  active, onClick, children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={cn(
-        "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm transition-colors",
-        active
-          ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-          : "text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]",
-      )}
-    >
-      {children}
-    </button>
-  );
 }
 
 export default App;

@@ -1,0 +1,3001 @@
+<title>Lucid — l'app complète, vivante</title>
+
+<style>
+  /* ═══════════════════════════════════════════════════════════════════════
+     JETONS · repris de src/index.css + les deux matériaux (chrome / contenu)
+     ═══════════════════════════════════════════════════════════════════════ */
+  :root {
+    --sb-ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+    /* Bornes du centre de notifications : lui seul doit rester SOUS les barres,
+       parce que son déclencheur est le badge du cluster — le recouvrir, c'est
+       le bug qu'on vient de corriger. Le cluster occupe 12 + 4 + 30 + 4 = 50,
+       la pastille de zoom 12 + 36 = 48. Le panneau de note, lui, passe par
+       dessus : il a son propre Fermer. */
+    --col-top: 58px;
+    --col-bottom: 54px;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+
+    --color-bg: #f5f7fb;
+    --color-surface: #ffffff;
+    --color-surface-2: #e9edf4;
+    --color-text: #1b2130;
+    --color-muted: #5c6577;
+    --color-accent: #ff8d4b;
+    --color-accent-hover: #f0722c;
+    --color-accent-soft: rgba(255, 141, 75, 0.2);
+    --color-ok: #2f9e6e;
+    --color-warn: #b0851f;
+    --color-err: #c25454;
+
+    /* chrome : translucide, plus clair · contenu : opaque, plus sombre */
+    --lg-tint: rgba(252, 253, 255, 0.62);
+    --lg-gloss: rgba(255, 255, 255, 0.5);
+    --lg-rim: rgba(255, 255, 255, 0.9);
+    --lg-rim-out: rgba(255, 255, 255, 0.6);
+    --lg-rim-bottom: rgba(255, 255, 255, 0.6);
+    --lg-spec: rgba(255, 255, 255, 0.5);
+    --lg-shadow:
+      0 1px 1px rgba(16, 24, 40, 0.04),
+      0 10px 24px -8px rgba(16, 24, 40, 0.13),
+      0 34px 64px -28px rgba(16, 24, 40, 0.18);
+    --lg-blur: 34px;
+    --lg-sat: 180%;
+    --lg-bright: 1.02;
+    --lg-fill: rgba(255, 255, 255, 0.6);
+    /* Lamelles en CLAIR : le blanc sur fond clair n'a pas de bord. La forme
+       vient d'un filet SOMBRE et d'une ombre franche, pas d'un liseré blanc
+       (invisible ici) — c'est l'inverse exact du réglage sombre. */
+    --card-tint: rgba(255, 255, 255, 0.82);
+    --card-gloss: rgba(255, 255, 255, 0.75);
+    --card-rim: rgba(255, 255, 255, 1);
+    --card-rim-out: rgba(16, 24, 40, 0.1);
+    --card-shadow: 0 1px 2px rgba(16, 24, 40, 0.07), 0 10px 26px -8px rgba(16, 24, 40, 0.22);
+    --content-bg: #ffffff;
+    --hairline: rgba(16, 24, 40, 0.09);
+    --scrim: rgba(16, 24, 40, 0.16);
+    --glow-a: 8%;
+    --glow-b: 4%;
+
+    /* canvas — plat strict : aplats + anneaux d'un demi-pixel, aucun dégradé */
+    --node: #e4e9f2;
+    --node-line: rgba(16, 24, 40, 0.14);
+    --edge: rgba(16, 24, 40, 0.16);
+    --label: #3d4658;
+
+    /* gris neutres du chrome */
+    --sb-text: #1e1e1e;
+    --sb-label: #8a8a8e;
+    --sb-icon: #b7b7b7;
+    --sb-field: rgba(120, 120, 128, 0.16);
+    --sb-placeholder: #9ca3af;
+    --sb-hover: rgba(0, 0, 0, 0.045);
+    --sb-track: #e6e6e9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --color-bg: #0a0d13;
+      --color-surface: #10131b;
+      --color-surface-2: #1a1e28;
+      --color-text: #e7ecf4;
+      --color-muted: #8a93a6;
+      --color-ok: #5fb39a;
+      --color-warn: #c9a86a;
+      --color-err: #d08a84;
+      --lg-tint: rgba(40, 40, 42, 0.92);
+      --lg-gloss: transparent;
+      --lg-rim: rgba(255, 255, 255, 0.075);
+      --lg-rim-out: rgba(255, 255, 255, 0.06);
+      --lg-rim-bottom: transparent;
+      --lg-spec: transparent;
+      --lg-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 10px 28px -10px rgba(0, 0, 0, 0.7);
+      --lg-sat: 140%;
+      --lg-bright: 1;
+      --lg-fill: rgba(255, 255, 255, 0.055);
+      --card-tint: rgba(52, 52, 55, 0.76);
+      --card-gloss: rgba(255, 255, 255, 0.05);
+      --card-rim: rgba(255, 255, 255, 0.12);
+      --card-rim-out: rgba(255, 255, 255, 0.08);
+      --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -12px rgba(0, 0, 0, 0.75);
+      --content-bg: #101217;
+      --hairline: rgba(255, 255, 255, 0.075);
+      --scrim: rgba(0, 0, 0, 0.42);
+      --glow-a: 3.5%;
+      --glow-b: 2%;
+      --node: #26262a;
+      --node-line: rgba(255, 255, 255, 0.1);
+      --edge: rgba(255, 255, 255, 0.12);
+      --label: #b6b6bd;
+      --sb-text: #f2f2f4;
+      --sb-label: #8e8e93;
+      --sb-icon: #6e6e73;
+      --sb-field: rgba(120, 120, 128, 0.32);
+      --sb-hover: rgba(255, 255, 255, 0.07);
+      --sb-track: rgba(255, 255, 255, 0.12);
+    }
+  }
+  :root[data-theme="dark"] {
+    --color-bg: #0a0d13;
+    --color-surface: #10131b;
+    --color-surface-2: #1a1e28;
+    --color-text: #e7ecf4;
+    --color-muted: #8a93a6;
+    --color-ok: #5fb39a;
+    --color-warn: #c9a86a;
+    --color-err: #d08a84;
+    --lg-tint: rgba(40, 40, 42, 0.92);
+    --lg-gloss: transparent;
+    --lg-rim: rgba(255, 255, 255, 0.075);
+    --lg-rim-out: rgba(255, 255, 255, 0.06);
+    --lg-rim-bottom: transparent;
+    --lg-spec: transparent;
+    --lg-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 10px 28px -10px rgba(0, 0, 0, 0.7);
+    --lg-sat: 140%;
+    --lg-bright: 1;
+    --lg-fill: rgba(255, 255, 255, 0.055);
+    --card-tint: rgba(52, 52, 55, 0.76);
+    --card-gloss: rgba(255, 255, 255, 0.05);
+    --card-rim: rgba(255, 255, 255, 0.12);
+    --card-rim-out: rgba(255, 255, 255, 0.08);
+    --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -12px rgba(0, 0, 0, 0.75);
+    --content-bg: #101217;
+    --hairline: rgba(255, 255, 255, 0.075);
+    --scrim: rgba(0, 0, 0, 0.42);
+    --glow-a: 3.5%;
+    --glow-b: 2%;
+    --node: #26262a;
+    --node-line: rgba(255, 255, 255, 0.1);
+    --edge: rgba(255, 255, 255, 0.12);
+    --label: #b6b6bd;
+    --sb-text: #f2f2f4;
+    --sb-label: #8e8e93;
+    --sb-icon: #6e6e73;
+    --sb-field: rgba(120, 120, 128, 0.32);
+    --sb-hover: rgba(255, 255, 255, 0.07);
+    --sb-track: rgba(255, 255, 255, 0.12);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
+  :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: 6px; }
+
+  /* ═══ MATIÈRES ═════════════════════════════════════════════════════════ */
+  .lg {
+    position: relative;
+    isolation: isolate;
+    background: linear-gradient(180deg, var(--lg-gloss) 0%, transparent 38%), var(--lg-tint);
+    border: 0.5px solid var(--lg-rim-out);
+    box-shadow: var(--lg-shadow), inset 0 0.5px 0 var(--lg-rim), inset 0 -0.5px 0 var(--lg-rim-bottom);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  }
+  .lg::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    z-index: 0;
+    background: radial-gradient(240px circle at var(--mx, 50%) var(--my, -20%), var(--lg-spec), transparent 60%);
+    opacity: 0;
+    transition: opacity 420ms var(--ease-out);
+  }
+  .lg[data-lit="true"]::after { opacity: 1; }
+  .lg > * { position: relative; z-index: 1; }
+  @supports not (backdrop-filter: blur(1px)) {
+    .lg { background: var(--color-surface); border-color: var(--hairline); }
+    .lg::after { display: none; }
+  }
+  .surface {
+    background: var(--content-bg);
+    border: 0.5px solid var(--lg-rim-out);
+    box-shadow: var(--lg-shadow), inset 0 0.5px 0 var(--lg-rim);
+  }
+
+  /* ═══ SCÈNE ════════════════════════════════════════════════════════════ */
+  .app { position: relative; height: 100vh; width: 100%; overflow: hidden; }
+  .bg {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(1100px 620px at 62% 32%, color-mix(in srgb, var(--color-accent) var(--glow-a), transparent), transparent 70%),
+      radial-gradient(760px 500px at 26% 84%, color-mix(in srgb, var(--color-accent) var(--glow-b), transparent), transparent 72%);
+  }
+
+  /* ═══ CANVAS ═══════════════════════════════════════════════════════════ */
+  #stage { position: absolute; inset: 0; touch-action: none; cursor: grab; }
+  #stage.grabbing { cursor: grabbing; }
+  #stage svg { width: 100%; height: 100%; display: block; }
+  #world { transition: transform 620ms var(--sb-ease); }
+  #world.dragging { transition: none; }
+
+  .edge {
+    stroke: var(--edge);
+    stroke-width: 1.25;
+    fill: none;
+    transition: stroke 240ms var(--ease-out), stroke-opacity 240ms var(--ease-out), stroke-width 240ms;
+  }
+  .edge.trunk { stroke-width: 1.85; }
+  .edge.bridge { stroke-dasharray: 4 5; stroke: color-mix(in srgb, var(--color-accent) 55%, transparent); stroke-width: 1.5; }
+  .edge.on { stroke: var(--color-accent); stroke-width: 2; stroke-opacity: 1; }
+  svg[data-focus="true"] .edge:not(.on) { stroke-opacity: 0.22; }
+
+  .node { cursor: pointer; }
+  .node .disc {
+    fill: var(--node);
+    stroke: var(--node-line);
+    stroke-width: 1;
+    transition: fill 240ms var(--ease-out), stroke 240ms var(--ease-out), r 420ms var(--spring), opacity 240ms;
+  }
+  .node .lbl {
+    fill: var(--label);
+    font-size: 12px;
+    font-weight: 500;
+    text-anchor: middle;
+    pointer-events: none;
+    transition: fill 240ms var(--ease-out), opacity 240ms;
+  }
+  .node .sub {
+    fill: var(--sb-label);
+    font-size: 9.5px;
+    text-anchor: middle;
+    pointer-events: none;
+    transition: opacity 240ms;
+  }
+  /* ── ENCODAGE ────────────────────────────────────────────────────────
+     Un canal, une variable — et jamais deux variables sur le même canal.
+     La FORME porte la nature : disque plein = page, anneau = dossier,
+     disque accentué = cerveau. Elle libère la TAILLE pour la masse.
+     Diverge de BrainMap.tsx, qui met la nature sur la taille et la COMMUNAUTÉ
+     sur la teinte. ADR-0022 mesure que l'étiquetage bouge entre deux passes
+     (19 documents changeaient de domaine) : les couleurs du cerveau de
+     quelqu'un changeraient toutes seules. La provenance, elle, ne bouge pas. */
+  .node[data-kind="container"] .disc { fill: var(--color-bg); stroke: var(--label); stroke-width: 2.25; }
+  .node[data-kind="root"] .disc { fill: color-mix(in srgb, var(--color-accent) 7%, var(--node)); stroke: color-mix(in srgb, var(--color-accent) 65%, transparent); stroke-width: 1.75; }
+  .node[data-kind="root"] .lbl { fill: var(--color-accent-hover); font-size: 14px; font-weight: 600; }
+  .node[data-kind="container"] .lbl { font-size: 12.5px; font-weight: 600; }
+  /* Le pouls : ce qui est arrivé depuis la dernière visite. Les mêmes trois
+     nœuds que les cartes du centre de notifications — un seul évènement, deux
+     endroits qui le disent. */
+  .node .pulse-ring { fill: none; stroke: color-mix(in srgb, var(--color-accent) 70%, transparent); stroke-width: 1.25; }
+
+  /* Le texte se détache du fond par un halo, pas par une boîte : dès que deux
+     bulles se rapprochent, les libellés se croisaient. */
+  .node .lbl, .node .sub { paint-order: stroke; stroke: var(--color-bg); stroke-width: 3px; stroke-linejoin: round; }
+
+  /* Le zoom porte le détail, comme une carte. Fondu et non apparition sèche
+     (décision Liam 2026-07-22, reprise de LEAF_FADE dans BrainMap.tsx). */
+  .node { transition: opacity 320ms var(--ease-out); }
+  svg[data-lod="far"] .node[data-kind="leaf"] { opacity: 0; pointer-events: none; }
+  svg[data-lod="far"] .edge[data-leaf="true"] { stroke-opacity: 0; }
+  svg[data-lod="mid"] .node[data-kind="leaf"] .lbl { opacity: 0; }
+  svg[data-lod="mid"] .node[data-kind="leaf"].on .lbl { opacity: 1; }
+  svg[data-lod="far"] .sub { opacity: 0; }
+  .node:hover .disc { stroke: color-mix(in srgb, var(--color-accent) 60%, transparent); }
+  .node[aria-selected="true"] .disc {
+    fill: color-mix(in srgb, var(--color-accent) 12%, var(--node));
+    stroke: var(--color-accent);
+    stroke-width: 2;
+  }
+  .node[aria-selected="true"] .lbl { fill: var(--color-accent-hover); }
+  svg[data-focus="true"] .node:not(.on) .disc { opacity: 0.3; }
+  svg[data-focus="true"] .node:not(.on) .lbl,
+  svg[data-focus="true"] .node:not(.on) .sub { opacity: 0.22; }
+
+  .ghost .disc { fill: none; stroke: var(--color-accent); stroke-dasharray: 5 4; stroke-width: 1.5; }
+  .ghost .lbl { fill: var(--color-accent-hover); }
+  .pulsing .disc { animation: ping 1.5s var(--ease-out) 2; }
+  @keyframes ping {
+    0% { stroke-width: 1; }
+    35% { stroke-width: 7; stroke: color-mix(in srgb, var(--color-accent) 45%, transparent); }
+    100% { stroke-width: 1; }
+  }
+
+  /* ═══ VUE ZONES ════════════════════════════════════════════════════════
+     L'inclusion se dessine par l'ENCLOS, pas par un trait : c'est la gestalt
+     la plus forte, et elle rend au graphe les 95 % d'arêtes qui ne faisaient
+     que répéter l'arborescence. Ce qui reste tracé, c'est le seul lien qu'un
+     enclos ne peut pas dire — le pont entre deux dossiers.
+     Prolonge la doctrine mosaïque (« zéro trait : la relation est l'adjacence »)
+     en lui rendant les liens, à la demande. */
+  /* `hidden` n'est pas honoré sur les éléments SVG par toutes les feuilles
+     de style UA : la bascule de vue doit être explicite. */
+  #edges[hidden], #nodes[hidden], #zones[hidden] { display: none; }
+  .zone { cursor: pointer; }
+  .zone-box {
+    fill: var(--lg-fill);
+    stroke: var(--hairline);
+    stroke-width: 1;
+    transition: opacity 260ms var(--ease-out), stroke 200ms var(--ease-out);
+  }
+  .zone[aria-selected="true"] .zone-box { stroke: var(--color-accent); }
+  .zone-name { fill: var(--label); font-size: 11.5px; font-weight: 600; paint-order: stroke; stroke: var(--color-bg); stroke-width: 3px; stroke-linejoin: round; }
+  .zone-n { fill: var(--sb-label); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+  .zone[aria-selected="true"] .zone-name { fill: var(--color-accent-hover); }
+
+  /* Barème d'opacité repris de MosaicMap : au repos les tuiles respirent,
+     le survol rend sa présence entière au dossier pointé et efface le reste. */
+  .zone { transition: opacity 260ms var(--ease-out); opacity: 0.86; }
+  .zone:hover, .zone.on { opacity: 1; }
+  #zones[data-focus="true"] .zone:not(.on) { opacity: 0.22; }
+
+  .tile { fill: var(--node); transition: opacity 240ms var(--ease-out), fill 200ms; }
+  .tile.anon { opacity: 0.45; }
+  .tile.named { cursor: pointer; }
+  .tile.named:hover { stroke: var(--color-accent); stroke-width: 1.5; }
+  .tile[aria-selected="true"] { stroke: var(--color-accent); stroke-width: 1.5; }
+  .tile-lbl { fill: var(--label); font-size: 9.5px; paint-order: stroke; stroke: var(--color-bg); stroke-width: 3px; stroke-linejoin: round; opacity: 0; transition: opacity 240ms var(--ease-out); }
+  .zone.on .tile-lbl, svg[data-lod="near"] .tile-lbl { opacity: 1; }
+  /* Marque de pont au repos : discrète, elle dit qu'il EXISTE un lien ailleurs.
+     L'arc, lui, ne se dessine qu'à la demande — sinon on rétablit la pelote. */
+  .tile-bridge { fill: var(--color-accent); }
+  .zarc { fill: none; stroke: var(--color-accent); stroke-width: 1.5; stroke-dasharray: 4 5; opacity: 0; transition: opacity 320ms var(--ease-out); }
+  .zarc.on { opacity: 1; }
+  /* De loin, un dossier est un bloc : 3 000 tuiles ne se lisent pas à 60 %. */
+  svg[data-lod="far"] .tile { opacity: 0; }
+  svg[data-lod="far"] .zone-box { fill: var(--node); }
+
+  /* Bascule de vue — elle vit dans la top-bar de la sidebar (décision 07/09) */
+  .seg { display: flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--sb-field); }
+  .seg button {
+    flex: 1; height: 22px; border-radius: 7px; font-size: 11px; font-weight: 500;
+    color: var(--sb-label);
+    transition: background-color 160ms var(--ease-out), color 160ms var(--ease-out);
+  }
+  .seg button[aria-pressed="true"] { background: var(--color-surface); color: var(--sb-text); box-shadow: 0 1px 2px rgba(0,0,0,0.12); }
+
+  /* ═══ SIDEBAR ══════════════════════════════════════════════════════════ */
+  .sb-shell {
+    position: absolute;
+    left: 12px;
+    top: 12px;
+    bottom: 12px;
+    z-index: 30;
+    transition: transform 420ms var(--sb-ease), opacity 240ms var(--sb-ease);
+  }
+  .sb-shell[data-open="false"] { transform: translateX(calc(-100% - 14px)); opacity: 0; pointer-events: none; }
+  .sidebar {
+    width: 234px;
+    height: 100%;
+    border-radius: 19px;
+    padding: 9px;
+    display: flex;
+    flex-direction: column;
+    color: var(--sb-text);
+  }
+  .sb-top { display: flex; flex-direction: column; gap: 9px; padding: 5px 5px 3px; flex-shrink: 0; }
+  .sb-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .sb-count { display: flex; align-items: baseline; gap: 4px; min-width: 0; }
+  .sb-count b { font-size: 12.5px; font-weight: 600; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+  .sb-count em { font-style: normal; font-size: 11px; color: var(--sb-label); }
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    color: var(--sb-icon);
+    flex-shrink: 0;
+    transition: background-color 160ms var(--ease-out), color 160ms var(--ease-out), transform 200ms var(--sb-ease);
+  }
+  .icon-btn:hover { background: var(--sb-hover); color: var(--sb-text); }
+  .icon-btn:active { transform: scale(0.93); }
+  .icon-btn.accent { color: var(--color-accent); }
+  .icon-btn.accent:hover { background: var(--color-accent-soft); color: var(--color-accent); }
+
+  .field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 27px;
+    border-radius: 9px;
+    background: var(--sb-field);
+    padding: 0 9px;
+    box-shadow: inset 0 0.5px 1px rgba(16, 24, 40, 0.05);
+    transition: box-shadow 200ms var(--ease-out);
+  }
+  .field:focus-within { box-shadow: 0 0 0 2.5px var(--color-accent-soft), inset 0 0.5px 1px rgba(16, 24, 40, 0.05); }
+  .field input { flex: 1; min-width: 0; background: none; border: 0; outline: none; font-size: 12.5px; color: var(--sb-text); }
+  .field input::placeholder { color: var(--sb-placeholder); }
+  .field svg { color: var(--sb-label); flex-shrink: 0; }
+
+  .sb-body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+  .sb-body::-webkit-scrollbar { width: 7px; }
+  .sb-body::-webkit-scrollbar-thumb { background: var(--sb-track); border-radius: 6px; }
+  .sec {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 13px 6px 4px 8px;
+    flex-shrink: 0;
+  }
+  .sec .ttl {
+    flex: 1;
+    text-align: left;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--sb-label);
+  }
+  .sec .chev svg { width: 14px; height: 14px; transition: transform 260ms var(--sb-ease); }
+  .sec[data-open="false"] .chev svg { transform: rotate(-90deg); }
+  .sec .plus:hover { transform: rotate(90deg); color: var(--color-accent); background: var(--color-accent-soft); }
+  .fold {
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transition: grid-template-rows 300ms var(--sb-ease), opacity 200ms var(--sb-ease);
+  }
+  .fold > * { min-height: 0; overflow: hidden; }
+  .fold[data-open="true"] { grid-template-rows: 1fr; opacity: 1; }
+
+  .tree { list-style: none; margin: 0; padding: 0 4px; }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    border-radius: 7px;
+    min-height: 23px;
+    padding: 2px 8px 2px 0;
+    font-size: 12.5px;
+    color: var(--sb-text);
+    width: 100%;
+    text-align: left;
+    transition: background-color 150ms var(--ease-out), color 150ms var(--ease-out);
+  }
+  .row:hover { background: var(--sb-hover); }
+  .row[aria-selected="true"] { background: var(--color-accent-soft); color: var(--color-accent-hover); font-weight: 500; }
+  .row .tw { width: 14px; flex-shrink: 0; color: var(--sb-icon); display: inline-flex; }
+  .row .tw svg { width: 14px; height: 14px; transition: transform 260ms var(--sb-ease); }
+  .row[data-exp="false"] .tw svg { transform: rotate(-90deg); }
+  .row[aria-selected="true"] .tw { color: var(--color-accent-hover); }
+  .row .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .dot-src { width: 5px; height: 5px; border-radius: 50%; margin-left: auto; flex-shrink: 0; opacity: 0.75; }
+
+  .space-wrap { padding: 1px 4px; }
+  .space {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border-radius: 7px;
+    min-height: 23px;
+    padding: 2px 8px;
+    width: 100%;
+    text-align: left;
+    color: var(--sb-text);
+    transition: background-color 150ms var(--ease-out), color 150ms var(--ease-out);
+  }
+  .space:hover { background: var(--sb-hover); }
+  .space[aria-selected="true"] { background: var(--color-accent-soft); color: var(--color-accent-hover); }
+  .space .bi { color: var(--color-accent); display: inline-flex; flex-shrink: 0; }
+  .space .bi svg { width: 15px; height: 15px; }
+  .space .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 500; }
+
+  .sb-foot {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 8px 3px;
+    border-top: 0.5px solid var(--sb-field);
+    margin-top: 4px;
+    border-radius: 9px;
+    flex-shrink: 0;
+    transition: background-color 150ms var(--ease-out);
+  }
+  .sb-foot:hover { background: var(--sb-hover); }
+  .avatar {
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    background: linear-gradient(140deg, var(--color-accent), var(--color-accent-hover));
+    color: #fff;
+    font-size: 8.5px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .sb-foot span:last-child { font-size: 11px; color: var(--sb-label); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .reopen {
+    position: absolute;
+    left: 12px;
+    top: 12px;
+    z-index: 30;
+    width: 34px;
+    height: 34px;
+    border-radius: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--color-text);
+  }
+  .reopen[hidden] { display: none; }
+
+  /* ═══ CARTE DU RELEVÉ ══════════════════════════════════════════════════ */
+  .stats {
+    position: absolute;
+    top: 12px;
+    z-index: 20;
+    width: 198px;
+    border-radius: 15px;
+    padding: 11px 13px 12px;
+    display: flex;
+    flex-direction: column;
+    transition: left 420ms var(--sb-ease), transform 520ms var(--spring), opacity 240ms var(--ease-out);
+  }
+  .stats.bump { transform: scale(1.035); }
+  .st-head { display: block; font-size: 10.5px; color: var(--sb-label); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .st-hero { margin-top: 6px; display: flex; align-items: baseline; gap: 6px; }
+  .st-hero .n {
+    font-size: 24px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.025em;
+    color: var(--color-accent);
+    font-variant-numeric: tabular-nums;
+  }
+  .st-hero .u { font-size: 11px; color: var(--sb-label); }
+  .bars { margin-top: 9px; display: flex; align-items: flex-end; gap: 2.5px; height: 15px; }
+  .bars > div { flex: 1; height: 100%; display: flex; align-items: flex-end; }
+  .bars i {
+    display: block;
+    width: 100%;
+    border-radius: 1.5px;
+    background: var(--sb-icon);
+    transition: opacity 180ms var(--ease-out), height 620ms var(--sb-ease);
+  }
+  .bars i.z { background: var(--sb-track); }
+  .bars:hover i { opacity: 0.34; }
+  .bars > div:hover i { opacity: 1; }
+  .st-foot { margin-top: 7px; font-size: 10px; color: var(--sb-label); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ═══ CLUSTER + ZOOM ═══════════════════════════════════════════════════ */
+  .cluster {
+    position: absolute;
+    right: 12px;
+    top: 12px;
+    z-index: 26;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    border-radius: 999px;
+    padding: 4px;
+  }
+  .cluster button {
+    width: 30px;
+    height: 30px;
+    border-radius: 999px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--color-muted);
+    font-size: 13px;
+    transition: background-color 160ms var(--ease-out), color 160ms var(--ease-out);
+  }
+  .cluster button:hover { background: var(--sb-hover); color: var(--color-text); }
+  .cluster button[aria-expanded="true"] { background: var(--color-accent-soft); color: var(--color-accent-hover); }
+  .badge { position: relative; }
+  .badge.bump { animation: badge-pop 620ms var(--spring); }
+  @keyframes badge-pop {
+    0% { transform: none; } 38% { transform: scale(1.22); } 100% { transform: none; }
+  }
+  .badge::after {
+    content: "";
+    position: absolute;
+    top: 5px;
+    right: 6px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--color-accent);
+  }
+
+  .zoom {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    z-index: 26;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    border-radius: 999px;
+    padding: 4px;
+  }
+  .zoom button {
+    width: 28px;
+    height: 28px;
+    border-radius: 999px;
+    color: var(--color-muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    transition: background-color 160ms, color 160ms;
+  }
+  .zoom button:hover { background: var(--sb-hover); color: var(--color-text); }
+  .zoom .lv {
+    font-size: 10.5px;
+    color: var(--sb-label);
+    min-width: 38px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ═══ CENTRE DE NOTIFICATIONS ═════════════════════════════════════════
+     Panneau de droite façon macOS : des cartes de verre empilées, groupées
+     quand elles se ressemblent, et une action à même la carte quand il y a
+     quelque chose à faire. Ce que Lucid a fait tout seul se lit ici — sinon
+     l'autonomie est indiscernable de l'inaction. */
+  /* Pas de panneau. Chez Apple le centre de notifications n'a pas de fond :
+     chaque carte est une lamelle de verre posée sur le bureau, et c'est ce
+     qu'on voit PASSER ENTRE les cartes qui produit l'effet. Un panneau opaque
+     rempli de rectangles plats, c'est une liste — pas du verre. */
+  .nc {
+    position: absolute;
+    right: 12px;
+    top: var(--col-top);
+    bottom: var(--col-bottom);
+    width: 372px;
+    max-width: calc(100vw - 24px);
+    z-index: 32;
+    display: flex;
+    flex-direction: column;
+    pointer-events: none;
+    transform-origin: top right;
+    animation: ncIn 420ms var(--spring);
+  }
+  .nc > * { pointer-events: auto; }
+  .nc[hidden] { display: none; }
+  @keyframes ncIn {
+    from { transform: translateX(20px) scale(0.97); opacity: 0; }
+    to { transform: none; opacity: 1; }
+  }
+  .nc-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 6px 10px;
+    flex-shrink: 0;
+  }
+  .nc-head .t { text-shadow: 0 1px 3px color-mix(in srgb, var(--color-bg) 80%, transparent); }
+  .nc-head .t { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; flex: 1; }
+  .nc-head .lnk {
+    font-size: 11.5px;
+    color: var(--sb-label);
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: var(--card-tint);
+    box-shadow: inset 0 0 0 0.5px var(--card-rim-out), var(--card-shadow);
+    backdrop-filter: blur(18px) saturate(160%);
+    -webkit-backdrop-filter: blur(18px) saturate(160%);
+  }
+  .nc-head .lnk:hover { color: var(--color-accent-hover); background: var(--color-accent-soft); }
+  .nc-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 4px 4px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    /* les cartes s'effacent en haut au lieu d'être tranchées net */
+    mask-image: linear-gradient(180deg, transparent 0, #000 14px, #000 calc(100% - 10px), transparent 100%);
+    -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 14px, #000 calc(100% - 10px), transparent 100%);
+  }
+  .nc-list::-webkit-scrollbar { width: 7px; }
+  .nc-list::-webkit-scrollbar-thumb { background: var(--sb-track); border-radius: 6px; }
+  .nc-sec {
+    text-shadow: 0 1px 3px color-mix(in srgb, var(--color-bg) 80%, transparent);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--sb-label);
+    font-weight: 600;
+    padding: 12px 4px 2px;
+  }
+  .nc-sec:first-child { padding-top: 2px; }
+
+  /* le conteneur qui permet l'effondrement à la fermeture */
+  .nc-slot {
+    display: grid;
+    grid-template-rows: 1fr;
+    transition: grid-template-rows 320ms var(--sb-ease), opacity 220ms var(--ease-out),
+                transform 320ms var(--sb-ease), margin 320ms var(--sb-ease);
+  }
+  .nc-slot > * { min-height: 0; }
+  .nc-slot[data-out="true"] {
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transform: translateX(28px);
+    margin-bottom: -8px;
+  }
+
+  .ncard {
+    position: relative;
+    isolation: isolate;
+    border-radius: 16px;
+    padding: 11px 12px 11px 13px;
+    background: linear-gradient(180deg, var(--card-gloss) 0%, transparent 42%), var(--card-tint);
+    box-shadow:
+      var(--card-shadow),
+      inset 0 0.5px 0 var(--card-rim),
+      inset 0 0 0 0.5px var(--card-rim-out);
+    backdrop-filter: blur(26px) saturate(175%);
+    -webkit-backdrop-filter: blur(26px) saturate(175%);
+    display: flex;
+    gap: 10px;
+    transition: box-shadow 200ms var(--ease-out), transform 260ms var(--spring);
+  }
+  .ncard > * { position: relative; z-index: 1; }
+  /* le reflet qui suit le curseur — clair seulement, cf. --lg-spec */
+  .ncard::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    z-index: 0;
+    background: radial-gradient(180px circle at var(--mx, 50%) var(--my, -30%), var(--lg-spec), transparent 62%);
+    opacity: 0;
+    transition: opacity 380ms var(--ease-out);
+  }
+  .ncard:hover::after { opacity: 1; }
+  .ncard:hover {
+    transform: translateY(-1px);
+    box-shadow:
+      var(--card-shadow),
+      inset 0 0.5px 0 var(--card-rim),
+      inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 32%, var(--card-rim-out));
+  }
+  /* Sans backdrop-filter (WebView2), les lamelles redeviennent des surfaces
+     pleines : lisibles, sans le verre. Jamais un panneau translucide illisible. */
+  @supports not (backdrop-filter: blur(1px)) {
+    .ncard { background: var(--color-surface); }
+    .ncard::after { display: none; }
+  }
+  .ncard .bar {
+    position: absolute;
+    left: 5px;
+    top: 13px;
+    bottom: 13px;
+    width: 2.5px;
+    border-radius: 999px;
+  }
+  .ncard.act { padding-left: 16px; }
+  .ncard .ico {
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    background: var(--sb-field);
+    overflow: hidden;
+  }
+  .ncard .ico img { width: 100%; height: 100%; object-fit: contain; }
+  .ncard .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .ncard .top { display: flex; align-items: baseline; gap: 8px; }
+  .ncard .ttl { font-size: 12.5px; font-weight: 600; flex: 1; min-width: 0; letter-spacing: -0.005em; }
+  .ncard .when { font-size: 10.5px; color: var(--sb-label); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .ncard .txt { font-size: 12px; line-height: 1.45; color: var(--sb-label); }
+  .ncard .row { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; }
+  .ncard .x {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 20px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--card-tint);
+    box-shadow: inset 0 0 0 0.5px var(--card-rim-out), 0 2px 6px rgba(16, 24, 40, 0.28);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    color: var(--sb-label);
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transform: scale(0.8);
+    transition: opacity 160ms var(--ease-out), transform 200ms var(--spring);
+  }
+  .ncard:hover .x { opacity: 1; transform: none; }
+  .ncard .x:hover { color: var(--sb-text); }
+
+  /* La pile : deux cartes fantômes derrière la première, qui se déplient. */
+  .stack { position: relative; }
+  .stack .ghost-l {
+    position: absolute;
+    left: 6px;
+    right: 6px;
+    height: 100%;
+    border-radius: 16px;
+    background: var(--card-tint);
+    box-shadow: inset 0 0 0 0.5px var(--card-rim-out), var(--card-shadow);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    transition: transform 340ms var(--spring), opacity 240ms var(--ease-out);
+    pointer-events: none;
+  }
+  .stack .g1 { transform: translateY(6px) scale(0.985); opacity: 0.7; }
+  .stack .g2 { transform: translateY(11px) scale(0.968); opacity: 0.4; }
+  .stack[data-open="true"] .ghost-l { transform: none; opacity: 0; }
+  .stack .more {
+    font-size: 10.5px;
+    color: var(--sb-label);
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--sb-field);
+    flex-shrink: 0;
+  }
+  .stack-items {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 340ms var(--sb-ease), opacity 240ms var(--ease-out), margin-top 340ms var(--sb-ease);
+    opacity: 0;
+  }
+  .stack-items > * { min-height: 0; overflow: hidden; }
+  .stack[data-open="true"] .stack-items { grid-template-rows: 1fr; opacity: 1; margin-top: 8px; }
+  .stack-items .inner { display: flex; flex-direction: column; gap: 8px; }
+
+  .nc-empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: var(--sb-label);
+    text-align: center;
+    padding: 0 32px 40px;
+  }
+  .nc-empty .big { font-size: 26px; opacity: 0.5; }
+  .nc-empty .t2 { font-size: 13px; font-weight: 500; color: var(--sb-text); }
+  .nc-empty .s2 { font-size: 11.5px; line-height: 1.5; }
+
+  .nc-foot {
+    align-self: flex-start;
+    margin: 4px 4px 0;
+    padding: 7px 12px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    color: var(--sb-label);
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-shrink: 0;
+    background: var(--card-tint);
+    box-shadow: inset 0 0 0 0.5px var(--card-rim-out), var(--card-shadow);
+    backdrop-filter: blur(20px) saturate(170%);
+    -webkit-backdrop-filter: blur(20px) saturate(170%);
+  }
+  .nc-foot .d { width: 5px; height: 5px; border-radius: 50%; background: var(--color-ok); flex-shrink: 0; }
+
+  .cluster .badge .cnt {
+    position: absolute;
+    top: 1px;
+    right: 1px;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 3px;
+    border-radius: 999px;
+    background: var(--color-accent);
+    color: #fff;
+    font-size: 9px;
+    line-height: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-bg) 65%, transparent);
+  }
+  .cluster .badge[data-n="0"] .cnt { display: none; }
+  /* jamais le point ET le nombre : ils se superposaient au même coin */
+  .cluster .badge:not([data-n="0"])::after,
+  .cluster .badge[data-news="false"]::after { display: none; }
+
+  /* La proposition de rangement n'a plus de carte flottante : elle vit dans
+     « À traiter » du centre de notifications, le seul endroit du produit qui
+     porte ce qui attend une décision. Sur le canvas il reste la bulle fantôme
+     — l'objet dont on parle, pas le formulaire. */
+
+  .mini-btn {
+    height: 27px;
+    padding: 0 12px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 500;
+    background: var(--lg-fill);
+    box-shadow: inset 0 0 0 0.5px var(--hairline);
+    transition: box-shadow 160ms, transform 180ms var(--sb-ease), background-color 160ms;
+  }
+  .mini-btn:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 50%, transparent); }
+  .mini-btn:active { transform: scale(0.97); }
+  .mini-btn.ok { background: var(--color-accent); color: #fff; box-shadow: 0 1px 3px color-mix(in srgb, var(--color-accent) 45%, transparent); }
+  .mini-btn.ok:hover { background: var(--color-accent-hover); }
+
+  /* Pas de bandeau d'arrivée : ses trois chiffres sont déjà les trois cartes
+     du centre de notifications, et son bouton « Voir » ouvrait ce même centre.
+     Le relevé d'arrivée, c'est la section « Depuis ta dernière visite » et le
+     badge qui compte — pas un panneau posé devant le canvas. */
+
+  /* ═══ PANNEAU DE PAGE ══════════════════════════════════════════════════ */
+  .page {
+    position: absolute;
+    right: 12px;
+    top: 12px;
+    bottom: 12px;
+    /* La largeur vient de `left`, posé par placePage() : deux valeurs en px
+       sur la même propriété s'animent, `width: auto` ne s'anime pas. */
+    left: 0;
+    transition: left 520ms var(--sb-ease);
+    /* Pile de la scène, du fond vers le dessus :
+         20 relevé · 26 cluster + zoom · 28 dock · 29 infobulle du dock ·
+         30 sidebar · 31 PANNEAU DE NOTE · 32 notifications · 40/45 modales.
+       Le panneau passe au-dessus de tout le chrome flottant parce qu'en pleine
+       page il le recouvre géométriquement — et il porte son propre Fermer, donc
+       rien ne devient injoignable. Il reste sous les notifications, dont le
+       déclencheur (le badge) doit rester atteignable. */
+    z-index: 31;
+    border-radius: 20px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: slide 420ms var(--sb-ease);
+  }
+  .page[hidden] { display: none; }
+  .page.nofx { transition: none; }
+  @keyframes slide { from { transform: translateX(26px); opacity: 0; } to { transform: none; opacity: 1; } }
+  /* Pleine page : la surface s'étend, pas le texte. Une colonne de 1 500 px
+     de large ne se lit pas — le corps reste à une longueur de ligne tenable. */
+  .page[data-mode="full"] .pg-body,
+  .page[data-narrow="true"] .pg-body { padding: 34px 24px 56px; gap: 20px; }
+  /* 600 px et non 680 : à 15,5 px la ligne fait ~78 caractères, contre ~95 à
+     13,5 px sur 680. Agrandir la surface sans agrandir le texte rendait la
+     pleine page MOINS lisible que la colonne. */
+  .page[data-mode="full"] .pg-body > *,
+  .page[data-narrow="true"] .pg-body > * { width: 100%; max-width: 600px; margin-inline: auto; }
+  .page[data-mode="full"] .pg-body p,
+  .page[data-narrow="true"] .pg-body p { font-size: 15.5px; line-height: 1.7; }
+  .page[data-mode="full"] .pg-body h3,
+  .page[data-narrow="true"] .pg-body h3 { font-size: 21px; }
+  .page[data-mode="full"] .pg-head,
+  .page[data-narrow="true"] .pg-head { padding-left: 24px; }
+  .pg-head {
+    height: 54px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 12px 0 18px;
+    border-bottom: 0.5px solid var(--hairline);
+  }
+  .pg-head .sq { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+  .pg-head .nm { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pg-tools { display: flex; align-items: center; gap: 2px; color: var(--color-muted); }
+  .pg-tools .icon-btn { width: 26px; height: 26px; border-radius: 8px; }
+  .pg-tools .icon-btn:hover { color: var(--color-accent); background: var(--color-accent-soft); }
+  /* Colonne d'arborescence, comme NodeDetail.tsx en plein écran : elle
+     n'apparaît qu'en pleine page — à 424 px il n'y a pas la place. */
+  .pg-main { flex: 1; min-height: 0; display: flex; }
+  .pg-side { display: none; }
+  .page[data-mode="full"] .pg-side,
+  .page[data-narrow="true"] .pg-side {
+    display: flex;
+    flex-direction: column;
+    width: 258px;
+    flex-shrink: 0;
+    overflow-y: auto;
+    border-right: 0.5px solid var(--hairline);
+    padding: 0 6px 18px;
+  }
+  .pg-side::-webkit-scrollbar { width: 7px; }
+  .pg-side::-webkit-scrollbar-thumb { background: var(--sb-track); border-radius: 6px; }
+  .pg-side .tree ul { list-style: none; margin: 0; padding: 0; }
+  .pg-side .row { cursor: default; }
+  .nm-btn { flex: 1; min-width: 0; text-align: left; font: inherit; color: inherit; }
+  .pg-body { flex: 1; min-width: 0; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+  .props { display: flex; flex-direction: column; gap: 6px; }
+  .prop { display: grid; grid-template-columns: 78px 1fr; gap: 10px; font-size: 12.5px; align-items: center; }
+  .prop .k { color: var(--sb-label); font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 600; }
+  .prop .v { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--lg-fill);
+    box-shadow: inset 0 0 0 0.5px var(--hairline);
+    font-size: 11px;
+  }
+  .chip .d { width: 6px; height: 6px; border-radius: 50%; }
+  .pg-body h3 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: -0.015em; line-height: 1.3; }
+  .pg-body p { margin: 0; font-size: 13.5px; line-height: 1.62; }
+  .pg-body p.mut { color: var(--color-muted); }
+  .kw { display: flex; flex-wrap: wrap; gap: 5px; }
+  .hr { border: 0; border-top: 0.5px solid var(--hairline); margin: 0; }
+  .srcs { display: flex; flex-direction: column; gap: 6px; }
+  .src-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 11px;
+    border-radius: 11px;
+    background: var(--lg-fill);
+    box-shadow: inset 0 0 0 0.5px var(--hairline);
+    font-size: 12.5px;
+    width: 100%;
+    text-align: left;
+    transition: box-shadow 160ms;
+  }
+  .src-row:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 45%, transparent); }
+  .src-row .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .src-row .go { color: var(--sb-icon); font-size: 13px; }
+
+  /* ═══ DOCK ═════════════════════════════════════════════════════════════ */
+  .dock-wrap {
+    position: absolute;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%);
+    z-index: 28;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+  .dock { display: flex; align-items: flex-end; gap: 10px; padding: 10px; border-radius: 20px; height: 56px; }
+  .tile {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transform-origin: bottom center;
+  }
+  .dock .tile { transition: transform 260ms var(--ease-out); }
+  .tile.plate { background: linear-gradient(to bottom, #fff, #d6d6d6); box-shadow: inset 0 0 0 0.5px rgba(255,255,255,0.9), 0 1px 2px rgba(16,24,40,0.16); }
+  .tile img { width: 30px; height: 30px; object-fit: contain; display: block; pointer-events: none; }
+  .tile.bleed img { width: 36px; height: 36px; filter: drop-shadow(0 1px 2px rgba(16,24,40,0.18)); }
+  .dock-sep { width: 1px; height: 34px; align-self: center; background: linear-gradient(180deg, transparent, var(--node-line), transparent); margin: 0 4px; }
+  .dot { position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%); width: 4px; height: 4px; border-radius: 50%; }
+  .dot.on { background: var(--color-ok); }
+  .dot.stale { background: var(--color-warn); }
+  .dot.dead { width: 5px; height: 5px; background: var(--color-err); }
+  .count {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: 999px;
+    background: var(--color-accent);
+    color: #fff;
+    font-size: 8.5px;
+    line-height: 14px;
+    text-align: center;
+    font-weight: 700;
+  }
+  .tip {
+    position: absolute;
+    bottom: 78px;
+    left: 0;
+    z-index: 29;
+    padding: 5px 10px;
+    border-radius: 9px;
+    font-size: 11.5px;
+    color: var(--sb-text);
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 180ms var(--ease-out), left 220ms var(--ease-out);
+  }
+  .tip[data-show="true"] { opacity: 1; }
+  .tip .st { color: var(--sb-label); }
+
+
+  /* ═══ CHATS IA LOCALE ══════════════════════════════════════════════════
+     Deux portées, comme dans l'app : AssistantPanel répond sur tout le cerveau
+     (brain.md), NodeChat sur une page et, au choix, ses sous-pages. Une seule
+     matière pour les deux — ce qui change, c'est le contexte, pas l'objet. */
+  .chat { display: flex; flex-direction: column; min-height: 0; }
+  .chat-head { display: flex; align-items: center; gap: 8px; padding: 9px 9px 8px 12px; flex-shrink: 0; border-bottom: 0.5px solid var(--hairline); }
+  .chat-head .bi { color: var(--color-accent); display: inline-flex; flex-shrink: 0; }
+  .chat-head .t { flex: 1; font-size: 12.5px; font-weight: 600; }
+  .kids-tog { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 999px; font-size: 10px; color: var(--sb-label); box-shadow: inset 0 0 0 0.5px var(--hairline); transition: color 160ms, background-color 160ms, box-shadow 160ms; }
+  .kids-tog .d { width: 5px; height: 5px; border-radius: 50%; background: var(--sb-icon); }
+  .kids-tog[aria-pressed="true"] { color: var(--color-accent); background: var(--color-accent-soft); box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--color-accent) 45%, transparent); }
+  .kids-tog[aria-pressed="true"] .d { background: var(--color-accent); }
+  .kids-tog[disabled] { opacity: 0.4; cursor: default; }
+  .chat-log { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 9px; }
+  .chat-log::-webkit-scrollbar { width: 7px; }
+  .chat-log::-webkit-scrollbar-thumb { background: var(--sb-track); border-radius: 6px; }
+  .chat-hint { font-size: 11.5px; line-height: 1.62; color: var(--sb-label); margin: 4px 2px 0; }
+  .chat-hint code { font-size: 10.5px; padding: 1px 5px; border-radius: 5px; background: var(--sb-field); }
+  .bub { max-width: 85%; padding: 7px 11px; border-radius: 13px; font-size: 12px; line-height: 1.55; white-space: pre-wrap; }
+  .bub.me { align-self: flex-end; background: var(--color-accent); color: #fff; }
+  .bub.ai { align-self: flex-start; background: var(--lg-fill); box-shadow: inset 0 0 0 0.5px var(--hairline); }
+  .chat-wait { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--sb-label); padding: 0 2px; }
+  .dots { display: inline-flex; gap: 3px; }
+  .dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--sb-icon); animation: blink 1.1s var(--ease-out) infinite; }
+  .dots i:nth-child(2) { animation-delay: 0.18s; }
+  .dots i:nth-child(3) { animation-delay: 0.36s; }
+  @keyframes blink { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+  .chat-in { flex-shrink: 0; border-top: 0.5px solid var(--hairline); padding: 9px; display: flex; align-items: flex-end; gap: 7px; }
+  .chat-in textarea { flex: 1; min-width: 0; resize: none; min-height: 32px; max-height: 96px; padding: 7px 10px; border-radius: 10px; border: 0; background: var(--sb-field); color: var(--sb-text); font: inherit; font-size: 12.5px; line-height: 1.4; outline: none; transition: box-shadow 200ms var(--ease-out); }
+  .chat-in textarea:focus { box-shadow: 0 0 0 2.5px var(--color-accent-soft); }
+  .chat-in textarea::placeholder { color: var(--sb-placeholder); }
+  .send { width: 32px; height: 32px; border-radius: 10px; background: var(--color-accent); color: #fff; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 15px; transition: background-color 160ms, transform 180ms var(--sb-ease); }
+  .send:hover { background: var(--color-accent-hover); }
+  .send:active { transform: scale(0.94); }
+
+  /* Chat du cerveau : il prend la colonne de travail, celle de la carte du
+     relevé — donc la carte s'efface pendant ce temps, une chose à la fois. */
+  .brain-chat { position: absolute; top: 12px; bottom: 12px; width: 340px; max-width: calc(100vw - 48px); z-index: 29; border-radius: 19px; overflow: hidden; animation: slideL 380ms var(--sb-ease); }
+  .brain-chat[hidden] { display: none; }
+  @keyframes slideL { from { transform: translateX(-18px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .stats[data-off="true"] { opacity: 0; pointer-events: none; }
+
+  /* Chat de page : colonne droite, comme NodeChat en plein écran. */
+  .pg-chat { display: none; }
+  .page[data-chat="true"][data-mode="full"] .pg-chat,
+  .page[data-chat="true"][data-narrow="true"] .pg-chat { display: flex; width: 340px; flex-shrink: 0; border-left: 0.5px solid var(--hairline); }
+
+  /* ═══ MODALES ══════════════════════════════════════════════════════════ */
+  .scrim {
+    position: absolute;
+    inset: 0;
+    z-index: 40;
+    background: var(--scrim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    animation: fade 200ms var(--ease-out);
+  }
+  .scrim[hidden] { display: none; }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  .sheet {
+    width: 860px;
+    max-width: 100%;
+    height: 564px;
+    max-height: calc(100vh - 48px);
+    border-radius: 24px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: sheetIn 340ms var(--spring);
+    color: var(--sb-text);
+  }
+  @keyframes sheetIn { from { transform: translateY(18px) scale(0.975); opacity: 0; } to { transform: none; opacity: 1; } }
+  .sh-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 0.5px solid var(--hairline); flex-shrink: 0; }
+  .sh-head .t { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+  .pill { font-size: 10px; padding: 3px 8px; border-radius: 999px; background: var(--sb-field); color: var(--sb-label); font-weight: 500; white-space: nowrap; }
+  .sh-search {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 232px;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 9px;
+    background: var(--sb-field);
+    transition: box-shadow 200ms var(--ease-out);
+  }
+  .sh-search:focus-within { box-shadow: 0 0 0 2.5px var(--color-accent-soft); }
+  .sh-search input { flex: 1; min-width: 0; background: none; border: 0; outline: none; font-size: 12.5px; color: var(--sb-text); }
+  .sh-search input::placeholder { color: var(--sb-placeholder); }
+  .sh-body { display: grid; grid-template-columns: 196px 1fr; min-height: 0; flex: 1; }
+  .sh-side {
+    padding: 12px 8px 16px;
+    border-right: 0.5px solid var(--hairline);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    overflow-y: auto;
+  }
+  .sh-main { padding: 18px 22px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; background: var(--content-bg); }
+  .pane-lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.09em; color: var(--sb-label); font-weight: 600; padding: 0 8px; }
+  .side-list { display: flex; flex-direction: column; gap: 1px; }
+  .side-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 5px 8px;
+    border-radius: 9px;
+    width: 100%;
+    text-align: left;
+    color: var(--sb-text);
+    transition: background-color 150ms var(--ease-out), color 150ms var(--ease-out);
+  }
+  .side-row:hover { background: var(--sb-hover); }
+  .side-row[aria-selected="true"] { background: var(--color-accent-soft); color: var(--color-accent-hover); }
+  .side-row .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 500; }
+  .side-row .n { font-size: 10px; color: var(--sb-label); font-variant-numeric: tabular-nums; }
+  .side-row .sd { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+  .side-add {
+    margin-top: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 7px 10px;
+    border-radius: 10px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--sb-label);
+    box-shadow: inset 0 0 0 0.5px var(--hairline);
+    transition: box-shadow 170ms, color 170ms;
+  }
+  .side-add:hover { color: var(--color-accent-hover); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 50%, transparent); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 20px 12px; }
+  .g-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 4px;
+    border-radius: 14px;
+    transition: background-color 180ms var(--ease-out), transform 220ms var(--sb-ease);
+  }
+  .g-item:hover { background: var(--sb-hover); transform: translateY(-2px); }
+  .g-item .lbl2 { font-size: 11.5px; font-weight: 500; text-align: center; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .g-item .sub2 { font-size: 9.5px; color: var(--sb-label); }
+  .g-item .sub2.soon { color: var(--color-warn); }
+  .g-item.soon { opacity: 0.5; cursor: not-allowed; }
+  .g-item.soon:hover { background: none; transform: none; }
+  .tile.big { width: 52px; height: 52px; border-radius: 13px; }
+  .tile.big img { width: 44px; height: 44px; }
+  .tile.big.bleed img { width: 52px; height: 52px; }
+  .tile.sm { width: 25px; height: 25px; border-radius: 7px; }
+  .tile.sm img { width: 21px; height: 21px; }
+  .tile.sm.bleed img { width: 25px; height: 25px; filter: none; }
+  .tile.md { width: 40px; height: 40px; border-radius: 11px; }
+  .tile.md img { width: 34px; height: 34px; }
+  .tile.md.bleed img { width: 40px; height: 40px; }
+  .tile .ok {
+    position: absolute;
+    right: -3px;
+    bottom: -3px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--color-accent);
+    color: #fff;
+    font-size: 9px;
+    line-height: 16px;
+    text-align: center;
+    font-weight: 700;
+  }
+
+  .detail { display: flex; flex-direction: column; gap: 18px; }
+  .d-top { display: flex; align-items: center; gap: 13px; }
+  .d-top .col { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+  .d-top .nm { font-size: 17px; font-weight: 600; letter-spacing: -0.015em; }
+  .d-state { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--sb-label); }
+  .d-state.bad { color: var(--color-err); }
+  .d-state .s { width: 6px; height: 6px; border-radius: 50%; }
+  .d-close { font-size: 11px; color: var(--sb-label); padding: 4px 9px; border-radius: 8px; }
+  .d-close:hover { color: var(--sb-text); background: var(--sb-hover); }
+  .cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .cell {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 11px 13px;
+    border-radius: 12px;
+    background: var(--lg-fill);
+    box-shadow: inset 0 0 0 0.5px var(--hairline);
+  }
+  .cell .k { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--sb-label); font-weight: 600; }
+  .cell .v { font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .warn-box {
+    display: flex;
+    gap: 9px;
+    padding: 11px 13px;
+    border-radius: 12px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-err) 42%, transparent);
+    color: var(--color-err);
+  }
+  .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn {
+    font-size: 12px;
+    padding: 7px 14px;
+    border-radius: 999px;
+    background: var(--lg-fill);
+    box-shadow: inset 0 0 0 0.5px var(--hairline);
+    font-weight: 500;
+    transition: box-shadow 170ms, transform 180ms var(--sb-ease), background-color 170ms;
+  }
+  .btn:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 50%, transparent); }
+  .btn:active { transform: scale(0.98); }
+  .btn.primary { background: var(--color-accent); color: #fff; box-shadow: 0 1px 3px color-mix(in srgb, var(--color-accent) 40%, transparent); }
+  .btn.primary:hover { background: var(--color-accent-hover); }
+  .btn.danger { color: var(--color-err); }
+
+  .grp { display: flex; flex-direction: column; gap: 9px; }
+  .grp > .lbl3 { font-size: 10px; text-transform: uppercase; letter-spacing: 0.09em; color: var(--sb-label); font-weight: 600; }
+  .card { display: flex; flex-direction: column; border-radius: 13px; background: var(--lg-fill); box-shadow: inset 0 0 0 0.5px var(--hairline); overflow: hidden; }
+  .line { display: flex; align-items: center; gap: 12px; padding: 11px 13px; border-bottom: 0.5px solid var(--hairline); font-size: 12.5px; min-height: 42px; }
+  .line:last-child { border-bottom: 0; }
+  .line .k { color: var(--sb-label); flex-shrink: 0; }
+  .line .col { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+  .line .col .t { font-weight: 500; }
+  .line .col .s { font-size: 10.5px; color: var(--sb-label); line-height: 1.4; }
+  .line .v { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 500; text-align: right; flex-shrink: 0; }
+  .line .v.mut { color: var(--sb-label); font-weight: 400; }
+  .tog { margin-left: auto; width: 36px; height: 21px; border-radius: 999px; background: var(--sb-track); box-shadow: inset 0 0 0 0.5px var(--hairline); flex-shrink: 0; position: relative; transition: background-color 220ms var(--ease-out); }
+  .tog i { position: absolute; top: 2px; left: 2px; width: 17px; height: 17px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(16,24,40,0.3); transition: transform 240ms var(--sb-ease); }
+  .tog[aria-pressed="true"] { background: var(--color-accent); }
+  .tog[aria-pressed="true"] i { transform: translateX(15px); }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill-ok { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 999px; background: var(--lg-fill); box-shadow: inset 0 0 0 0.5px var(--hairline); font-size: 10.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .pill-ok .s { width: 5px; height: 5px; border-radius: 50%; background: var(--color-ok); }
+  .url { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border-radius: 11px; background: var(--lg-fill); box-shadow: inset 0 0 0 0.5px var(--hairline); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  .url span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .note { font-size: 11px; line-height: 1.5; color: var(--sb-label); }
+  .note.warn { color: var(--color-warn); }
+  .sec-top { display: flex; align-items: center; gap: 10px; }
+  .sec-top .h { font-size: 17px; font-weight: 600; letter-spacing: -0.015em; flex: 1; }
+  .who { display: flex; align-items: center; gap: 12px; }
+  .who .av { width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(140deg, var(--color-accent), var(--color-accent-hover)); color: #fff; font-size: 17px; font-weight: 600; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .who .col { display: flex; flex-direction: column; gap: 2px; }
+  .who .em { font-size: 14px; font-weight: 500; }
+  .who .pl { font-size: 11px; color: var(--sb-label); }
+
+  /* ═══ PALETTE ⌘K ═══════════════════════════════════════════════════════ */
+  .pal-scrim { position: absolute; inset: 0; z-index: 45; background: var(--scrim); display: flex; align-items: flex-start; justify-content: center; padding: 14vh 24px 24px; animation: fade 160ms var(--ease-out); }
+  .pal-scrim[hidden] { display: none; }
+  .palette {
+    width: 560px;
+    max-width: 100%;
+    border-radius: 18px;
+    overflow: hidden;
+    animation: sheetIn 280ms var(--spring);
+    color: var(--sb-text);
+    display: flex;
+    flex-direction: column;
+    max-height: 60vh;
+  }
+  .pal-in { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 0.5px solid var(--hairline); flex-shrink: 0; }
+  .pal-in input { flex: 1; background: none; border: 0; outline: none; font-size: 15px; color: var(--sb-text); }
+  .pal-in input::placeholder { color: var(--sb-placeholder); }
+  .pal-in svg { color: var(--sb-label); }
+  .pal-list { overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 1px; }
+  .pal-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 10px; width: 100%; text-align: left; }
+  .pal-row[aria-selected="true"] { background: var(--color-accent-soft); }
+  .pal-row .sq { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+  .pal-row .nm { flex: 1; font-size: 13px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pal-row .kind { font-size: 10px; color: var(--sb-label); text-transform: uppercase; letter-spacing: 0.06em; }
+  .pal-empty { padding: 18px 12px; font-size: 12.5px; color: var(--sb-label); text-align: center; }
+  .pal-foot { padding: 9px 16px; border-top: 0.5px solid var(--hairline); font-size: 10.5px; color: var(--sb-label); display: flex; gap: 14px; flex-shrink: 0; }
+  .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; padding: 1px 5px; border-radius: 4px; background: var(--sb-field); }
+
+  /* ═══ RESPONSIVE + MOTION ══════════════════════════════════════════════ */
+  /* Sous 1240 px le panneau était purement masqué : la note devenait
+     inouvrable. La pleine page est la réponse — on force la tenue, et la
+     bascule disparaît puisqu'elle n'a plus rien à basculer. */
+  @media (max-width: 1240px) { #pgWide { display: none; } }
+  @media (max-width: 900px) {
+    .stats { display: none; }
+    .sheet { width: 100%; }
+    .sh-body { grid-template-columns: 1fr; }
+    .sh-side { border-right: 0; border-bottom: 0.5px solid var(--hairline); }
+    .grid { grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); }
+    /* 258 px de colonne sur une fenêtre étroite ne laissent plus de texte */
+    .page[data-mode] .pg-side, .page[data-narrow] .pg-side { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="app" id="app">
+  <div class="bg"></div>
+
+  <!-- ═══ CANVAS ═══ -->
+  <div id="stage">
+    <svg id="svg" viewBox="0 0 1200 760" preserveAspectRatio="xMidYMid meet" aria-label="Carte du cerveau">
+      <g id="world">
+        <g id="edges"></g>
+        <g id="nodes"></g>
+        <g id="zones" hidden></g>
+      </g>
+    </svg>
+  </div>
+
+  <!-- ═══ SIDEBAR ═══ -->
+  <button class="reopen lg" id="reopen" hidden aria-label="Ouvrir la barre latérale">
+    <svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden><path d="M9 5V15H4C3.44687 15 3 14.5531 3 14V6C3 5.44687 3.44687 5 4 5H9ZM9.5 4H4C2.89688 4 2 4.89688 2 6V14C2 15.1031 2.89688 16 4 16H16C17.1031 16 18 15.1031 18 14V6C18 4.89688 17.1031 4 16 4H9.5ZM10 5H16C16.5531 5 17 5.44687 17 6V14C17 14.5531 16.5531 15 16 15H10V5ZM4.5 7C4.5 7.275 4.725 7.5 5 7.5H7C7.275 7.5 7.5 7.275 7.5 7C7.5 6.725 7.275 6.5 7 6.5H5C4.725 6.5 4.5 6.725 4.5 7ZM4.5 9C4.5 9.275 4.725 9.5 5 9.5H7C7.275 9.5 7.5 9.275 7.5 9C7.5 8.725 7.275 8.5 7 8.5H5C4.725 8.5 4.5 8.725 4.5 9ZM4.5 11C4.5 11.275 4.725 11.5 5 11.5H7C7.275 11.5 7.5 11.275 7.5 11C7.5 10.725 7.275 10.5 7 10.5H5C4.725 10.5 4.5 10.725 4.5 11Z" fill="currentColor"/></svg>
+  </button>
+
+  <div class="sb-shell" id="sbShell" data-open="true">
+    <div class="sidebar lg">
+      <div class="sb-top">
+        <div class="sb-row">
+          <div class="sb-count"><b id="docCount">438</b><em>documents</em></div>
+          <div style="display:flex;gap:2px">
+            <button class="icon-btn accent" id="chatBtn" title="Lucid IA" aria-label="Lucid IA">
+              <svg viewBox="0 0 20 20" width="17" height="17" fill="none" aria-hidden><path d="M6.50781 12.8289C6.34609 13.2273 6.16797 13.6609 5.97812 14.132C6.93906 13.8016 7.48281 13.6141 7.61406 13.5695L8.00781 13.7336C8.61484 13.9844 9.2875 14.1273 10.0023 14.1273C12.7633 14.1273 14.8773 12.0461 14.8773 9.62734C14.8773 7.20859 12.7609 5.125 10 5.125C7.23906 5.125 5.125 7.20625 5.125 9.625C5.125 10.6258 5.47891 11.5563 6.09062 12.3109L6.50781 12.8266V12.8289ZM5.41328 15.5148L4 16C4.36094 15.1141 4.76641 14.1203 5.21406 13.0187C4.45234 12.0766 4 10.9 4 9.625C4 6.51953 6.68594 4 10 4C13.3141 4 16 6.51953 16 9.625C16 12.7305 13.3141 15.25 10 15.25C9.1375 15.25 8.31484 15.0789 7.57422 14.7719L5.41328 15.5148Z" fill="currentColor"/></svg>
+            </button>
+            <button class="icon-btn" id="collapse" title="Replier la barre latérale" aria-label="Replier la barre latérale">
+              <svg viewBox="0 0 20 20" width="17" height="17" fill="none" aria-hidden><path d="M9 5V15H4C3.44687 15 3 14.5531 3 14V6C3 5.44687 3.44687 5 4 5H9ZM9.5 4H4C2.89688 4 2 4.89688 2 6V14C2 15.1031 2.89688 16 4 16H16C17.1031 16 18 15.1031 18 14V6C18 4.89688 17.1031 4 16 4H9.5ZM10 5H16C16.5531 5 17 5.44687 17 6V14C17 14.5531 16.5531 15 16 15H10V5ZM4.5 7C4.5 7.275 4.725 7.5 5 7.5H7C7.275 7.5 7.5 7.275 7.5 7C7.5 6.725 7.275 6.5 7 6.5H5C4.725 6.5 4.5 6.725 4.5 7ZM4.5 9C4.5 9.275 4.725 9.5 5 9.5H7C7.275 9.5 7.5 9.275 7.5 9C7.5 8.725 7.275 8.5 7 8.5H5C4.725 8.5 4.5 8.725 4.5 9ZM4.5 11C4.5 11.275 4.725 11.5 5 11.5H7C7.275 11.5 7.5 11.275 7.5 11C7.5 10.725 7.275 10.5 7 10.5H5C4.725 10.5 4.5 10.725 4.5 11Z" fill="currentColor"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="seg" role="group" aria-label="Vue">
+          <button data-view="mind" aria-pressed="true">Mind</button>
+          <button data-view="zones" aria-pressed="false">Zones</button>
+        </div>
+        <label class="field">
+          <input type="text" id="sbQuery" placeholder="Rechercher…" aria-label="Rechercher un document" />
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden><path d="M14.0001 14.0001L11.1068 11.1068M12.6667 7.33333C12.6667 10.2789 10.2789 12.6667 7.33333 12.6667C4.38781 12.6667 2 10.2789 2 7.33333C2 4.38781 4.38781 2 7.33333 2C10.2789 2 12.6667 4.38781 12.6667 7.33333Z" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </label>
+      </div>
+
+      <div class="sb-body">
+        <div class="sec" id="secStruct" data-open="true">
+          <button class="ttl" data-fold="foldStruct">Structure</button>
+          <button class="icon-btn chev" data-fold="foldStruct" aria-label="Replier Structure">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden><path d="M7.435 10.965C7.7475 11.2775 8.255 11.2775 8.5675 10.965L12.5675 6.965C12.88 6.6525 12.88 6.145 12.5675 5.8325C12.255 5.52 11.7475 5.52 11.435 5.8325L8 9.2675L4.565 5.835C4.2525 5.5225 3.745 5.5225 3.4325 5.835C3.12 6.1475 3.12 6.655 3.4325 6.9675L7.4325 10.9675L7.435 10.965Z" fill="currentColor"/></svg>
+          </button>
+        </div>
+        <div class="fold" id="foldStruct" data-open="true"><ul class="tree" id="tree"></ul></div>
+
+        <div class="sec" id="secSpaces" data-open="true">
+          <button class="ttl" data-fold="foldSpaces">Spaces</button>
+          <button class="icon-btn chev" data-fold="foldSpaces" aria-label="Replier Spaces">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden><path d="M7.435 10.965C7.7475 11.2775 8.255 11.2775 8.5675 10.965L12.5675 6.965C12.88 6.6525 12.88 6.145 12.5675 5.8325C12.255 5.52 11.7475 5.52 11.435 5.8325L8 9.2675L4.565 5.835C4.2525 5.5225 3.745 5.5225 3.4325 5.835C3.12 6.1475 3.12 6.655 3.4325 6.9675L7.4325 10.9675L7.435 10.965Z" fill="currentColor"/></svg>
+          </button>
+          <button class="icon-btn plus" title="Nouveau space" aria-label="Nouveau space">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden><path d="M8.8 3.2C8.8 2.7575 8.4425 2.4 8 2.4C7.5575 2.4 7.2 2.7575 7.2 3.2V7.2H3.2C2.7575 7.2 2.4 7.5575 2.4 8C2.4 8.4425 2.7575 8.8 3.2 8.8H7.2V12.8C7.2 13.2425 7.5575 13.6 8 13.6C8.4425 13.6 8.8 13.2425 8.8 12.8V8.8H12.8C13.2425 8.8 13.6 8.4425 13.6 8C13.6 7.5575 13.2425 7.2 12.8 7.2H8.8V3.2Z" fill="currentColor"/></svg>
+          </button>
+        </div>
+        <div class="fold" id="foldSpaces" data-open="true"><div id="spaces"></div></div>
+      </div>
+
+      <button class="sb-foot" id="openSet" title="Réglages (⌘,)">
+        <span class="avatar">L</span><span>compte@example.fr</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- ═══ RELEVÉ ═══ -->
+  <div class="stats lg" id="stats">
+    <span class="st-head" id="stHead">64 échanges sur 14 jours</span>
+    <div class="st-hero"><span class="n">1,2 M</span><span class="u">tokens évités</span></div>
+    <div class="bars" id="bars"></div>
+    <span class="st-foot" id="stFoot">78 % de moins · 61 rangés sans toi</span>
+  </div>
+
+  <!-- ═══ CHAT DU CERVEAU ═══ -->
+  <div class="brain-chat chat lg" id="brainChat" hidden role="dialog" aria-label="Lucid IA"></div>
+
+  <!-- ═══ CLUSTER ═══ -->
+  <div class="cluster lg">
+    <button class="badge" id="ncBtn" title="Notifications" aria-label="Notifications" aria-expanded="false" data-n="6">✦<span class="cnt" id="ncCount">6</span></button>
+    <button id="setBtn" title="Réglages (⌘,)" aria-label="Réglages">⚙</button>
+    <button id="themeBtn" title="Thème" aria-label="Changer de thème">◐</button>
+  </div>
+
+  <div class="nc" id="nc" hidden role="dialog" aria-label="Notifications">
+    <div class="nc-head">
+      <span class="t">Notifications</span>
+      <button class="lnk" id="ncClear">Effacer l'historique</button>
+    </div>
+    <div class="nc-list" id="ncList"></div>
+    <div class="nc-foot">
+      <span class="d"></span>
+      <span id="ncFoot">Tout est à jour · dernière vérification il y a 6 min</span>
+    </div>
+  </div>
+
+  <!-- ═══ ZOOM ═══ -->
+  <div class="zoom lg">
+    <button id="zOut" title="Dézoomer" aria-label="Dézoomer">−</button>
+    <span class="lv" id="zLvl">100 %</span>
+    <button id="zIn" title="Zoomer" aria-label="Zoomer">+</button>
+    <button id="zFit" title="Tout voir" aria-label="Tout voir">⤢</button>
+  </div>
+
+  <!-- ═══ PANNEAU DE PAGE ═══ -->
+  <div class="page surface" id="page" hidden>
+    <div class="pg-head">
+      <span class="sq" id="pgSq"></span>
+      <span class="nm" id="pgName">—</span>
+      <div class="pg-tools">
+        <button class="icon-btn" title="Propriétés" aria-label="Propriétés">◇</button>
+        <button class="icon-btn" title="Historique" aria-label="Historique">◷</button>
+        <button class="icon-btn" title="Exporter" aria-label="Exporter">↓</button>
+        <button class="icon-btn" id="pgChatBtn" title="Lucid IA sur cette page" aria-label="Lucid IA" aria-pressed="false">✦</button>
+        <button class="icon-btn" id="pgWide" title="Pleine page" aria-label="Pleine page" aria-pressed="false">⤢</button>
+        <button class="icon-btn" id="pgClose" title="Fermer (Échap)" aria-label="Fermer">✕</button>
+      </div>
+    </div>
+    <div class="pg-main">
+      <aside class="pg-side">
+        <div class="sec"><span class="ttl">Arborescence</span></div>
+        <ul class="tree" id="pgTree"></ul>
+      </aside>
+      <div class="pg-body" id="pgBody"></div>
+      <aside class="pg-chat chat" id="pgChat"></aside>
+    </div>
+  </div>
+
+  <!-- ═══ DOCK ═══ -->
+  <div class="dock-wrap">
+    <div class="tip lg" id="tip"><span class="nm"></span> <span class="st"></span></div>
+    <div class="dock lg" id="dock"></div>
+  </div>
+
+  <!-- ═══ LAUNCHPAD ═══ -->
+  <div class="scrim" id="scrimLp" hidden>
+    <div class="sheet lg" role="dialog" aria-modal="true" aria-label="Connecteurs">
+      <div class="sh-head">
+        <span class="t">Connecteurs</span>
+        <span class="pill" id="lpCount">5 connectés</span>
+        <label class="sh-search">
+          <input type="text" id="lpQuery" placeholder="Chercher une source…" aria-label="Chercher une source" />
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden><path d="M14.0001 14.0001L11.1068 11.1068M12.6667 7.33333C12.6667 10.2789 10.2789 12.6667 7.33333 12.6667C4.38781 12.6667 2 10.2789 2 7.33333C2 4.38781 4.38781 2 7.33333 2C10.2789 2 12.6667 4.38781 12.6667 7.33333Z" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </label>
+      </div>
+      <div class="sh-body">
+        <div class="sh-side">
+          <span class="pane-lbl">Ajoutés</span>
+          <div class="side-list" id="lpSide"></div>
+          <button class="side-add" id="lpAdd">+ Ajouter une source</button>
+        </div>
+        <div class="sh-main" id="lpMain"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ RÉGLAGES ═══ -->
+  <div class="scrim" id="scrimSet" hidden>
+    <div class="sheet lg" role="dialog" aria-modal="true" aria-label="Réglages">
+      <div class="sh-head">
+        <span class="t">Réglages</span>
+        <span class="pill">compte@example.fr</span>
+      </div>
+      <div class="sh-body">
+        <div class="sh-side">
+          <span class="pane-lbl">Sections</span>
+          <div class="side-list" id="setNav"></div>
+        </div>
+        <div class="sh-main" id="setMain"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ PALETTE ═══ -->
+  <div class="pal-scrim" id="palScrim" hidden>
+    <div class="palette lg" role="dialog" aria-modal="true" aria-label="Recherche">
+      <div class="pal-in">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden><path d="M14.0001 14.0001L11.1068 11.1068M12.6667 7.33333C12.6667 10.2789 10.2789 12.6667 7.33333 12.6667C4.38781 12.6667 2 10.2789 2 7.33333C2 4.38781 4.38781 2 7.33333 2C10.2789 2 12.6667 4.38781 12.6667 7.33333Z" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <input type="text" id="palQuery" placeholder="Aller à une page, un dossier, un space…" aria-label="Rechercher" />
+      </div>
+      <div class="pal-list" id="palList"></div>
+      <div class="pal-foot">
+        <span><span class="kbd">↑↓</span> naviguer</span>
+        <span><span class="kbd">↵</span> ouvrir</span>
+        <span><span class="kbd">esc</span> fermer</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  "use strict";
+  const $ = (s) => document.querySelector(s);
+  const NS = "http://www.w3.org/2000/svg";
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     DONNÉES — un cerveau plausible : racine, dossiers, pages, et un pont
+     inter-sources (le même concept vu dans deux sources différentes).
+     ═══════════════════════════════════════════════════════════════════════ */
+  const SOURCES = {
+    drive:    { name: "Google Drive", color: "#3b82f6", icon: "drive" },
+    obsidian: { name: "Obsidian",     color: "#8b5cf6", icon: "obsidian" },
+    claude:   { name: "Claude",       color: "#d97757", icon: "claude" },
+    notes:    { name: "Notes Apple",  color: "#eab308", icon: "notes" },
+    folder:   { name: "Dossier local", color: "#64748b", icon: "folder" },
+  };
+
+  const NODES = [
+    { id: "root", label: "Lucid", kind: "root", x: 600, y: 372, r: 38, docs: 438 },
+
+    { id: "c-lf",  label: "LucidFlow",  kind: "container", parent: "root", x: 322, y: 214, r: 27, docs: 96 },
+    { id: "c-imo", label: "Immobilier", kind: "container", parent: "root", x: 892, y: 226, r: 27, docs: 128 },
+    { id: "c-jrn", label: "Journal",    kind: "container", parent: "root", x: 300, y: 566, r: 25, docs: 62 },
+    { id: "c-adr", label: "ADR",        kind: "container", parent: "root", x: 636, y: 132, r: 23, docs: 25 },
+    { id: "c-drv", label: "Devis",      kind: "container", parent: "root", x: 906, y: 552, r: 24, docs: 74 },
+
+    { id: "n1", label: "Stack technique",   parent: "c-lf",  x: 168, y: 132, r: 16, src: "obsidian" },
+    { id: "n2", label: "Roadmap",           parent: "c-lf",  x: 152, y: 268, r: 15, src: "obsidian" },
+    { id: "n3", label: "Pricing",           parent: "c-lf",  x: 262, y: 92,  r: 14, src: "notes" },
+    { id: "n4", label: "Parité Windows",    parent: "c-lf",  x: 218, y: 330, r: 14, src: "obsidian" },
+
+    { id: "n5", label: "Mandats en cours",  parent: "c-imo", x: 1056, y: 156, r: 17, src: "drive", fresh: true },
+    { id: "n6", label: "Estimation type",   parent: "c-imo", x: 1072, y: 300, r: 15, src: "drive" },
+    { id: "n7", label: "Diagnostics",       parent: "c-imo", x: 962,  y: 108, r: 14, src: "drive" },
+    { id: "n8", label: "Baux commerciaux",  parent: "c-imo", x: 998,  y: 372, r: 14, src: "folder" },
+
+    { id: "n9",  label: "2026-09-05",       parent: "c-jrn", x: 148, y: 640, r: 14, src: "obsidian", fresh: true },
+    { id: "n10", label: "2026-09-03",       parent: "c-jrn", x: 166, y: 500, r: 13, src: "obsidian" },
+    { id: "n11", label: "Sessions Claude",  parent: "c-jrn", x: 322, y: 690, r: 15, src: "claude", fresh: true },
+
+    { id: "n12", label: "ADR-0025 relevé",  parent: "c-adr", x: 548, y: 52,  r: 14, src: "obsidian" },
+    { id: "n13", label: "ADR-0015 parité",  parent: "c-adr", x: 700, y: 44,  r: 13, src: "obsidian" },
+
+    { id: "n14", label: "Devis 2026-04",    parent: "c-drv", x: 1080, y: 622, r: 14, src: "drive" },
+    { id: "n15", label: "Devis 2026-07",    parent: "c-drv", x: 1006, y: 704, r: 14, src: "drive" },
+    { id: "n16", label: "Grille tarifaire", parent: "c-drv", x: 872,  y: 672, r: 15, src: "notes" },
+  ];
+
+  // Le pont : « Pricing » (Notes) et « Grille tarifaire » (Notes) parlent du
+  // même sujet dans deux dossiers différents. C'est ce que le graphe apporte.
+  const BRIDGES = [["n6", "n14"]];  // estimation ↔ devis : même bien, deux dossiers
+
+  const PAGES = {
+    root: { title: "Lucid", body: "438 documents, 6 sources, 5 dossiers. Le cerveau agrège ce qui existe déjà sur ta machine — il ne le déplace pas.", kws: ["cerveau", "agrégation", "local-first"] },
+    "c-imo": { title: "Immobilier", body: "Dossier construit par l'archiviste : les documents qui citent un bien, un mandat ou un diagnostic s'y ancrent. Un document qui ne cite pas l'entité du dossier est refusé.", kws: ["mandats", "estimation", "diagnostics"] },
+    n5: { title: "Mandats en cours", body: "Synthèse des mandats actifs, reconstruite à chaque synchro Drive. Les montants et les noms restent dans le document d'origine — le cerveau n'en garde que la structure et les mots-clés.", kws: ["mandat", "exclusivité", "échéance"] },
+    n3: { title: "Pricing", body: "Trois paliers, un essai gratuit, et le principe : on ne facture pas ce qui tourne sur la machine de l'utilisateur.", kws: ["tarifs", "essai", "conversion"] },
+    n6: { title: "Estimation type", body: "Le modèle d'estimation. Relié au devis 2026-04 par un pont : même bien, deux dossiers, deux sources — c'est ce que le graphe apporte qu'une arborescence ne peut pas dire.", kws: ["estimation", "devis", "pont"] },
+    n12: { title: "ADR-0025 — Point de comptage unique", body: "Un seul point de comptage, là où le poids de la page et le poids servi coexistent. Deux endroits qui comptent, ce sont deux chiffres qui divergent.", kws: ["relevé", "MCP", "agrégation"] },
+  };
+
+  const TREE = [
+    { id: "c-lf",  label: "LucidFlow", depth: 0, exp: true },
+    { id: "n1",  label: "Stack technique", depth: 1, src: "obsidian" },
+    { id: "n2",  label: "Roadmap", depth: 1, src: "obsidian" },
+    { id: "n3",  label: "Pricing", depth: 1, src: "notes" },
+    { id: "c-adr", label: "ADR", depth: 0, exp: true },
+    { id: "n12", label: "ADR-0025 relevé", depth: 1, src: "obsidian" },
+    { id: "n13", label: "ADR-0015 parité", depth: 1, src: "obsidian" },
+    { id: "c-imo", label: "Immobilier", depth: 0, exp: true },
+    { id: "n5",  label: "Mandats en cours", depth: 1, src: "drive" },
+    { id: "n6",  label: "Estimation type", depth: 1, src: "drive" },
+    { id: "n7",  label: "Diagnostics", depth: 1, src: "drive" },
+    { id: "c-drv", label: "Devis", depth: 0, exp: false },
+    { id: "c-jrn", label: "Journal", depth: 0, exp: false },
+  ];
+
+  const SPACES = ["Lucid", "LucidFlow", "Immobilier"];
+  const BARS = [0, 2, 1, 0, 5, 8, 3, 0, 6, 11, 7, 4, 9, 8];
+
+  const INBOX = [
+    { id: "n5",  t: "Mandats en cours", s: "Google Drive · il y a 6 min", src: "drive" },
+    { id: "n11", t: "Sessions Claude", s: "Claude · il y a 2 h", src: "claude" },
+    { id: "n9",  t: "2026-09-05", s: "Obsidian · hier", src: "obsidian" },
+  ];
+
+  const ICONS = {
+    drive: { src: "data:image/svg+xml;base64,PHN2ZyBwcmVzZXJ2ZUFzcGVjdFJhdGlvPSJub25lIiBvdmVyZmxvdz0idmlzaWJsZSIgc3R5bGU9ImRpc3BsYXk6IGJsb2NrOyIgd2lkdGg9IjM0LjY2IiBoZWlnaHQ9IjMwLjAxNjQiIHZpZXdCb3g9IjAgMCAzNC42NiAzMC4wMTY0IiBmaWxsPSJub25lIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPgo8ZyBpZD0iR3JvdXAiPgo8cGF0aCBpZD0iVmVjdG9yIiBkPSJNMzQuNjYgMzAuMDE2NEgyMC4zMDI1TDE3LjMzMTQgMjQuODcwNUwyNC41MTAyIDEyLjQzNjRMMzQuNjYgMzAuMDE2NFoiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8wXzgpIi8+CjxwYXRoIGlkPSJWZWN0b3JfMiIgZD0iTTAgMzAuMDE0MkwxMC4xNDk4IDEyLjQzNDJWMTIuNDM0NUw3LjE3OTg0IDE3LjU3OTJIMTMuMTIwNUwyMC4yOTk4IDMwLjAxMzlMMC4wMDAxNTYxNjQgMzAuMDE0MUwwIDMwLjAxNDJaIiBmaWxsPSJ1cmwoI3BhaW50MV9saW5lYXJfMF84KSIvPgo8cGF0aCBpZD0iVmVjdG9yXzMiIGQ9Ik0xNy4zMzIyIDBMMjQuNTExNCAxMi40MzUyTDIxLjU0MDkgMTcuNTgwMkg3LjE4MjM0TDE3LjMzMjIgMFoiIGZpbGw9InVybCgjcGFpbnQyX2xpbmVhcl8wXzgpIi8+CjwvZz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8wXzgiIHgxPSIzMi41ODExIiB5MT0iMjkuMDEzMyIgeDI9IjE4LjQzODkiIHkyPSIyMC41MTQ4IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+CjxzdG9wIG9mZnNldD0iMC4wOSIgc3RvcC1jb2xvcj0iI0ZGRTkyMSIvPgo8c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNGRUM3MDAiLz4KPC9saW5lYXJHcmFkaWVudD4KPGxpbmVhckdyYWRpZW50IGlkPSJwYWludDFfbGluZWFyXzBfOCIgeDE9IjIwLjIwNjEiIHkxPSIzMS41MTQ4IiB4Mj0iNC43NTc2NiIgeTI9IjIyLjE2OTUiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj4KPHN0b3Agb2Zmc2V0PSIwLjE1IiBzdG9wLWNvbG9yPSIjQTlBOEZGIi8+CjxzdG9wIG9mZnNldD0iMC4zMyIgc3RvcC1jb2xvcj0iIzZEOTdGRiIvPgo8c3RvcCBvZmZzZXQ9IjAuNDgiIHN0b3AtY29sb3I9IiMzMTg2RkYiLz4KPC9saW5lYXJHcmFkaWVudD4KPGxpbmVhckdyYWRpZW50IGlkPSJwYWludDJfbGluZWFyXzBfOCIgeDE9IjIyLjQ2ODYiIHkxPSI5LjA1NzAzIiB4Mj0iNi44MTU0NyIgeTI9IjE2LjM2MzMiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj4KPHN0b3Agb2Zmc2V0PSIwLjU1IiBzdG9wLWNvbG9yPSIjMEVCQzVGIi8+CjxzdG9wIG9mZnNldD0iMC44NSIgc3RvcC1jb2xvcj0iIzc4QzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=", plate: true },
+    obsidian: { src: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEgAAABICAYAAABV7bNHAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAASKADAAQAAAABAAAASAAAAACQMUbvAAAU10lEQVR4AdVcC5AdxXXt+b73drX6CyEERtgSRmACBmIbSkVkE4cEQgkFi6KcsjFWCkwlEH+oEBJXaglVlgkuMMKpmE+kwoljG1lWcDCWIOZjodgmIIP52QIkIQlWq9+u9r/vM5Nzbs+dN/u0q919+xaR1vbc7p7u233P3Hv7M/PkmPdQiE3s/PC2nj8oVqLlSBdcz/nRtsqeJ1pbzygeq2E6x6rj2n7/vXXPiWGu5V7P9S5xXd/EcWyiKDKVSvmZ2CmuvOrv5myrbfNu5N13o5PR+vj+7QcW55umbsznC5dEpmxKlX5TrgyYSlw0+Vx+yUCPt+GmC944bjQ+k3H/mAP00B1d5+f83KYwDM4olnuN48TGwagkQr8Hy32mqdB0+tQ5U+5tXfqkPxkgHI3nMQVo/R2HLs0H7iO+751EjXEACIFxE6ogxV6/KRSaLo+aTv3q0YSZjHvHDKAf3dlxdZjLrXM8Z2YZpuQAFThloUwLWAQKES7JGH/ABH7uq7cue2f5ZAAxEs9jAtDDq7u+EubCNY4bFaKoVNWYrOYQMAJFjUJ0vBiJ2PM8/97WZW2njyRQo8vfVYBaW2P34Xs6b8+F4TeMiVzMURA8MSuCQDASrRHzYhlViAH4xHDgvhfOCQLvwa+veHOavTG513cNoLWtO/Lnzem9v6nQ/DecnYwTAQyaUmJWQi1IQ4ACgHHsmKgM8GCCFTNgckH+vNhpWo07CXqTB9K7AtB3V701Y+7c2T8oFPKfL2FWMjpTQXiaj5hQoi0WsAQoiM975SJ0pxzbuigrR30mCAqfXXVV2xcnDxrLedKfwPrVB09szue/F4bhksFBgoOOYS4MCZGEpGlGSRSTQoYWdmBPxbzzRsl4dNbJiF3Ypuu6A5U4/tObvzv7Z8JwEi6TqkGP/HP34ilNuY25XLCkWOpL/U3W71S1B7JD+NQpU6PgkAhc96EKzCu5j0p03gYeDDTve2btqs+1LZgEbITlpAH00293nR8WXCwAwzOKJaxxOCPRz2hkXsswimGBAij93TFiZDwuARC1HjGKTAlTf3hSLvbW3rlid2EyQJoUgDbee/jSIOfLArBUBjh8+gkIFFCFzM5UAlb2HpUEsaOtArkJjs0rH21bjvpNGBaWOi252ycDIAyhseGnD3RcnQvz/wKuhQrWOGkHaSLpT5xO4odqfQ8Mi9V7OiOz/QUsIplBzFJAJmXkRq303ADOu7jyS/963BqWNSqw64aFTfd3firI579v4ooXxXzyVaGO6EQBytIMUARj50tFc3h/1f8QIZbLoHmRhO2DThtAdWNV/skv3nf8r47or86ChpnYw7fvb4GPWOW5BmteLABpLtmtA+yFztWujq0/EbNS86PgjGyH2ar3cGS66JyRtuZX9T9qsqm5oV3sEEi3JXD9B7/51+1z68TjiGYNA6hptndWEPoLxawAhHXAEJYCQwBG9RvZvCwWWV/AtCDx/oE9WBlCoyyo1bbCg/zIF1FAEueNxSQWoEGQ/6Bfcu9vXfFKeIS0dRQ0DCA39BeFYQ6jTgadUAUl+9S1LBWQ4AmA0BJoTB9mrZ5DmLl8Aj2UnwCT0UzRSGnLeo4pwWnng+bLjps757o68DiiScMA8lxnoQf7GvJksyApCKkwCooFQIDAPZolZy4uGGXtk+GRmifroZyalgVQ++b0D828bvUNMZ7YxALXpo0JrlnE/ZUMmBw5+MSjInlEEN/MC5FIArWsjG1aF7RHfI/wIAhMyJ9omuWNRgnjhKR5bmoxjgVNfufxqPWW8q+HNgQg7tIxgZzCmUswwYVUhVJB0gECE97mVtPBRTCK7EliX1fFlAZj2VZkeUk60XflTX7yECRheTJJ5tjg+sVyOS/5CVwaAtCyszqndpf8+Thmh+pnwCEKCCKQTco1VRpVHqkH/wMN6umAFiKvfBQM0mo66UOYZ4BJ+mC9CCyCHPV5YqEhAPVXvOMh0CwxsUSQVBgdH8olUHuQJjbY1FvtYSYRhQ5algfKB+UpLyTSNJkldZiUkPRBvnhOnhdH7xEf5LsnB04QyhTPQaYDH/qkRQiCwSAUF9YnQSyXDMwLwiVrI4IhMdHKFBztg3yYrpI04zp4eeQ7Tbag/mtDNAja84HAD0xUxNZCBg9g+OQ5LlwSGWSU6REXAWJGMJKLqeDMJ0rOfaQ924JhNZ3wU57SGesI6yEX3+PWozR9SGEdmYYABDs5VXyGPuksODWDZ5Y+SKhckI+oaRYc4sbpmkKrHxKQkzI24U0BBZkh4MhNdmDg5D2APTiH1ScSGgOQYxbRQWef9JECcPQUPyFMJllZXKJBDM/KdowKTpYnb2h+iGayjTBOLshgXWYqrjs/W1xPGs9lYiF+Lg6wTlnAA3iMyT59Pm1EK6Tdf9lFHJ+8zYugrEPhGJEWoYWH1RCtI9sWVMz6JmnH9vBXonFIV+uDl/CL3z8x6fC2aaIMNj1/YPb04wvz3TCypsOB8klDUBV4SB+p5hAVKhHWP4nmcGsxRHOUl1DytTHly37IXC5DekGGGu0uqi0dbx5dTyz8x507P/Lo2rZph/b1myDvpuCkT5NCUUAVUtOgVgsgJMswDB/byyF7NgKQqa9pAZEaldyz2mk1SdN2NR0tWtvaMSFHjS4mFnCQft2u3/aZH67eaV5/4bDBMasVEhKrGdBErFBWCBVUNYKUwQ+xeIFO2/IqOORjwWCZLc+CI/VrgIyhlp7rzy340WmWe33XCQF0ze/94hzH9f7Q9cvYgZfNIw/sNv/72H4T5rBpTXbcBIYCUgh98gIQQaFQco8XYwIAhNWv1cJEYGkr9SwfBYY80nvJcYf0xf4QOSvmMBCY+8frg8a2QjcTCJF3vefkAvoRAkIpn3iozWx+eC/MDQPVBV8irAJj1zYUQgGyY/ACx+SbWBl/WQBQUdqSH+5ZM0KZApPUlzpsLnVwPoSJAyguf+ihGC3rC2BXX1i5eMvJjuOuqMQDYGA9L58ahdz8n/vMlh+3mxyETQfNgWukQJkoDggFFLww1Q4p1Q6UD2knPDLgMl/7IJI83/v7nn9uvKPzwvqkFCWvr2nF9VZCe6bFPHvmPiGJBAmLavP0+r3mxc0HoRE4K07VPgGGQglAvCRpwgw2U6ZnQK0BR01I2oKHmhvBlMiyJE1Q8bGD8f2Ah5Zfqk9KsKin4afP3DwDQl9TMXzHrvN2lToYGJ/qxgffNnt39cInqRZknrwCA6og4Ys70zzNFYCJYFZzrF9B1QwwNs16iDC3LCUqBJDfHUGLLll3R8fSemStC6Cc41/le/kTOZVa86CQ1CIrLCn9z0Bf2Ty6dg8Kq+/VRYgEHAsMBOPIceFKOiw4pjDFDks0hbwIANugWKOUsZxltSaWlrERtAj7DqRufbI1Hve6z46EAxxjuGHh6znIe30c49QOnQ+NPMshUFabOG3vfKXbbH3ygMk3c9T4k8gLOmRkUMok0i2zYJZMo8kR4OCGgCz3kjooE9NiGdPsSuohDWjKlUF+EXJhR3PnZ9jdeAJYjS/0Nu+/xPPCMyMnMS8FBAOyUiWg0cwQPYC05b/aTV9vOV3jsJ5WlwSbsgyRO/qps7hMqJap1lihE60hCAQkoakWZbSJYClQyYx22/q7eueNR+JxAdRqWiFyfAMHphKqYMNR1uHC70DbgHl5yyHMahh90lSBkYLMJYLPz8PE8lPQmJVUSNLEpFItITjomOXic5hO8imoUgfAQ+NzQdN8nMl8PdPdqMlxAbT77IvP97zgQr5/UkBkscdBJBpjKfpNBsZ6OJoxW586gG+e7XHqEHDUt+tQEyGnzea30gQgiRlwRPikHjVHtIiak6SZt6ZJwDg25EGL+Lw48MLPbLij80rtbjSKpuMITnSD5wTiIIb6HppVRpisb0IPmGlN245+074LHz5xlY3RhjnPFJp90zTVN4UWD9rlGD/HdRRe+cD5T5vjmOlzPEz7AeoFwkOFtVpigaHgFrCkf/SX1mOawCZjo2/EP05v39xwV8eCsUiOpmMLf3HO04uNyT2Pp4/PTKqawM5HCnI4Dy0gLQ5E5k+uPsksveIE0767x7S/fdi8s+uwad/TZQ7t6zXdhwfMQH8ZPgi8wdAPfXy1EZrpM5rN3BNmmHnzZ5npM6finm9KRdghRM0Ckx0D+0sjZkbOjvLlPppxKRF6eTNQHNjU3dtx+TWtp3ClO2IY87QXxf4XQj9XKMf9mSeCJ6SsJZHm7AiZxWAZqTm//nm7eWHrq+b1l/abvp6iqZQwWtRJ/QbTCT9pBikpGAM+wjJz588wH/rwAvPBD72P+yxTHLTLDLZPA6tTg0EJhq70sodxRXySkw8LF8MKVqDGv6Vth0mMCaBrz31uHn4i8Oms75Ex4WJpVTDtA0OUQVI+BxfW6zpYNL0HurCxLcJ54ysHvIkda4jw3uzttw6aPTsOmOf+53VzwScWm9PPWiAvGqPEt1kowRFHuAz0h1B2GZyASD+JIh6FO3RYxhl1pz+mEWLF/LnAy83mFxSpWsO2dYpN/YDYPAdmnaJQKSOQHBVmp0JO1iYUYLTANvgOEUB62DLQ5AJp39XRbx5d97x55Ae/xME8vnot8NOXqk/iuKxmghArdq2dMY1CfNhV9lx3oxaPRAnjUcO15z4+zTi5+6COM9JXy3R8CRhDQWI5wQBL3ieVAdk0xDVO2G+6OnvtjRF6pgAEheBoVLAsYC6+4vDN/r3dZse2dnPywplmKnyV+C/2ySBUM9biRcNwCYMm/GBm8MHlX552j6088pVYHzVUTPMf+W54ipzQibAJOEwLSHzK9klbijQ/EqJwPI7AI1AwhfIyQlBgasFRLWJ5NuYLId7j95sN33nW7GvnOssX7bD92IeiqsOHhZGjPZx8eaA974f/MMIwhhSPPNqkGgZ9FgfIjnShxs5YlAJCgASMGqrA8R5ZkAdibagFJgtCbVrBUhrCeXP2+8n3tprDHV0yGchY2Q/74z/tExS7ezjv8q2X3Ni0p3Ycw+XHABCMnB2hFxVQhKXwKBCQAEC6SEvAoOakoGWAstNadSgqqFICkk1nARqpnL6JW5lN638D7SiiX5iygGNBkt6QD4O8KZb6nz6pacYD1REcPTUqQFikb45i+8ZUOqUmiMAERYGB6rJMTItqrObFsmrkp7z8FaHMbGCmYKjgSmvLNZ8Fq7aMy4CD7b1my+O/s8cllBugaMCraFOJyn3o9svnXefgJffYwqgAdS7Y+0xsihtCH6+5U00CMAKSfUFnQeBsAzAwfTMSJBstQNQw7ssqFS7yUAY1rAWkVmjNZ+tpGammlVcuH5o3Xt5v3ni1DSChQ/HKFogwKACg4p2X/dX0rWODxtYaFaB1666sxPnStZW4f0vo55PjBAJkfZAFymqMAkKgNC1aJZqFOtiTlUrY1QOcWuE0n6VMjzf6mN22bnnL9PbYj9dlkernsHLue7E/Lo37W+pRASKO9z318QPo44pKXHo28AsWHOiqgJOYk2iPAENwqEmgoklWgwQoHx/HYZvgZvyMPn3VklpaC5Dery3XPH69iIVoybzy/G7xj/SdURzxbObGK//yuJ7xaA/rjgkgVrz7Zx9rj8Pi8sgUfx1Ak6wGQRNgahYcapGN/HCAGkTTy2qTcfH1WJE/K6iucVQwBUrvKc0CMlI6y4Npzmw7th00B/d140fBTTDr4upLv9Dyc8ox3jBmgMj4W48veScyg5fHpvQSbTqdzQgSog+N4RMkOKSSlrzVpnI0iP0XduwEL/FBSmsBqQUjm68FRPNZys9otr92iKb1cos37R/HC4zWHxdAbHT3fy/ZVXajy3Hk+ltqEkESIemcIbhoDE1LzCuhBA4niwP92DjLacORAGUB0LTSrOBMZ8uZ1pi9x6kfJwbxm6+13bJkpdOtAo+XZibC8TW9ZfmvTg3cwk/8IFxoHDjexKS4LtKVmT1iwIcxFZ7CFM2b27eb3i68q4JWqVAjUfoO3stSuxazQ2Z6uMA+GXFuhTVR/1N3P770ItTjlrWuMG4N0l5WbfjoNtctL8P+bCcXYNbfWI1R8/LF1GxZCa9fBnrxo7hhzGs4kLLaoPezZUzXRtbTMtHmwP0Wxls3OJS1boDYuHXdOa/iBHAZPhTYHQbcpScDpEnhFNHDWoQOOwhd09XVJeczKmwtTQUbwWR4PwuA1leq90jxw19obHmn73c8xnFOJEwIIHb899858zdY/i3HQUsbNYm+R501F2vUJgzWdBzsgSO3QqrZ1IKkQg4ntJYpra2r5aQBHha+7Nj4Tz9eVrfvUVAnDBAZ3fLg4udNPPhn+B38Pv5eQwAScHAsEXrQnsPyElGWAYmG1IJUm1cAamkWiNp7zDPyvBzKPOpZj4JwNNoQgNjBVx44/Zc4UPsU1kcHw1xBNIdnNjzV29t2EIPWwVe3GcOBokIqJSBMK82Wa1mW8jgD44A9x+PaUowEUsMAYgc33vP+zVhIXomZrDOXy0N7AtPR0YkDsj4RUAEhzaZVaC3TvNKhABzpnHlf6+A3rNgOedu3hb//zkhCj6e8oQCx4+u/seAJnF1fBTProuPetaONW1NogQVlOHCywGTTChCpgjAczdbj99HI/27dOpwPNyA0HCCO6fNfO2FTUHAve3t327OdHb0xnXeAVy0h9nHcywlFHufcmHECCO+LGamgI4Gk91VbasHiffKCNb/ZAGyExZjeatTT2RU3ce9z7ZI/P/visyMTvQ8H/7OiyJ2NmWxWHLuz/NifCc2agTS+CPJnoo9ZmJ5zNBFugrl80f2eAqNUtZBUF4akPEbh99q+E/yinjEP12b45ehwNSepjP9pUnuz39Li5Y/zYncRTgHOwW7/YzgSORvHo/PwE0sRmx9lqpkSKIKjgeDwII6r58Fy/4sDYfMFrfedgP/mYeKh2svEeTWUw9c++9osfOnxYXwLcBGWBxcBsDNzYVOeyiVfaiSnYapBruPjM5dSV7FSuvRv13zgmUYN5j0LUFZA/mBvylu7TsPq/BOYof4Y25qPYjE4G+c80By8qzMez6Jfxs79xpvXLHwy23ai6f8XANUKede1++cV8s5HsDC9rVKJW7AXvqmvr+Oxm9ecNuGVc21f/wc2MGkdnte0ggAAAABJRU5ErkJggg==", plate: true },
+    claude: { src: "data:image/svg+xml;base64,PHN2ZyBwcmVzZXJ2ZUFzcGVjdFJhdGlvPSJub25lIiBvdmVyZmxvdz0idmlzaWJsZSIgc3R5bGU9ImRpc3BsYXk6IGJsb2NrOyIgd2lkdGg9IjMwIiBoZWlnaHQ9IjMwIiB2aWV3Qm94PSIwIDAgMzAgMzAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxnIGlkPSJjbGF1ZGUtY29sb3IgMiIgY2xpcC1wYXRoPSJ1cmwoI2NsaXAwXzBfNikiPgo8cGF0aCBpZD0iVmVjdG9yIiBkPSJNNS44ODYyNSAxOS45NDM3TDExLjc4NjIgMTYuNjM1TDExLjg4NjIgMTYuMzQ3NUwxMS43ODYyIDE2LjE4NzVIMTEuNUwxMC41MTI1IDE2LjEyNzVMNy4xNCAxNi4wMzYzTDQuMjE2MjUgMTUuOTE1TDEuMzgzNzUgMTUuNzYyNUwwLjY3IDE1LjYxMTNMMCAxNC43M0wwLjA2ODc1IDE0LjI5TDAuNjY4NzUgMTMuODg4OEwxLjUyNjI1IDEzLjk2MzdMMy40MjYyNSAxNC4wOTI1TDYuMjczNzUgMTQuMjlMOC4zMzg3NSAxNC40MTEzTDExLjQgMTQuNzNIMTEuODg2MkwxMS45NTUgMTQuNTMzN0wxMS43ODc1IDE0LjQxMTNMMTEuNjU4NyAxNC4yOUw4LjcxMTI1IDEyLjI5NUw1LjUyMTI1IDEwLjE4NUwzLjg1MTI1IDguOTdMMi45NDYyNSA4LjM1NjI1TDIuNDkxMjUgNy43Nzg3NUwyLjI5Mzc1IDYuNTE4NzVMMy4xMTM3NSA1LjYxNjI1TDQuMjE1IDUuNjkxMjVMNC40OTYyNSA1Ljc2NzVMNS42MTI1IDYuNjI1TDcuOTk3NSA4LjQ3TDExLjExMTIgMTAuNzYxM0wxMS41Njc1IDExLjE0MTNMMTEuNzQ4OCAxMS4wMTI1TDExLjc3MjUgMTAuOTIxM0wxMS41Njc1IDEwLjU3ODhMOS44NzM3NSA3LjUyMTI1TDguMDY2MjUgNC40MDg3NUw3LjI2MTI1IDMuMTE4NzVMNy4wNDg3NSAyLjM0NUM2Ljk2Nzc4IDIuMDQ3ODIgNi45MjQxMSAxLjc0MTcyIDYuOTE4NzUgMS40MzM3NUw3Ljg1Mzc1IDAuMTY3NUw4LjM3IDBMOS42MTUgMC4xNjc1TDEwLjE0IDAuNjIyNUwxMC45MTUgMi4zOUwxMi4xNjc1IDUuMTc2MjVMMTQuMTExMiA4Ljk2Mzc1TDE0LjY4MTIgMTAuMDg2M0wxNC45ODUgMTEuMTI2M0wxNS4wOTg4IDExLjQ0NUgxNS4yOTYzVjExLjI2MjVMMTUuNDU2MiA5LjEzTDE1Ljc1MjUgNi41MTEyNUwxNi4wNCAzLjE0MjVMMTYuMTQgMi4xOTI1TDE2LjYxIDEuMDU1TDE3LjU0MzcgMC40NEwxOC4yNzM4IDAuNzlMMTguODczNyAxLjY0NjI1TDE4Ljc5IDIuMjAxMjVMMTguNDMyNSA0LjUxNUwxNy43MzM4IDguMTQzNzVMMTcuMjc4NyAxMC41NzEySDE3LjU0MzdMMTcuODQ3NSAxMC4yNjg4TDE5LjA3ODcgOC42MzYyNUwyMS4xNDM4IDYuMDU2MjVMMjIuMDU2MyA1LjAzMTI1TDIzLjExODggMy45MDEyNUwyMy44MDI1IDMuMzYyNUgyNS4wOTM4TDI2LjA0MzcgNC43NzM3NUwyNS42MTg4IDYuMjMxMjVMMjQuMjg4NyA3LjkxNUwyMy4xODc1IDkuMzQyNUwyMS42MDc1IDExLjQ2NzVMMjAuNjIgMTMuMTY3NUwyMC43MTEzIDEzLjMwNUwyMC45NDYyIDEzLjI4TDI0LjUxNjMgMTIuNTIyNUwyNi40NDUgMTIuMTcyNUwyOC43NDYyIDExLjc3ODhMMjkuNzg3NSAxMi4yNjM3TDI5LjkwMTIgMTIuNzU3NUwyOS40OTEzIDEzLjc2NjJMMjcuMDMgMTQuMzczN0wyNC4xNDM4IDE0Ljk1MTNMMTkuODQ1IDE1Ljk2NzVMMTkuNzkyNSAxNi4wMDVMMTkuODUzOCAxNi4wODEyTDIxLjc5IDE2LjI2MzdMMjIuNjE3NSAxNi4zMDg3SDI0LjY0NUwyOC40MiAxNi41OUwyOS40MDc1IDE3LjI0MjVMMzAgMTguMDRMMjkuOTAxMiAxOC42NDYyTDI4LjM4MjUgMTkuNDIxMkwyNi4zMzI1IDE4LjkzNUwyMS41NDYyIDE3Ljc5NzVMMTkuOTA2MyAxNy4zODYzSDE5LjY3ODhWMTcuNTIzOEwyMS4wNDUgMTguODU4N0wyMy41NTI1IDIxLjEyMTJMMjYuNjg4NyAyNC4wMzM3TDI2Ljg0NzUgMjQuNzU2M0wyNi40NDUgMjUuMzI1TDI2LjAyIDI1LjI2MzhMMjMuMjYzOCAyMy4xOTI1TDIyLjIgMjIuMjU4N0wxOS43OTI1IDIwLjIzMzhIMTkuNjMyNVYyMC40NDYzTDIwLjE4NzUgMjEuMjU3NUwyMy4xMTg4IDI1LjY1ODhMMjMuMjcxMyAyNy4wMDg4TDIzLjA1ODggMjcuNDVMMjIuMjk4OCAyNy43MTYzTDIxLjQ2MzcgMjcuNTYzOEwxOS43NDYyIDI1LjE1NzVMMTcuOTc3NSAyMi40NDg3TDE2LjU0ODggMjAuMDJMMTYuMzczNyAyMC4xMkwxNS41MzEzIDI5LjE4NzVMMTUuMTM2MyAyOS42NUwxNC4yMjUgMzBMMTMuNDY2MiAyOS40MjM3TDEzLjA2MzggMjguNDlMMTMuNDY2MiAyNi42NDVMMTMuOTUyNSAyNC4yNEwxNC4zNDYzIDIyLjMyNzVMMTQuNzAzNyAxOS45NTI1TDE0LjkxNjIgMTkuMTYyNUwxNC45MDEyIDE5LjExTDE0LjcyNjMgMTkuMTMyNUwxMi45MzM4IDIxLjU5MTNMMTAuMjA4NyAyNS4yNzI1TDguMDUxMjUgMjcuNTc4N0w3LjUzMzc1IDI3Ljc4MzdMNi42Mzc1IDI3LjMyMTNMNi43MjEyNSAyNi40OTM3TDcuMjIyNSAyNS43NTc1TDEwLjIwNzUgMjEuOTYyNUwxMi4wMDc1IDE5LjYxTDEzLjE3IDE4LjI1MjVMMTMuMTYyNSAxOC4wNTVIMTMuMDkzOEw1LjE2NSAyMy4yTDMuNzUyNSAyMy4zODI1TDMuMTQzNzUgMjIuODEyNUwzLjIyIDIxLjg4TDMuNTA4NzUgMjEuNTc2Mkw1Ljg5Mzc1IDE5LjkzNjNMNS44ODYyNSAxOS45NDM3WiIgZmlsbD0iI0Q5Nzc1NyIvPgo8L2c+CjxkZWZzPgo8Y2xpcFBhdGggaWQ9ImNsaXAwXzBfNiI+CjxyZWN0IHdpZHRoPSIzMCIgaGVpZ2h0PSIzMCIgZmlsbD0id2hpdGUiLz4KPC9jbGlwUGF0aD4KPC9kZWZzPgo8L3N2Zz4K", plate: true },
+    notes: { src: "data:image/png;base64,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", plate: false },
+    folder: { src: "data:image/png;base64,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", plate: false },
+    mail: { src: "data:image/png;base64,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", plate: false },
+    launch: { src: "data:image/png;base64,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", plate: false },
+  };
+
+  const CONNECTORS = [
+    { id: "drive", icon: "drive", name: "Google Drive", added: true, state: "on",
+      meta: "sync il y a 6 min · 218 documents",
+      detail: [["Dossiers suivis", "4"], ["Documents", "218"], ["Dernière vérification", "il y a 6 min"], ["Prochaine sonde", "dans 4 min"]] },
+    { id: "obsidian", icon: "obsidian", name: "Obsidian", added: true, state: "on",
+      meta: "sync hier · 92 documents",
+      detail: [["Coffre", "LucidFlow"], ["Documents", "92"], ["Dernière vérification", "hier, 19:45"]] },
+    { id: "claude", icon: "claude", name: "Claude", added: true, state: "dead",
+      meta: "accès expiré · reconnecter",
+      reason: "Le jeton a expiré le 2 septembre. Reconnecte pour reprendre la synchro.",
+      detail: [["Documents", "1 204"], ["Dernière sync réussie", "2 septembre"]] },
+    { id: "notes", icon: "notes", name: "Notes Apple", added: true, state: "on",
+      meta: "sync il y a 2 h · 41 documents",
+      detail: [["Dossiers", "3"], ["Documents", "41"], ["Dernière vérification", "il y a 2 h"]] },
+    { id: "folder", icon: "folder", name: "Dossiers locaux", added: true, state: "stale", count: 3,
+      meta: "3 dossiers · scan il y a 3 j",
+      detail: [["Dossiers suivis", "3"], ["Documents", "1 291"], ["Dernier scan", "il y a 3 jours"]],
+      instances: [
+        { name: "Documents", meta: "scan il y a 3 j · 1 204 documents" },
+        { name: "Bureau", meta: "scan il y a 3 j · 87 documents" },
+        { name: "Téléchargements", meta: "scan il y a 3 j · 0 document" },
+      ] },
+    { id: "chatgpt", icon: "claude", name: "ChatGPT", added: false },
+    { id: "mail", icon: "mail", name: "Mail", added: false, soon: true },
+  ];
+
+  const CHEV = '<svg viewBox="0 0 16 16" fill="none" aria-hidden><path d="M7.435 10.965C7.7475 11.2775 8.255 11.2775 8.5675 10.965L12.5675 6.965C12.88 6.6525 12.88 6.145 12.5675 5.8325C12.255 5.52 11.7475 5.52 11.435 5.8325L8 9.2675L4.565 5.835C4.2525 5.5225 3.745 5.5225 3.4325 5.835C3.12 6.1475 3.12 6.655 3.4325 6.9675L7.4325 10.9675L7.435 10.965Z" fill="currentColor"/></svg>';
+  const BRAIN = '<svg viewBox="0 0 20 20" fill="none" aria-hidden><path d="M8.25 2C7.10625 2 6.14062 2.76875 5.84375 3.81562C4.3625 4.11875 3.25 5.42813 3.25 7C3.25 7.35313 3.30625 7.69375 3.40937 8.00937C2.7 8.60625 2.25 9.5 2.25 10.5C2.25 11.2406 2.5 11.925 2.91563 12.4719C2.80625 12.7969 2.75 13.1406 2.75 13.5C2.75 15.1875 4.0375 16.5781 5.68437 16.7344C6.17187 17.4937 7.025 18 8 18C8.7875 18 9.5 17.6688 10 17.1375C10.5 17.6688 11.2125 18 12 18C12.9719 18 13.825 17.4937 14.3156 16.7344C15.9625 16.575 17.25 15.1875 17.25 13.5C17.25 13.1406 17.1906 12.7969 17.0844 12.4719C17.5031 11.925 17.75 11.2406 17.75 10.5C17.75 9.5 17.2969 8.60625 16.5906 8.00937C16.6938 7.69062 16.75 7.35 16.75 7C16.75 5.42813 15.6375 4.11875 14.1562 3.81562C13.8594 2.76875 12.8937 2 11.75 2C11.0688 2 10.45 2.27188 10 2.71563C9.55 2.275 8.93125 2 8.25 2ZM9.25 4.5V15.3469C9.24687 15.3656 9.24375 15.3844 9.24063 15.4062C9.1625 16.0219 8.6375 16.5 8 16.5C7.475 16.5 7.025 16.1781 6.84062 15.7156C6.72187 15.4156 6.425 15.2281 6.10313 15.2469C6.06875 15.25 6.03438 15.25 6.00313 15.25C5.0375 15.25 4.25313 14.4656 4.25313 13.5C4.25313 13.2031 4.32813 12.9219 4.45625 12.6781C4.61563 12.3781 4.55313 12.0094 4.30625 11.7781C3.9625 11.4594 3.75 11.0031 3.75 10.5C3.75 9.825 4.13125 9.2375 4.69688 8.94375C4.88125 8.85 5.01563 8.68125 5.07188 8.48438C5.12813 8.2875 5.1 8.07188 4.99375 7.89375C4.8375 7.63125 4.74687 7.32812 4.74687 7C4.74687 6.03438 5.53125 5.25 6.49687 5.25C6.9125 5.25 7.24687 4.91563 7.24687 4.5C7.24687 3.94687 7.69375 3.5 8.24687 3.5C8.8 3.5 9.24687 3.94687 9.24687 4.5H9.25ZM10.75 15.3469V4.5C10.75 3.94687 11.1969 3.5 11.75 3.5C12.3031 3.5 12.75 3.94687 12.75 4.5C12.75 4.91563 13.0844 5.25 13.5 5.25C14.4656 5.25 15.25 6.03438 15.25 7C15.25 7.32812 15.1594 7.63438 15.0031 7.89375C14.8969 8.07188 14.8688 8.28437 14.925 8.48438C14.9813 8.68438 15.1188 8.85 15.3 8.94375C15.8625 9.23438 16.2469 9.82187 16.2469 10.5C16.2469 11.0031 16.0344 11.4594 15.6906 11.7781C15.4438 12.0094 15.3812 12.3781 15.5406 12.6781C15.6719 12.9219 15.7437 13.2 15.7437 13.5C15.7437 14.4656 14.9594 15.25 13.9937 15.25C13.9594 15.25 13.925 15.25 13.8938 15.2469C13.5719 15.2281 13.275 15.4187 13.1562 15.7156C12.9719 16.175 12.5187 16.5 11.9969 16.5C11.3594 16.5 10.8344 16.0219 10.7563 15.4062C10.7531 15.3875 10.75 15.3656 10.7469 15.3469H10.75Z" fill="currentColor"/></svg>';
+
+  const byId = new Map(NODES.map((n) => [n.id, n]));
+  let selected = null;
+  let tidied = 61;
+
+  /* r = 9 + 1,5·√n : la part VARIABLE est proportionnelle à l'aire, pas au
+     rayon — sinon un dossier quatre fois plus gros en paraît seize fois plus
+     gros. Le socle de 9 px garantit qu'une page reste visée à la souris.
+     Une page pèse 1 : toutes les feuilles ont donc la même taille, ce qui est
+     vrai — et c'est la forme, pas la taille, qui dit qu'elles sont des pages. */
+  const radiusOf = (n) => Math.round((9 + 1.5 * Math.sqrt(n.docs || 1)) * 10) / 10;
+  for (const n of NODES) n.r = radiusOf(n);
+
+  /* ═══ CANVAS : rendu ═══════════════════════════════════════════════════ */
+  function el(name, attrs, parent) {
+    const e = document.createElementNS(NS, name);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+
+  function drawCanvas() {
+    const eg = $("#edges"), ng = $("#nodes");
+    eg.innerHTML = ""; ng.innerHTML = "";
+
+    for (const n of NODES) {
+      if (!n.parent) continue;
+      const p = byId.get(n.parent);
+      // L'épaisseur porte la profondeur : un graphe se lit d'abord par ses
+      // liens, et tout au même poids ne dit rien de la hiérarchie.
+      const leaf = !n.kind;
+      el("line", { class: "edge" + (p.kind === "root" ? " trunk" : ""),
+                   x1: p.x, y1: p.y, x2: n.x, y2: n.y,
+                   "data-a": p.id, "data-b": n.id, "data-leaf": String(leaf) }, eg);
+    }
+    for (const [a, b] of BRIDGES) {
+      const na = byId.get(a), nb = byId.get(b);
+      const mx = (na.x + nb.x) / 2, my = (na.y + nb.y) / 2 + 90;
+      el("path", { class: "edge bridge", d: `M${na.x} ${na.y} Q ${mx} ${my} ${nb.x} ${nb.y}`,
+                   "data-a": a, "data-b": b }, eg);
+    }
+
+    for (const n of NODES) {
+      const g = el("g", { class: "node", "data-id": n.id, "data-kind": n.kind || "leaf",
+                          tabindex: "0", role: "button",
+                          "aria-label": n.label }, ng);
+      const disc = el("circle", { class: "disc", cx: n.x, cy: n.y, r: n.r }, g);
+      // La teinte porte la PROVENANCE, sur le contour — pas une pastille de
+      // 3 px dans un coin. Les dossiers restent neutres : ils agrègent
+      // plusieurs sources, aucune ne leur appartient.
+      if (n.src && !n.kind) disc.setAttribute("stroke", SOURCES[n.src].color);
+      if (n.fresh) el("circle", { class: "pulse-ring", cx: n.x, cy: n.y, r: n.r + 4.5 }, g);
+      const t = el("text", { class: "lbl", x: n.x, y: n.y + n.r + 15 }, g);
+      t.textContent = n.label;
+      if (n.docs) {
+        const s = el("text", { class: "sub", x: n.x, y: n.y + n.r + 28 }, g);
+        s.textContent = n.docs + " documents";
+      }
+      g.addEventListener("click", (ev) => { ev.stopPropagation(); select(n.id); });
+      g.addEventListener("keydown", (ev) => { if (ev.key === "Enter") select(n.id); });
+      g.addEventListener("pointerenter", () => focus(n.id));
+      g.addEventListener("pointerleave", unfocus);
+    }
+  }
+
+  /* Redessiner sans perdre l'état : drawCanvas recrée les <g>, donc la
+     sélection et la mise en avant doivent être réappliquées derrière. */
+  function redraw() {
+    if (VIEW === "zones") { drawZones(); return; }
+    drawCanvas();
+    if (selected && byId.has(selected)) {
+      document.querySelectorAll(".node").forEach((g) =>
+        g.setAttribute("aria-selected", String(g.dataset.id === selected)));
+      focus(selected);
+    } else {
+      selected = null;
+      $("#svg").removeAttribute("data-focus");
+    }
+  }
+
+  /* ── Mise en avant : le nœud, sa lignée, ses ponts ── */
+  function kin(id) {
+    const set = new Set([id]);
+    const n = byId.get(id);
+    if (n && n.parent) set.add(n.parent);
+    for (const m of NODES) if (m.parent === id) set.add(m.id);
+    for (const [a, b] of BRIDGES) {
+      if (a === id) set.add(b);
+      if (b === id) set.add(a);
+    }
+    return set;
+  }
+  function focus(id) {
+    if (VIEW !== "mind") return;
+    const set = kin(id);
+    $("#svg").setAttribute("data-focus", "true");
+    document.querySelectorAll(".node").forEach((g) =>
+      g.classList.toggle("on", set.has(g.dataset.id)));
+    document.querySelectorAll(".edge").forEach((e) =>
+      e.classList.toggle("on", set.has(e.dataset.a) && set.has(e.dataset.b)));
+  }
+  function unfocus() {
+    if (selected) return focus(selected);
+    $("#svg").removeAttribute("data-focus");
+    document.querySelectorAll(".node.on").forEach((g) => g.classList.remove("on"));
+    document.querySelectorAll(".edge.on").forEach((e) => e.classList.remove("on"));
+  }
+
+  /* ── Sélection : le panneau s'ouvre, la carte se décale pour lui ── */
+  function select(id, opts) {
+    selected = id;
+    document.querySelectorAll(".node").forEach((g) =>
+      g.setAttribute("aria-selected", String(g.dataset.id === id)));
+    document.querySelectorAll(".row").forEach((r) =>
+      r.setAttribute("aria-selected", String(r.dataset.id === id)));
+    document.querySelectorAll(".tile[data-id], .zone").forEach((t) =>
+      t.setAttribute("aria-selected", String(t.dataset.id === id)));
+    focus(id);
+    openPage(id);
+    if (!opts || opts.center !== false) center(id);
+  }
+
+  /* Arborescence de la note — transcription de ProjectTree (NodeDetail.tsx) :
+     on remonte les parents jusqu'à la racine exclue, on part du plus haut
+     ancêtre, on déplie le chemin et on surligne la page courante. L'arbre est
+     CONSTRUIT depuis `parent`, là où celui de la sidebar est une liste plate. */
+  let pgOpen = new Set(), pgTreeFor = null;
+  function renderPgTree(id) {
+    const kids = new Map();
+    for (const n of NODES) {
+      if (!n.parent) continue;
+      if (!kids.has(n.parent)) kids.set(n.parent, []);
+      kids.get(n.parent).push(n);
+    }
+    const path = [];
+    let cur = byId.get(id);
+    while (cur && cur.parent && cur.parent !== "root") {
+      const par = byId.get(cur.parent);
+      if (!par || par.id === id) break;   // sécurité anti-boucle
+      path.unshift(par);
+      cur = par;
+    }
+    const top = path[0] || byId.get(id);
+    if (!top) { $("#pgTree").innerHTML = ""; return; }
+    // On ne sème le chemin qu'au CHANGEMENT de page : le refaire à chaque rendu
+    // rouvrirait la branche que l'utilisateur vient de replier.
+    if (pgTreeFor !== id) {
+      pgTreeFor = id;
+      [...path.map((a) => a.id), id].forEach((x) => pgOpen.add(x));
+    }
+
+    const row = (n, depth) => {
+      if (depth > 8) return "";
+      const ks = kids.get(n.id) || [];
+      const open = pgOpen.has(n.id);
+      const tw = ks.length
+        ? '<button class="tw" data-tw="' + n.id + '" aria-label="Déplier">' + CHEV + "</button>"
+        : '<span class="tw"></span>';
+      const dot = n.src ? '<span class="dot-src" style="background:' + SOURCES[n.src].color + '"></span>' : "";
+      return '<li><div class="row"' + (n.id === id ? ' aria-selected="true"' : "")
+        + (ks.length ? ' data-exp="' + open + '"' : "")
+        + ' style="padding-left:calc(4px + ' + depth + ' * 15px)">'
+        + tw + '<button class="nm-btn" data-go="' + n.id + '"><span class="nm">' + n.label + "</span></button>"
+        + dot + "</div>"
+        + (open && ks.length ? '<ul class="tree">' + ks.map((k) => row(k, depth + 1)).join("") + "</ul>" : "")
+        + "</li>";
+    };
+    $("#pgTree").innerHTML = row(top, 0);
+    $("#pgTree").querySelectorAll("[data-tw]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const k = b.dataset.tw;
+        pgOpen.has(k) ? pgOpen.delete(k) : pgOpen.add(k);
+        renderPgTree(id);
+      }));
+    $("#pgTree").querySelectorAll("[data-go]").forEach((b) =>
+      b.addEventListener("click", () => select(b.dataset.go)));
+  }
+
+  function openPage(id) {
+    const n = byId.get(id);
+    if (!n) return;
+    const p = PAGES[id] || {
+      title: n.label,
+      body: "Cette page vient d'une source réelle : le cerveau en garde la structure, les mots-clés et la provenance. Le contenu d'origine, lui, ne bouge pas de là où il est.",
+      kws: ["synthèse", "mots-clés", "provenance"],
+    };
+    const src = n.src ? SOURCES[n.src] : null;
+    $("#pgName").textContent = p.title;
+    $("#pgSq").style.background = src ? src.color : "var(--color-accent)";
+    const kind = n.kind === "root" ? "Cerveau" : n.kind === "container" ? "Dossier" : "Page";
+    const children = NODES.filter((m) => m.parent === id);
+
+    $("#pgBody").innerHTML =
+      '<div class="props">'
+      + '<div class="prop"><span class="k">Type</span><span class="v">' + kind + "</span></div>"
+      + (src ? '<div class="prop"><span class="k">Source</span><span class="v">'
+          + '<span class="chip"><span class="d" style="background:' + src.color + '"></span>'
+          + src.name + "</span></span></div>" : "")
+      + (n.docs ? '<div class="prop"><span class="k">Contient</span><span class="v">' + n.docs + " documents</span></div>" : "")
+      + '<div class="prop"><span class="k">Sync</span><span class="v">il y a 6 min</span></div>'
+      + '</div><hr class="hr" />'
+      + "<h3>" + p.title + "</h3>"
+      + "<p>" + p.body + "</p>"
+      + '<div class="kw">' + p.kws.map((k) => '<span class="chip">' + k + "</span>").join("") + "</div>"
+      + (children.length
+          ? '<hr class="hr" /><span class="pane-lbl" style="padding:0">'
+            + children.length + " page" + (children.length > 1 ? "s" : "") + '</span><div class="srcs">'
+            + children.map((c) =>
+                '<button class="src-row" data-go="' + c.id + '">'
+                + '<span class="d" style="width:7px;height:7px;border-radius:50%;background:'
+                + (c.src ? SOURCES[c.src].color : "var(--color-accent)") + '"></span>'
+                + '<span class="nm">' + c.label + '</span><span class="go">›</span></button>').join("")
+            + "</div>"
+          : "")
+      + '<hr class="hr" /><p class="mut" style="font-size:12px">Ouvrir l\'original ne copie rien : '
+      + "Lucid renvoie vers le fichier là où il vit.</p>";
+
+    $("#pgBody").querySelectorAll("[data-go]").forEach((b) =>
+      b.addEventListener("click", () => select(b.dataset.go)));
+    renderPgTree(id);
+    mountPageChat();
+    const pg = $("#page");
+    const first = pg.hidden;
+    pg.hidden = false;
+    if (first) pg.classList.add("nofx");   // pas de glissement depuis le bord gauche
+    placePage();
+    if (first) requestAnimationFrame(() => pg.classList.remove("nofx"));
+  }
+  /* Moment n°4 de la chorégraphie : on ramène au nœud, il PULSE, puis la page
+     s'ouvre. Ouvrir tout de suite ferait rater le geste — on ne verrait pas où
+     on a atterri. Cette fonction était appelée par les notifications et par ⌘K
+     sans exister : chaque clic levait une ReferenceError. */
+  function reveal(id) {
+    if (!byId.has(id)) return;
+    center(id);
+    const g = document.querySelector('.node[data-id="' + id + '"]');
+    if (g) {
+      g.classList.add("pulsing");
+      setTimeout(() => g.classList.remove("pulsing"), 3000);
+    }
+    setTimeout(() => select(id, { center: false }), 620);   // le recadrage a fini
+  }
+  function closePage() {
+    $("#page").hidden = true;
+    selected = null;
+    document.querySelectorAll(".node").forEach((g) => g.setAttribute("aria-selected", "false"));
+    unfocus();
+    fit();
+  }
+
+  /* ═══ VUE ZONES ════════════════════════════════════════════════════════
+     Un dossier n'est plus une bulle reliée par des traits à ses pages : c'est
+     un ENCLOS qui les contient. L'inclusion cesse d'être dessinée, elle est
+     vue — et les 95 % d'arêtes qui ne faisaient que répéter l'arborescence
+     disparaissent, rendant l'espace aux données.
+
+     Le pavage est DÉTERMINISTE : mêmes données, même image. Le graphe à forces
+     rejoue sa physique à chaque génération, donc le cerveau de quelqu'un n'a
+     jamais deux fois la même tête — on ne peut pas se souvenir d'un endroit.
+
+     Chaque dossier pave son VRAI nombre de documents (`docs`), pas seulement
+     les nœuds nommés : c'est ce qui répond à la question que l'artifact est
+     censé trancher — « est-ce que le pavage tient à 3 000 notes ». */
+  const Z = { tile: 11, gap: 3, pad: 13, head: 22, gapZone: 30, width: 1180 };
+  let VIEW = "mind";
+  let ZONES = [];
+
+  function buildZones() {
+    const out = [];
+    let x = 24, y = 44, rowH = 0;
+    for (const f of NODES.filter((n) => n.kind === "container")) {
+      const named = NODES.filter((n) => n.parent === f.id && !n.kind);
+      const total = Math.max(named.length, f.docs || named.length);
+      const cols = Math.max(3, Math.ceil(Math.sqrt(total)));
+      const rows = Math.ceil(total / cols);
+      const w = Z.pad * 2 + cols * Z.tile + (cols - 1) * Z.gap;
+      const h = Z.head + Z.pad * 2 + rows * Z.tile + (rows - 1) * Z.gap;
+      if (x + w > Z.width - 24) { x = 24; y += rowH + Z.gapZone; rowH = 0; }
+      out.push({ f, x, y, w, h, cols, total, named });
+      // Les nœuds nommés portent leur position de zone, pour que center() et
+      // la sélection marchent dans les deux vues sans les distinguer.
+      named.forEach((n, i) => {
+        n.zx = x + Z.pad + (i % cols) * (Z.tile + Z.gap) + Z.tile / 2;
+        n.zy = y + Z.head + Z.pad + Math.floor(i / cols) * (Z.tile + Z.gap) + Z.tile / 2;
+      });
+      f.zx = x + w / 2; f.zy = y + Z.head / 2;
+      x += w + Z.gapZone;
+      rowH = Math.max(rowH, h);
+    }
+    return out;
+  }
+
+  function drawZones() {
+    const zg = $("#zones");
+    zg.innerHTML = "";
+    ZONES = buildZones();
+    const bridged = new Set(BRIDGES.flat());
+
+    for (const z of ZONES) {
+      const g = el("g", { class: "zone", "data-id": z.f.id, tabindex: "0", role: "button",
+                          "aria-label": z.f.label }, zg);
+      el("rect", { class: "zone-box", x: z.x, y: z.y, width: z.w, height: z.h, rx: 14 }, g);
+      const nm = el("text", { class: "zone-name", x: z.x + Z.pad, y: z.y + 15 }, g);
+      nm.textContent = z.f.label;
+      const cnt = el("text", { class: "zone-n", x: z.x + z.w - Z.pad, y: z.y + 15,
+                               "text-anchor": "end" }, g);
+      cnt.textContent = z.total;
+
+      for (let i = 0; i < z.total; i++) {
+        const n = z.named[i];
+        const tx = z.x + Z.pad + (i % z.cols) * (Z.tile + Z.gap);
+        const ty = z.y + Z.head + Z.pad + Math.floor(i / z.cols) * (Z.tile + Z.gap);
+        const t = el("rect", { class: "tile " + (n ? "named" : "anon"), x: tx, y: ty,
+                               width: Z.tile, height: Z.tile, rx: 3 }, g);
+        if (!n) continue;
+        t.setAttribute("data-id", n.id);
+        if (n.src) t.setAttribute("fill", SOURCES[n.src].color);
+        if (n.fresh) el("rect", { class: "tile-bridge", x: tx + Z.tile - 3, y: ty - 1,
+                                  width: 3, height: 3, rx: 1.5 }, g);
+        if (bridged.has(n.id)) el("circle", { class: "tile-bridge", cx: tx + Z.tile / 2,
+                                              cy: ty + Z.tile + 4, r: 1.8 }, g);
+        const lb = el("text", { class: "tile-lbl", x: tx + Z.tile / 2, y: ty - 4,
+                                "text-anchor": "middle" }, g);
+        lb.textContent = n.label;
+        t.addEventListener("click", (ev) => { ev.stopPropagation(); select(n.id); });
+      }
+      g.addEventListener("click", (ev) => { ev.stopPropagation(); select(z.f.id); });
+      g.addEventListener("pointerenter", () => focusZone(z.f.id));
+      g.addEventListener("pointerleave", () => focusZone(null));
+    }
+
+    // Le seul lien qu'un enclos ne peut pas dire. Il ne se dessine qu'à la
+    // demande : tracé en permanence, on rétablit exactement la pelote qu'on
+    // vient de supprimer.
+    for (const [a, b] of BRIDGES) {
+      const na = byId.get(a), nb = byId.get(b);
+      if (na.zx === undefined || nb.zx === undefined) continue;
+      const my = Math.min(na.zy, nb.zy) - 46;
+      el("path", { class: "zarc", "data-a": a, "data-b": b,
+                   d: `M${na.zx} ${na.zy} Q ${(na.zx + nb.zx) / 2} ${my} ${nb.zx} ${nb.zy}` }, zg);
+    }
+  }
+
+  /* Le survol d'un enclos : sa présence entière, le reste s'efface — et ses
+     ponts se lèvent du pavage. Barème repris de MosaicMap. */
+  function focusZone(id) {
+    const zg = $("#zones");
+    if (!id) {
+      zg.removeAttribute("data-focus");
+      zg.querySelectorAll(".zone, .zarc").forEach((e) => e.classList.remove("on"));
+      return;
+    }
+    zg.setAttribute("data-focus", "true");
+    zg.querySelectorAll(".zone").forEach((g) => g.classList.toggle("on", g.dataset.id === id));
+    const inside = new Set(NODES.filter((n) => n.parent === id).map((n) => n.id));
+    zg.querySelectorAll(".zarc").forEach((a) =>
+      a.classList.toggle("on", inside.has(a.dataset.a) || inside.has(a.dataset.b)));
+  }
+
+  function setView(v) {
+    VIEW = v;
+    document.querySelectorAll(".seg button").forEach((b) =>
+      b.setAttribute("aria-pressed", String(b.dataset.view === v)));
+    $("#edges").hidden = $("#nodes").hidden = v !== "mind";
+    $("#zones").hidden = v !== "zones";
+    redraw();
+    fit();
+  }
+
+  /* ═══ VUE : pan, zoom, recentrage — le « zoom analogique » ═════════════ */
+  const view = { x: 0, y: 0, k: 1 };
+  const VB = { w: 1200, h: 760 };
+
+  function applyView(animate) {
+    const w = $("#world");
+    w.classList.toggle("dragging", !animate);
+    w.setAttribute("transform", `translate(${view.x} ${view.y}) scale(${view.k})`);
+    $("#zLvl").textContent = Math.round(view.k * 100) + " %";
+    // De loin la structure, de près le contenu. Trois paliers, comme une carte.
+    $("#svg").dataset.lod = view.k < 0.62 ? "far" : view.k < 1.2 ? "mid" : "near";
+  }
+  function clampK(k) { return Math.min(2.4, Math.max(0.45, k)); }
+
+  function center(id) {
+    const n = byId.get(id);
+    if (!n) return;
+    // le panneau occupe la droite : on vise un peu à gauche du centre
+    const panelOpen = !$("#page").hidden && window.innerWidth > 1240;
+    const targetX = panelOpen ? VB.w * 0.34 : VB.w / 2;
+    // Chaque nœud porte deux positions, une par vue : recentrer ne doit pas
+    // savoir laquelle est affichée.
+    const nx = VIEW === "zones" && n.zx !== undefined ? n.zx : n.x;
+    const ny = VIEW === "zones" && n.zy !== undefined ? n.zy : n.y;
+    view.k = clampK(Math.max(view.k, 1.15));
+    view.x = targetX - nx * view.k;
+    view.y = VB.h / 2 - ny * view.k;
+    applyView(true);
+  }
+  /* Cadrer ce qui EXISTE, pas le viewBox. L'ancien fit() posait k=1/x=0/y=0
+     sans rien savoir de la sidebar ni de la carte du relevé : au démarrage le
+     nœud racine était à moitié hors champ et un dossier passait sous la carte. */
+  function boxOf() {
+    const acc = { x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 };
+    const eat = (x0, y0, x1, y1) => {
+      acc.x0 = Math.min(acc.x0, x0); acc.y0 = Math.min(acc.y0, y0);
+      acc.x1 = Math.max(acc.x1, x1); acc.y1 = Math.max(acc.y1, y1);
+    };
+    if (VIEW === "zones") ZONES.forEach((z) => eat(z.x, z.y, z.x + z.w, z.y + z.h));
+    else NODES.forEach((n) => eat(n.x - n.r, n.y - n.r, n.x + n.r, n.y + n.r + 30));
+    return acc.x1 > acc.x0 ? acc : null;
+  }
+  function fit() {
+    const b = boxOf();
+    if (!b) { view.k = 1; view.x = 0; view.y = 0; return applyView(true); }
+    const r = $("#stage").getBoundingClientRect();
+    const sc = Math.min(r.width / VB.w, r.height / VB.h) || 1;   // viewBox → px
+    const oX = (r.width - VB.w * sc) / 2, oY = (r.height - VB.h * sc) / 2;
+    const vb = (px, off) => (px - off) / sc;
+    // bornes de la zone réellement libre, en unités de viewBox
+    const L = vb(($("#sbShell").dataset.open === "true" ? 260 : 68) + 16, oX);
+    const R = vb(r.width - 72, oX);          // cluster + pastille de zoom
+    const T = vb(104, oY);                    // carte du relevé
+    const B = vb(r.height - 92, oY);          // dock
+    const w = Math.max(60, R - L), h = Math.max(60, B - T);
+    const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+    view.k = clampK(Math.min(w / bw, h / bh));
+    view.x = L + (w - bw * view.k) / 2 - b.x0 * view.k;
+    view.y = T + (h - bh * view.k) / 2 - b.y0 * view.k;
+    applyView(true);
+  }
+
+  (function wireStage() {
+    const stage = $("#stage");
+    let drag = null;
+
+    stage.addEventListener("pointerdown", (e) => {
+      if (e.target.closest(".node")) return;
+      drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+      stage.classList.add("grabbing");
+      stage.setPointerCapture(e.pointerId);
+    });
+    stage.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const rect = stage.getBoundingClientRect();
+      const s = VB.w / rect.width;
+      view.x = drag.vx + (e.clientX - drag.x) * s;
+      view.y = drag.vy + (e.clientY - drag.y) * s;
+      applyView(false);
+    });
+    const end = () => { drag = null; stage.classList.remove("grabbing"); };
+    stage.addEventListener("pointerup", end);
+    stage.addEventListener("pointercancel", end);
+
+    // Convention Figma : la molette DÉPLACE, ⌘/ctrl + molette zoome. Zoomer à
+    // la molette nue transforme un scroll deux doigts en dézoom accidentel.
+    stage.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const rect = stage.getBoundingClientRect();
+      const s = VB.w / rect.width;
+      if (e.ctrlKey || e.metaKey) {
+        const px = (e.clientX - rect.left) * s, py = (e.clientY - rect.top) * s;
+        const k2 = clampK(view.k * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
+        view.x = px - (px - view.x) * (k2 / view.k);
+        view.y = py - (py - view.y) * (k2 / view.k);
+        view.k = k2;
+      } else {
+        view.x -= e.deltaX * s;
+        view.y -= e.deltaY * s;
+      }
+      applyView(false);
+    }, { passive: false });
+
+    stage.addEventListener("click", (e) => {
+      if (!e.target.closest(".node")) closePage();
+    });
+    $("#zIn").addEventListener("click", () => { view.k = clampK(view.k * 1.2); applyView(true); });
+    $("#zOut").addEventListener("click", () => { view.k = clampK(view.k / 1.2); applyView(true); });
+    $("#zFit").addEventListener("click", fit);
+  })();
+
+  /* ═══ SIDEBAR ══════════════════════════════════════════════════════════ */
+  function renderTree() {
+    const q = $("#sbQuery").value.trim().toLowerCase();
+    const rows = TREE.filter((t) => !q || t.label.toLowerCase().includes(q));
+    $("#tree").innerHTML = rows.map((t) => {
+      const tw = t.exp === undefined ? '<span class="tw"></span>' : '<span class="tw">' + CHEV + "</span>";
+      const dot = t.src ? '<span class="dot-src" style="background:' + SOURCES[t.src].color + '"></span>' : "";
+      return '<li><button class="row" data-id="' + t.id + '"'
+        + ' style="padding-left:calc(4px + ' + t.depth + ' * 15px)"'
+        + (t.id === selected ? ' aria-selected="true"' : "")
+        + (t.exp === undefined ? "" : ' data-exp="' + t.exp + '"') + ">"
+        + tw + '<span class="nm">' + t.label + "</span>" + dot + "</button></li>";
+    }).join("") || '<li style="padding:8px 12px;font-size:12px;color:var(--sb-label)">Aucun résultat</li>';
+    $("#tree").querySelectorAll(".row").forEach((b) =>
+      b.addEventListener("click", () => select(b.dataset.id)));
+  }
+
+  function renderSpaces() {
+    $("#spaces").innerHTML = SPACES.map((s, i) =>
+      '<div class="space-wrap"><button class="space"'
+      + (i === 1 ? ' aria-selected="true"' : "") + ">"
+      + '<span class="bi">' + BRAIN + '</span><span class="nm">' + s + "</span></button></div>"
+    ).join("");
+    $("#spaces").querySelectorAll(".space").forEach((b) =>
+      b.addEventListener("click", () => {
+        $("#spaces").querySelectorAll(".space").forEach((o) => o.removeAttribute("aria-selected"));
+        b.setAttribute("aria-selected", "true");
+      }));
+  }
+
+  function renderBars() {
+    const max = Math.max(...BARS);
+    $("#bars").innerHTML = BARS.map((v) => {
+      const h = v === 0 ? 2 : Math.max(3, Math.round((v / max) * 15));
+      return '<div title="' + v + ' échanges"><i class="' + (v === 0 ? "z" : "") + '" style="height:' + h + 'px"></i></div>';
+    }).join("");
+  }
+
+  /* ═══ CENTRE DE NOTIFICATIONS ═════════════════════════════════════════
+     Trois natures, dans cet ordre : ce qui demande une décision, ce que Lucid
+     a fait tout seul, ce qui s'est passé sans conséquence. Une notification
+     qui n'appelle aucune action n'a pas de bouton — et un échec en a toujours un. */
+  let NOTIFS = [
+    { id: "t1", sec: "À traiter", tone: "err", icon: "claude", when: "il y a 2 j",
+      title: "Claude — accès expiré",
+      text: "Le jeton a expiré le 2 septembre. Tes sessions Claude ne se synchronisent plus depuis.",
+      actions: [{ label: "Reconnecter", primary: true, go: "connect:claude" }, { label: "Plus tard" }] },
+    { id: "t3", sec: "À traiter", tone: "warn", icon: "drive", when: "il y a 6 min",
+      title: "2 fichiers illisibles",
+      text: "Deux PDF scannés sans couche texte : l'OCR n'a rien pu en extraire. Ils sont comptés comme illisibles, pas ignorés.",
+      actions: [{ label: "Voir lesquels" }] },
+
+    { id: "g1", sec: "Depuis ta dernière visite", tone: null, icon: "drive", when: "il y a 6 min",
+      title: "3 documents ajoutés", group: [
+        { icon: "drive", title: "Mandats en cours", text: "Google Drive · il y a 6 min", go: "node:n5" },
+        { icon: "claude", title: "Sessions Claude", text: "Claude · il y a 2 h", go: "node:n11" },
+        { icon: "obsidian", title: "2026-09-05", text: "Obsidian · hier", go: "node:n9" },
+      ] },
+    { id: "a1", sec: "Depuis ta dernière visite", tone: "ok", icon: "folder", when: "il y a 1 h",
+      title: "2 fichiers rangés sans toi",
+      text: "« Devis 2026-07 » et « Grille tarifaire » ont rejoint le dossier Devis.",
+      actions: [{ label: "Annuler" }] },
+    { id: "a2", sec: "Depuis ta dernière visite", tone: null, icon: "brain", when: "il y a 3 h",
+      title: "12 consultations par tes IA",
+      text: "Claude Desktop a lu 7 pages, ChatGPT 5. Environ 84 000 tokens évités.",
+      actions: [{ label: "Voir le relevé", go: "stats" }] },
+
+    { id: "w1", sec: "Cette semaine", tone: null, icon: "brain", when: "mardi",
+      title: "Mise à jour installée",
+      text: "Version 0.2.0-beta.22. Redémarrage effectué automatiquement." },
+    { id: "w2", sec: "Cette semaine", tone: null, icon: "brain", when: "lundi",
+      title: "Sauvegarde locale créée",
+      text: "2,1 Mo, conservée sur cette machine. Trois sauvegardes disponibles." },
+  ];
+  const openStacks = new Set();
+
+  function toneColor(tone) {
+    return tone === "err" ? "var(--color-err)"
+      : tone === "warn" ? "var(--color-warn)"
+      : tone === "ok" ? "var(--color-ok)"
+      : tone === "accent" ? "var(--color-accent)" : null;
+  }
+  function ncIcon(name) {
+    if (name === "brain") return '<span class="ico" style="color:var(--color-accent)">' + BRAIN + "</span>";
+    const i = ICONS[name];
+    return i ? '<span class="ico"><img src="' + i.src + '" alt="" /></span>' : '<span class="ico">•</span>';
+  }
+  function actionsHtml(list) {
+    if (!list || !list.length) return "";
+    return '<div class="row">' + list.map((a) =>
+      '<button class="mini-btn' + (a.primary ? " ok" : "") + '"'
+      + (a.go ? ' data-go="' + a.go + '"' : "") + ">" + a.label + "</button>").join("") + "</div>";
+  }
+  function cardHtml(n) {
+    const col = toneColor(n.tone);
+    const isStack = !!n.group;
+    const inner = '<div class="ncard' + (col ? " act" : "") + '">'
+      + (col ? '<span class="bar" style="background:' + col + '"></span>' : "")
+      + ncIcon(n.icon)
+      + '<div class="body"><div class="top"><span class="ttl">' + n.title + "</span>"
+      + (isStack ? '<span class="more">' + n.group.length + "</span>" : "")
+      + '<span class="when">' + n.when + "</span></div>"
+      + (n.text ? '<div class="txt">' + n.text + "</div>" : "")
+      + actionsHtml(n.actions) + "</div>"
+      + '<button class="x" data-close="' + n.id + '" aria-label="Effacer">✕</button></div>';
+
+    if (!isStack) return '<div class="nc-slot" data-id="' + n.id + '">' + inner + "</div>";
+
+    const open = openStacks.has(n.id);
+    return '<div class="nc-slot" data-id="' + n.id + '"><div class="stack" data-open="' + open + '" data-stack="' + n.id + '">'
+      + '<span class="ghost-l g2"></span><span class="ghost-l g1"></span>'
+      + inner
+      + '<div class="stack-items"><div><div class="inner">'
+      + n.group.map((g) =>
+          '<div class="ncard" data-go="' + g.go + '">' + ncIcon(g.icon)
+          + '<div class="body"><div class="top"><span class="ttl">' + g.title + "</span></div>"
+          + '<div class="txt">' + g.text + "</div></div></div>").join("")
+      + "</div></div></div></div></div>";
+  }
+
+  function renderNC() {
+    const list = $("#ncList");
+    // Le compteur porte ce qui attend une DÉCISION. Le reste est un compte
+    // rendu : il mérite un point, pas un nombre qui réclame qu'on le vide.
+    const pending = NOTIFS.filter((n) => n.sec === "À traiter").length;
+    $("#ncCount").textContent = pending;
+    $("#ncBtn").dataset.n = pending;
+    $("#ncBtn").dataset.news = NOTIFS.length ? "true" : "false";
+    // On n'efface pas en lot ce qui attend une décision : le bouton ne porte
+    // que le compte rendu, et disparaît quand il n'y a rien à effacer.
+    $("#ncClear").hidden = NOTIFS.length === pending;
+    if (!NOTIFS.length) {
+      list.innerHTML = '<div class="nc-empty"><span class="big">✦</span>'
+        + '<span class="t2">Rien à signaler</span>'
+        + '<span class="s2">Lucid continue de lire tes sources en fond. Il te préviendra quand '
+        + "quelque chose arrive — ou quand quelque chose échoue.</span></div>";
+      return;
+    }
+    let html = "", sec = null;
+    for (const n of NOTIFS) {
+      if (n.sec !== sec) { sec = n.sec; html += '<div class="nc-sec">' + sec + "</div>"; }
+      html += cardHtml(n);
+    }
+    list.innerHTML = html;
+
+    list.querySelectorAll("[data-close]").forEach((b) =>
+      b.addEventListener("click", (e) => { e.stopPropagation(); dismiss(b.dataset.close); }));
+    list.querySelectorAll("[data-stack]").forEach((s) =>
+      s.querySelector(".ncard").addEventListener("click", (e) => {
+        if (e.target.closest("[data-close]") || e.target.closest("[data-go]")) return;
+        const id = s.dataset.stack;
+        openStacks.has(id) ? openStacks.delete(id) : openStacks.add(id);
+        s.dataset.open = String(openStacks.has(id));
+      }));
+    list.querySelectorAll("[data-go]").forEach((b) =>
+      b.addEventListener("click", (e) => { e.stopPropagation(); runGo(b.dataset.go, b); }));
+  }
+
+  /* Le reflet sur les lamelles : une seule écoute déléguée, les cartes étant
+     recréées à chaque rendu. Inerte en sombre (--lg-spec y vaut transparent). */
+  (function wireCardSpecular() {
+    const list = $("#ncList");
+    let raf = 0;
+    list.addEventListener("pointermove", (e) => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        const c = e.target.closest(".ncard");
+        if (c) {
+          const r = c.getBoundingClientRect();
+          c.style.setProperty("--mx", ((e.clientX - r.left) / r.width) * 100 + "%");
+          c.style.setProperty("--my", ((e.clientY - r.top) / r.height) * 100 + "%");
+        }
+        raf = 0;
+      });
+    });
+  })();
+
+  /* Fermer une carte : elle glisse et son emplacement s'effondre — sans ça,
+     la liste sursaute et on perd de vue où on en était. */
+  function dismiss(id) {
+    const slot = $('.nc-slot[data-id="' + id + '"]');
+    if (!slot) return;
+    slot.dataset.out = "true";
+    setTimeout(() => {
+      NOTIFS = NOTIFS.filter((n) => n.id !== id);
+      renderNC();
+    }, 300);
+  }
+
+  function runGo(go, btn) {
+    const [verb, arg] = go.split(":");
+    if (verb === "node") { toggleNC(false); reveal(arg); }
+    else if (verb === "connect") { toggleNC(false); openLp(arg); }
+    else if (verb === "stats") { toggleNC(false); $("#stats").classList.add("bump");
+      setTimeout(() => $("#stats").classList.remove("bump"), 520); }
+    else if (verb === "tidy") {
+      const card = btn && btn.closest(".nc-slot");
+      resolveProposal(arg === "yes");
+      if (card) dismiss(card.dataset.id);
+    }
+    else if (btn) { btn.textContent = "Fait"; btn.disabled = true; }
+  }
+
+  function toggleNC(force) {
+    const open = force === undefined ? $("#nc").hidden : force;
+    $("#nc").hidden = !open;
+    $("#ncBtn").setAttribute("aria-expanded", String(open));
+    if (open) renderNC();
+  }
+
+  /* ═══ ARCHIVISTE : la proposition, et ce qu'elle enseigne ══════════════ */
+  const GHOST = { id: "g1", label: "Estimation — rue de l'Exemple", parent: "c-imo",
+                  x: 1112, y: 452, src: "drive" };
+  GHOST.r = radiusOf(GHOST);
+  /* ADR-0022 : en autonomie, l'archiviste applique ce qui est certain et ne
+     range PAS ce dont il doute — il n'y a donc rien à valider. La proposition
+     n'existe que hors mode auto, et alors elle a sa place dans « À traiter ».
+     Dans les deux cas la bulle apparaît : c'est elle l'évènement, pas la carte. */
+  const PROPOSAL = { id: "t2", sec: "À traiter", tone: "accent", icon: "folder", when: "à l'instant",
+    title: "L'archiviste propose un rangement",
+    text: "« Estimation — rue de l'Exemple » irait dans Immobilier : trois documents du dossier parlent du même bien, ancré à 0,89.",
+    actions: [{ label: "Ranger", primary: true, go: "tidy:yes" }, { label: "Pas ici", go: "tidy:no" }] };
+
+  function pingBadge() {
+    const b = $("#ncBtn");
+    b.classList.add("bump");
+    setTimeout(() => b.classList.remove("bump"), 620);
+  }
+  function showProposal() {
+    if (byId.has(GHOST.id)) return;
+    NODES.push(GHOST); byId.set(GHOST.id, GHOST);
+    redraw();
+    if (autoTidy) { resolveProposal(true, { silent: true }); return; }
+    const gn = document.querySelector('.node[data-id="g1"]');
+    if (gn) {
+      gn.classList.add("ghost");
+      document.querySelector('.edge[data-b="g1"]').classList.add("bridge");
+    }
+    NOTIFS.unshift(PROPOSAL);
+    renderNC();
+    pingBadge();
+  }
+  function resolveProposal(accept, opts) {
+    const g = document.querySelector('.node[data-id="g1"]');
+    if (accept) {
+      if (g) {
+        g.classList.remove("ghost");
+        document.querySelector('.edge[data-b="g1"]').classList.remove("bridge");
+      }
+      GHOST.x = 1006; GHOST.y = 452;
+      redraw();
+      tidied += 1;
+      $("#stFoot").textContent = "78 % de moins · " + tidied + " rangés sans toi";
+      $("#stats").classList.add("bump");
+      setTimeout(() => $("#stats").classList.remove("bump"), 520);
+      $("#docCount").textContent = "439";
+      if (opts && opts.silent) {
+        // Rangé sans demander : ça ne demande pas de décision, donc pas
+        // « À traiter » — un compte rendu dans le relevé d'arrivée, annulable.
+        NOTIFS.unshift({ id: "auto1", sec: "Depuis ta dernière visite", tone: "ok", icon: "folder", when: "à l'instant",
+          title: "1 fichier rangé sans toi",
+          text: "« Estimation — rue de l'Exemple » a rejoint Immobilier · ancré à 0,89.",
+          actions: [{ label: "Annuler", go: "tidy:no" }] });
+        renderNC();
+        pingBadge();
+      }
+    } else {
+      // « Pas ici » : le refus enseigne — le document retourne au non trié.
+      const i = NODES.indexOf(GHOST);
+      if (i >= 0) NODES.splice(i, 1);
+      byId.delete(GHOST.id);
+      redraw();
+    }
+  }
+
+  /* ═══ CHATS IA LOCALE ══════════════════════════════════════════════════
+     Transcription d'AssistantPanel et de NodeChat : mêmes bulles, même Entrée
+     pour envoyer, même « Sous-pages (N) » désactivée quand il n'y en a pas.
+     Les réponses sont écrites d'avance — c'est une maquette, pas un modèle. */
+  const CREATE_INTENT = /\b(cr[ée]{2}r?|g[ée]n[èe]re|ajoute|construis|fais(?:-moi)?)\b.*\b(structure|arborescence|pages?|n(?:œ|oe)uds?)\b/i;
+  const BRAIN_REPLIES = [
+    "J'ai lu 3 pages : ADR-0025, Relevé d'activité et Pricing. Le point commun, c'est le comptage — l'une pose la règle, les deux autres s'en servent.\n\nTout est resté sur ta machine.",
+    "Rien dans le cerveau ne répond directement. Les deux pages les plus proches sont « Parité Windows » et « ADR-0015 » — je peux les résumer si tu veux.",
+  ];
+  const PAGE_REPLIES = [
+    "Cette page tient en une phrase : la structure est gardée, le contenu reste dans le fichier d'origine.",
+    "Trois mots-clés portent l'essentiel, et la source est un fichier Drive synchronisé il y a 6 min.",
+  ];
+
+  function mountChat(host, opts) {
+    let turn = 0, busy = false;
+    const kids = opts.kids || 0;
+    host.innerHTML =
+      '<div class="chat-head"><span class="bi">' + BRAIN + '</span><span class="t">Lucid IA</span>'
+      + (opts.kidsLabel
+          ? '<button class="kids-tog" data-kids aria-pressed="' + (kids > 0) + '"'
+            + (kids ? "" : " disabled")
+            + ' title="Inclure le contenu des sous-pages dans le contexte">'
+            + '<span class="d"></span>Sous-pages' + (kids ? " (" + kids + ")" : "") + "</button>"
+          : "")
+      + (opts.onClose ? '<button class="icon-btn" data-x aria-label="Fermer">✕</button>' : "")
+      + '</div><div class="chat-log" data-log><p class="chat-hint">' + opts.hint + "</p></div>"
+      + '<div class="chat-in"><textarea rows="1" data-in placeholder="' + opts.placeholder + '"></textarea>'
+      + '<button class="send" data-send aria-label="Envoyer">↑</button></div>';
+
+    const log = host.querySelector("[data-log]");
+    const ta = host.querySelector("[data-in]");
+    const kidsBtn = host.querySelector("[data-kids]");
+    const bubble = (cls, text) => {
+      const d = document.createElement("div");
+      d.className = "bub " + cls;
+      d.textContent = text;
+      log.appendChild(d);
+      log.scrollTop = log.scrollHeight;
+    };
+    function send() {
+      const q = ta.value.trim();
+      if (!q || busy) return;
+      const hint = host.querySelector(".chat-hint");
+      if (hint) hint.remove();
+      ta.value = ""; ta.style.height = "";
+      bubble("me", q);
+      busy = true;
+      const wait = document.createElement("div");
+      wait.className = "chat-wait";
+      wait.innerHTML = '<span class="dots"><i></i><i></i><i></i></span>' + opts.waiting;
+      log.appendChild(wait);
+      log.scrollTop = log.scrollHeight;
+      setTimeout(() => {
+        wait.remove();
+        // Même bifurcation que dans AssistantPanel : une intention de création
+        // ne produit pas une réponse, elle produit des pages.
+        if (opts.canCreate && CREATE_INTENT.test(q)) {
+          bubble("ai", "✅ Structure « " + q.slice(0, 34).trim() + " » créée (4 pages).");
+        } else {
+          const withKids = kidsBtn && kidsBtn.getAttribute("aria-pressed") === "true";
+          bubble("ai", (withKids ? "En incluant les sous-pages — " : "")
+                       + opts.replies[turn++ % opts.replies.length]);
+        }
+        busy = false;
+      }, 900);
+    }
+    host.querySelector("[data-send]").addEventListener("click", send);
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+    ta.addEventListener("input", () => {
+      ta.style.height = "auto";
+      ta.style.height = Math.min(96, ta.scrollHeight) + "px";
+    });
+    if (kidsBtn && kids) kidsBtn.addEventListener("click", () =>
+      kidsBtn.setAttribute("aria-pressed", String(kidsBtn.getAttribute("aria-pressed") !== "true")));
+    if (opts.onClose) host.querySelector("[data-x]").addEventListener("click", opts.onClose);
+    return ta;
+  }
+
+  function mountPageChat() {
+    const pg = $("#page");
+    if (pg.dataset.chat !== "true" || !pgTreeFor) return;
+    const kids = NODES.filter((m) => m.parent === pgTreeFor).length;
+    mountChat($("#pgChat"), {
+      kidsLabel: true, kids,
+      hint: "Pose une question sur cette page" + (kids ? " et ses sous-pages" : "") + ". Tout reste local.",
+      placeholder: "Poser une question…", waiting: "L'assistant réfléchit…",
+      replies: PAGE_REPLIES,
+    });
+  }
+
+  function setPageMode(full) {
+    const p = $("#page"), b = $("#pgWide");
+    p.dataset.mode = full ? "full" : "peek";
+    b.setAttribute("aria-pressed", String(full));
+    b.textContent = full ? "⤡" : "⤢";
+    b.title = full ? "Réduire" : "Pleine page";
+    // en pleine page le panneau recouvre la colonne de gauche : le chat du
+    // cerveau y vit, le laisser ouvert dessous n'aurait aucun sens
+    if (full) toggleBrainChat(false);
+    placePage();
+  }
+
+  function toggleBrainChat(force) {
+    const el = $("#brainChat");
+    const open = force === undefined ? el.hidden : force;
+    el.hidden = !open;
+    $("#stats").dataset.off = String(open);
+    $("#chatBtn").setAttribute("aria-expanded", String(open));
+    if (!open) { el.innerHTML = ""; return; }
+    el.style.left = clampLeft(0, 340) + "px";
+    mountChat(el, {
+      hint: "Pose une question sur ton second cerveau — l'IA locale répond à partir de ton <code>brain.md</code>. Tu peux aussi lui demander de créer des pages : « crée une structure pour gérer un projet web ».",
+      placeholder: "Demander…", waiting: "réflexion…",
+      replies: BRAIN_REPLIES, canCreate: true,
+      onClose: () => toggleBrainChat(false),
+    }).focus();
+  }
+
+  /* ═══ PALETTE ⌘K ═══════════════════════════════════════════════════════ */
+  let palIdx = 0, palRows = [];
+  function renderPal() {
+    const q = $("#palQuery").value.trim().toLowerCase();
+    palRows = NODES.filter((n) => !q || n.label.toLowerCase().includes(q)).slice(0, 40);
+    if (!palRows.length) {
+      $("#palList").innerHTML = '<p class="pal-empty">Rien ne correspond.</p>';
+      return;
+    }
+    palIdx = Math.min(palIdx, palRows.length - 1);
+    $("#palList").innerHTML = palRows.map((n, i) => {
+      const kind = n.kind === "root" ? "cerveau" : n.kind === "container" ? "dossier" : "page";
+      const c = n.src ? SOURCES[n.src].color : "var(--color-accent)";
+      return '<button class="pal-row" data-i="' + i + '"' + (i === palIdx ? ' aria-selected="true"' : "") + ">"
+        + '<span class="sq" style="background:' + c + '"></span>'
+        + '<span class="nm">' + n.label + '</span><span class="kind">' + kind + "</span></button>";
+    }).join("");
+    $("#palList").querySelectorAll("[data-i]").forEach((b) =>
+      b.addEventListener("click", () => { palIdx = +b.dataset.i; commitPal(); }));
+  }
+  function commitPal() {
+    const n = palRows[palIdx];
+    closePal();
+    if (n) reveal(n.id);
+  }
+  function openPal() {
+    $("#palScrim").hidden = false;
+    $("#palQuery").value = ""; palIdx = 0;
+    renderPal();
+    setTimeout(() => $("#palQuery").focus(), 40);
+  }
+  function closePal() { $("#palScrim").hidden = true; }
+
+  /* ═══ DOCK ═════════════════════════════════════════════════════════════ */
+  function renderDock() {
+    const added = CONNECTORS.filter((c) => c.added);
+    $("#dock").innerHTML = added.map((c) =>
+      '<button class="tile ' + (ICONS[c.icon].plate ? "plate" : "bleed") + '" data-id="' + c.id + '"'
+      + ' aria-label="' + c.name + '"><img src="' + ICONS[c.icon].src + '" alt="" />'
+      + (c.count ? '<span class="count">' + c.count + "</span>" : "")
+      + '<span class="dot ' + c.state + '"></span></button>').join("")
+      + '<span class="dock-sep"></span>'
+      + '<button class="tile bleed" id="lpTile" aria-label="Launchpad">'
+      + '<img src="' + ICONS.launch.src + '" alt="" /></button>';
+    $("#lpTile").addEventListener("click", () => openLp(null));
+    $("#dock").querySelectorAll("[data-id]").forEach((b) =>
+      b.addEventListener("click", () => openLp(b.dataset.id)));
+    wireMagnify();
+  }
+  function wireMagnify() {
+    const dock = $("#dock"), tip = $("#tip");
+    const tiles = [...dock.querySelectorAll(".tile")];
+    let raf = 0;
+    dock.addEventListener("pointermove", (e) => {
+      if (!raf) raf = requestAnimationFrame(() => {
+        tiles.forEach((t) => {
+          const r = t.getBoundingClientRect();
+          const d = Math.abs(e.clientX - (r.left + r.width / 2));
+          const f = Math.exp(-Math.pow(d / 62, 2));
+          t.style.transform = "scale(" + (1 + 0.28 * f) + ") translateY(" + (-9 * f) + "px)";
+        });
+        raf = 0;
+      });
+      const t = e.target.closest(".tile");
+      if (t) {
+        const c = CONNECTORS.find((x) => x.id === t.dataset.id);
+        tip.querySelector(".nm").textContent = c ? c.name : "Launchpad";
+        tip.querySelector(".st").textContent = c ? "· " + c.meta : "· toutes les sources";
+        const tr = t.getBoundingClientRect(), wr = $(".dock-wrap").getBoundingClientRect();
+        tip.style.left = (tr.left - wr.left + tr.width / 2) + "px";
+        tip.style.transform = "translateX(-50%)";
+        tip.dataset.show = "true";
+      } else tip.dataset.show = "false";
+    });
+    dock.addEventListener("pointerleave", () => {
+      tiles.forEach((t) => { t.style.transform = ""; });
+      tip.dataset.show = "false";
+    });
+  }
+
+  /* ═══ LAUNCHPAD ════════════════════════════════════════════════════════ */
+  let lpSel = null;
+  const stateColor = (s) => s === "dead" ? "var(--color-err)" : s === "stale" ? "var(--color-warn)" : "var(--color-ok)";
+  function tileHtml(icon, cls) {
+    const i = ICONS[icon];
+    return '<span class="tile ' + (i.plate ? "plate" : "bleed") + " " + (cls || "") + '">'
+      + '<img src="' + i.src + '" alt="" /></span>';
+  }
+  function renderLpSide() {
+    const added = CONNECTORS.filter((c) => c.added);
+    $("#lpCount").textContent = added.length + " connectés";
+    $("#lpSide").innerHTML = added.map((c) =>
+      '<button class="side-row" data-id="' + c.id + '"' + (lpSel === c.id ? ' aria-selected="true"' : "") + ">"
+      + tileHtml(c.icon, "sm") + '<span class="nm">' + c.name + "</span>"
+      + (c.count ? '<span class="n">' + c.count + "</span>" : "")
+      + '<span class="sd" style="background:' + stateColor(c.state) + '"></span></button>').join("");
+    $("#lpSide").querySelectorAll("[data-id]").forEach((b) =>
+      b.addEventListener("click", () => { lpSel = b.dataset.id; renderLpSide(); renderLpMain(); }));
+  }
+  function renderLpGrid() {
+    const q = $("#lpQuery").value.trim().toLowerCase();
+    const list = CONNECTORS.filter((c) => !q || c.name.toLowerCase().includes(q));
+    $("#lpMain").innerHTML = '<span class="pane-lbl" style="padding:0">Toutes les sources</span>'
+      + (list.length ? '<div class="grid">' + list.map((c) => {
+        if (c.soon) return '<span class="g-item soon">' + tileHtml(c.icon, "big")
+          + '<span class="lbl2">' + c.name + '</span><span class="sub2 soon">Bientôt</span></span>';
+        const badge = c.added ? '<span class="ok">✓</span>' : "";
+        const sub = c.added ? (c.count ? c.count + " ajoutés" : "Ajouté") : "Ajouter";
+        return '<button class="g-item" data-id="' + c.id + '">'
+          + '<span class="tile big ' + (ICONS[c.icon].plate ? "plate" : "bleed") + '">'
+          + '<img src="' + ICONS[c.icon].src + '" alt="" />' + badge + "</span>"
+          + '<span class="lbl2">' + c.name + '</span><span class="sub2">' + sub + "</span></button>";
+      }).join("") + "</div>"
+      : '<p class="note">Aucune source ne correspond.</p>');
+    $("#lpMain").querySelectorAll("[data-id]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const c = CONNECTORS.find((x) => x.id === b.dataset.id);
+        if (c && c.added) { lpSel = c.id; renderLpSide(); renderLpMain(); }
+      }));
+  }
+  function renderLpMain() {
+    const c = lpSel ? CONNECTORS.find((x) => x.id === lpSel) : null;
+    if (!c) return renderLpGrid();
+    const bad = c.state === "dead";
+    const inst = c.instances
+      ? '<hr class="hr" /><span class="pane-lbl" style="padding:0">' + c.instances.length
+        + ' dossiers suivis</span><div class="srcs">'
+        + c.instances.map((i) => '<div class="src-row">' + tileHtml(c.icon, "sm")
+            + '<span class="nm">' + i.name + '</span><span class="go" style="font-size:10.5px;color:var(--sb-label)">'
+            + i.meta + "</span></div>").join("") + "</div>"
+      : "";
+    $("#lpMain").innerHTML = '<div class="detail">'
+      + '<div class="d-top">' + tileHtml(c.icon, "md")
+      + '<span class="col"><span class="nm">' + c.name + "</span>"
+      + '<span class="d-state' + (bad ? " bad" : "") + '"><span class="s" style="background:'
+      + stateColor(c.state) + '"></span>' + c.meta + "</span></span>"
+      + '<button class="d-close" id="lpBack">Toutes les sources</button></div>'
+      + (bad ? '<div class="warn-box"><span>⚠</span><span>' + c.reason + "</span></div>" : "")
+      + '<div class="cells">' + (c.detail || []).map((d) =>
+          '<div class="cell"><span class="k">' + d[0] + '</span><span class="v">' + d[1] + "</span></div>").join("")
+      + "</div>" + inst
+      + '<div class="acts">'
+      + (bad ? '<button class="btn primary">Reconnecter</button>' : '<button class="btn primary">Synchroniser</button>')
+      + '<button class="btn">Choisir les dossiers</button>'
+      + '<button class="btn danger">Déconnecter</button></div></div>';
+    $("#lpBack").addEventListener("click", () => { lpSel = null; renderLpSide(); renderLpMain(); });
+  }
+  function openLp(id) {
+    lpSel = id || null;
+    $("#scrimLp").hidden = false;
+    $("#lpQuery").value = "";
+    renderLpSide(); renderLpMain();
+  }
+
+  /* ═══ RÉGLAGES ═════════════════════════════════════════════════════════ */
+  const SET_NAV = [
+    { id: "account", label: "Compte", glyph: "◍" },
+    { id: "ai", label: "IA locale", glyph: "◈" },
+    { id: "mcp", label: "MCP", glyph: "◇" },
+  ];
+  const SIDECARS = ["llama-completion", "llama-server", "pdftotext", "pdftoppm", "tesseract"];
+  let setSec = "account", autoSync = false;
+  let autoTidy = true;   // ADR-0022 : l'autonomie est le défaut
+
+  function renderSetNav() {
+    $("#setNav").innerHTML = SET_NAV.map((s) =>
+      '<button class="side-row" data-sec="' + s.id + '"' + (setSec === s.id ? ' aria-selected="true"' : "") + ">"
+      + '<span style="width:25px;text-align:center;opacity:.75">' + s.glyph + "</span>"
+      + '<span class="nm">' + s.label + "</span></button>").join("");
+    $("#setNav").querySelectorAll("[data-sec]").forEach((b) =>
+      b.addEventListener("click", () => { setSec = b.dataset.sec; renderSetNav(); renderSet(); }));
+  }
+  function renderSet() {
+    const m = $("#setMain");
+    if (setSec === "account") {
+      m.innerHTML = '<div class="grp"><div class="sec-top"><span class="h">Compte</span></div>'
+        + '<div class="who"><span class="av">L</span><span class="col">'
+        + '<span class="em">compte@example.fr</span><span class="pl">Compte Lucid · beta</span></span></div></div>'
+        + '<div class="grp"><span class="lbl3">Synchronisation</span><div class="card">'
+        + '<div class="line"><span class="col"><span class="t">Synchroniser automatiquement</span>'
+        + '<span class="s">Désactivée depuis la démo — deux machines divergent en silence tant qu\'on ne la rallume pas.</span></span>'
+        + '<button class="tog" id="togSync" aria-pressed="' + autoSync + '" aria-label="Synchronisation automatique"><i></i></button></div>'
+        + '<div class="line"><span class="k">Dernière synchro</span><span class="v">il y a 12 min · 2,1 Mo</span></div>'
+        + '<div class="line"><span class="col"><span class="t">Sauvegardes locales</span>'
+        + '<span class="s">3 conservées sur cette machine</span></span>'
+        + '<span class="v"><button class="btn">Restaurer</button></span></div></div></div>'
+        + '<div class="grp"><span class="lbl3">Vie privée</span>'
+        + '<p class="note">L\'analyse de tes documents reste sur ta machine. Seul le cerveau — le résultat, environ 2 Mo — est synchronisé entre tes appareils.</p></div>'
+        + '<div class="acts"><button class="btn danger">Se déconnecter</button></div>';
+      $("#togSync").addEventListener("click", (e) => {
+        autoSync = !autoSync;
+        e.currentTarget.setAttribute("aria-pressed", String(autoSync));
+      });
+    } else if (setSec === "ai") {
+      m.innerHTML = '<div class="grp"><div class="sec-top"><span class="h">IA locale</span>'
+        + '<button class="btn">Diagnostic</button></div>'
+        + '<p class="note">Le modèle tourne sur ta machine. Aucun document ne part vers un serveur.</p></div>'
+        + '<div class="grp"><span class="lbl3">Modèle</span><div class="card">'
+        + '<div class="line"><span class="col"><span class="t">Gemma 3 4B</span>'
+        + '<span class="s">Q4_K_M · 2,3 Go · téléchargé</span></span>'
+        + '<span class="v"><button class="btn">Retélécharger</button></span></div>'
+        + '<div class="line"><span class="k">Débit mesuré</span><span class="v">58 tok/s <span class="v mut">(Metal)</span></span></div>'
+        + '<div class="line"><span class="k">Embeddings</span><span class="v">BGE-M3 · actif</span></div></div></div>'
+        + '<div class="grp"><span class="lbl3">Archiviste</span><div class="card">'
+        + '<div class="line"><span class="col"><span class="t">Valider manuellement les actions de l\'Archiviste</span>'
+        + '<span class="s">Par défaut il applique ce qui est certain et laisse non trié ce dont il doute. Activé, chaque rangement attend ta décision dans « À traiter ».</span></span>'
+        + '<button class="tog" id="togTidy" aria-pressed="' + !autoTidy + '" aria-label="Valider manuellement les actions de l\'Archiviste"><i></i></button></div></div></div>'
+        + '<div class="grp"><span class="lbl3">Binaires embarqués</span><div class="pills">'
+        + SIDECARS.map((s) => '<span class="pill-ok"><span class="s"></span>' + s + "</span>").join("")
+        + '</div><p class="note">Les cinq démarrent depuis l\'app installée. Si l\'un manque, le rapport de scan le dit — jamais d\'échec silencieux.</p></div>';
+      $("#togTidy").addEventListener("click", (e) => {
+        autoTidy = !autoTidy;
+        e.currentTarget.setAttribute("aria-pressed", String(!autoTidy));   // le toggle nomme la validation manuelle
+        // Repasser en autonomie pendant qu'une proposition attend : elle n'a
+        // plus lieu d'être. On l'applique plutôt que de la laisser pourrir.
+        if (autoTidy && NOTIFS.some((n) => n.id === "t2")) {
+          NOTIFS = NOTIFS.filter((n) => n.id !== "t2");
+          resolveProposal(true, { silent: true });
+        }
+      });
+    } else {
+      m.innerHTML = '<div class="grp"><div class="sec-top"><span class="h">MCP</span></div>'
+        + '<p class="note">L\'adresse que tu colles dans Claude, ChatGPT ou Cursor pour qu\'ils lisent ton cerveau.</p></div>'
+        + '<div class="grp"><span class="lbl3">Adresse de ton cerveau</span>'
+        + '<div class="url"><span>https://&lt;projet&gt;.supabase.co/functions/v1/lucid-mcp?token=••••••••••••</span></div>'
+        + '<div class="acts"><button class="btn primary">Copier</button>'
+        + '<button class="btn">Régénérer</button><button class="btn danger">Révoquer</button></div>'
+        + '<p class="note warn">Régénérer invalide l\'ancienne adresse immédiatement : les IA déjà branchées devront être reconnectées.</p></div>'
+        + '<div class="grp"><span class="lbl3">Mes IA</span><div class="card">'
+        + '<div class="line"><span class="col"><span class="t">Claude Desktop</span><span class="s">config sauvegardée</span></span><span class="v mut">connecté</span></div>'
+        + '<div class="line"><span class="col"><span class="t">Claude Code</span><span class="s">config sauvegardée</span></span><span class="v mut">connecté</span></div>'
+        + '<div class="line"><span class="col"><span class="t">ChatGPT</span></span><span class="v"><button class="btn">Connecter</button></span></div>'
+        + '<div class="line"><span class="col"><span class="t">Cursor</span></span><span class="v"><button class="btn">Connecter</button></span></div>'
+        + "</div></div>"
+        + '<div class="grp"><span class="lbl3">Ce que ça a rapporté</span><div class="card">'
+        + '<div class="line"><span class="k">Échanges</span><span class="v">64 sur 14 jours</span></div>'
+        + '<div class="line"><span class="k">Tokens évités</span><span class="v">1,2 M · 78 % de moins</span></div>'
+        + '</div><p class="note">Compteurs agrégés par jour. Jamais le texte d\'une requête, jamais le libellé des pages consultées.</p></div>';
+    }
+  }
+  function openSet() { $("#scrimSet").hidden = false; renderSetNav(); renderSet(); }
+
+  /* ═══ CHROME ═══════════════════════════════════════════════════════════ */
+  /* ── La colonne du relevé : la carte, puis le ruban juste dessous. Le ruban
+        se replie DANS la carte ; le faire partir du centre de l'écran faisait
+        traverser toute la scène à une tuile de 600 px pour finir à gauche. ── */
+  function clampLeft(x, w) {
+    const open = $("#sbShell").dataset.open === "true";
+    const min = open ? 12 + 234 + 14 : 56;
+    return Math.max(min, Math.min(x, window.innerWidth - w - 12));
+  }
+  function placeStats() {
+    const st = $("#stats");
+    st.style.left = clampLeft(0, st.offsetWidth) + "px";
+    if (!$("#brainChat").hidden) $("#brainChat").style.left = clampLeft(0, 340) + "px";
+    placePage();
+  }
+
+  /* Deux tenues pour la même note : en colonne à droite pour garder le graphe
+     sous les yeux, en pleine page pour lire. La sidebar reste visible dans les
+     deux — c'est elle qui sert à passer à la note suivante. */
+  const PEEK_W = 424;
+  function placePage() {
+    const p = $("#page");
+    if (p.hidden) return;
+    const min = clampLeft(0, 0);
+    const peek = Math.max(min, window.innerWidth - 12 - PEEK_W);
+    const full = p.dataset.mode === "full" || window.innerWidth <= 1240;
+    p.style.left = (full ? min : peek) + "px";
+    p.dataset.narrow = String(window.innerWidth <= 1240);
+  }
+
+  $("#collapse").addEventListener("click", () => {
+    $("#sbShell").dataset.open = "false";
+    $("#reopen").hidden = false;
+    placeStats();
+  });
+  $("#reopen").addEventListener("click", () => {
+    $("#sbShell").dataset.open = "true";
+    $("#reopen").hidden = true;
+    placeStats();
+  });
+  document.querySelectorAll("[data-fold]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const f = $("#" + b.dataset.fold);
+      const next = f.dataset.open !== "true";
+      f.dataset.open = String(next);
+      b.closest(".sec").dataset.open = String(next);
+    }));
+  $("#sbQuery").addEventListener("input", renderTree);
+  $("#pgClose").addEventListener("click", closePage);
+  $("#pgWide").addEventListener("click", () => setPageMode($("#page").dataset.mode !== "full"));
+  $("#pgChatBtn").addEventListener("click", () => {
+    const pg = $("#page"), b = $("#pgChatBtn");
+    const on = pg.dataset.chat !== "true";
+    pg.dataset.chat = String(on);
+    b.setAttribute("aria-pressed", String(on));
+    if (!on) { $("#pgChat").innerHTML = ""; return; }
+    // le chat de page n'existe qu'en pleine page : cliquer ✦ en colonne
+    // sans rien afficher serait un bouton qui ne fait rien
+    if (pg.dataset.mode !== "full" && pg.dataset.narrow !== "true") setPageMode(true);
+    mountPageChat();
+  });
+  $("#ncBtn").addEventListener("click", () => toggleNC());
+  $("#ncClear").addEventListener("click", () => {
+    const gone = new Set(NOTIFS.filter((n) => n.sec !== "À traiter").map((n) => n.id));
+    const slots = [...document.querySelectorAll(".nc-slot")].filter((s) => gone.has(s.dataset.id));
+    slots.forEach((s, i) => setTimeout(() => { s.dataset.out = "true"; }, i * 45));
+    setTimeout(() => { NOTIFS = NOTIFS.filter((n) => !gone.has(n.id)); renderNC(); },
+               slots.length * 45 + 320);
+  });
+  $("#openSet").addEventListener("click", openSet);
+  $("#setBtn").addEventListener("click", openSet);
+  $("#chatBtn").addEventListener("click", () => toggleBrainChat());
+  document.querySelectorAll(".seg button").forEach((b) =>
+    b.addEventListener("click", () => setView(b.dataset.view)));
+  $("#scrimLp").addEventListener("click", (e) => { if (e.target === $("#scrimLp")) $("#scrimLp").hidden = true; });
+  $("#scrimSet").addEventListener("click", (e) => { if (e.target === $("#scrimSet")) $("#scrimSet").hidden = true; });
+  $("#palScrim").addEventListener("click", (e) => { if (e.target === $("#palScrim")) closePal(); });
+  $("#lpAdd").addEventListener("click", () => { lpSel = null; renderLpSide(); renderLpMain(); });
+  $("#lpQuery").addEventListener("input", () => { if (!lpSel) renderLpGrid(); });
+  $("#palQuery").addEventListener("input", () => { palIdx = 0; renderPal(); });
+
+  document.addEventListener("keydown", (e) => {
+    const meta = e.metaKey || e.ctrlKey;
+    if (meta && e.key.toLowerCase() === "k") { e.preventDefault(); openPal(); return; }
+    if (meta && e.key === ",") { e.preventDefault(); openSet(); return; }
+    if (!$("#palScrim").hidden) {
+      if (e.key === "ArrowDown") { e.preventDefault(); palIdx = Math.min(palIdx + 1, palRows.length - 1); renderPal(); }
+      if (e.key === "ArrowUp") { e.preventDefault(); palIdx = Math.max(palIdx - 1, 0); renderPal(); }
+      if (e.key === "Enter") { e.preventDefault(); commitPal(); }
+      if (e.key === "Escape") closePal();
+      return;
+    }
+    if (e.key === "Escape") {
+      if (!$("#scrimLp").hidden) { $("#scrimLp").hidden = true; return; }
+      if (!$("#scrimSet").hidden) { $("#scrimSet").hidden = true; return; }
+      if (!$("#nc").hidden) { toggleNC(false); return; }
+      if (!$("#brainChat").hidden) { toggleBrainChat(false); return; }
+      if (!$("#page").hidden) closePage();
+    }
+  });
+
+  // Le panneau se fermait à Échap ou par le badge — que le bug du z-index
+  // rendait justement inatteignable. Un clic à côté ferme, comme les modales.
+  document.addEventListener("click", (e) => {
+    if ($("#nc").hidden) return;
+    if (e.target.closest && (e.target.closest("#nc") || e.target.closest("#ncBtn"))) return;
+    toggleNC(false);
+  });
+
+  const themes = ["auto", "light", "dark"];
+  $("#themeBtn").addEventListener("click", () => {
+    const cur = document.documentElement.getAttribute("data-theme") || "auto";
+    const next = themes[(themes.indexOf(cur) + 1) % themes.length];
+    if (next === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", next);
+  });
+
+  document.querySelectorAll(".lg").forEach((elm) => {
+    let raf = 0;
+    elm.addEventListener("pointermove", (ev) => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        const r = elm.getBoundingClientRect();
+        elm.style.setProperty("--mx", ((ev.clientX - r.left) / r.width) * 100 + "%");
+        elm.style.setProperty("--my", ((ev.clientY - r.top) / r.height) * 100 + "%");
+        elm.dataset.lit = "true";
+        raf = 0;
+      });
+    });
+    elm.addEventListener("pointerleave", () => { elm.dataset.lit = "false"; });
+  });
+
+  /* ═══ DÉPART ═══════════════════════════════════════════════════════════ */
+  drawCanvas();
+  renderTree();
+  renderSpaces();
+  renderBars();
+  renderNC();
+  renderDock();
+  placeStats();
+  addEventListener("resize", placeStats);
+  fit();
+  setTimeout(pingBadge, 700);   // le relevé d'arrivée se signale là où il vit
+
+  // La chorégraphie d'ouverture : le ruban est là, l'archiviste se manifeste
+  // quelques secondes plus tard — jamais les deux en même temps.
+  setTimeout(showProposal, 2600);
+</script>
+

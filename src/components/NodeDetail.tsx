@@ -9,13 +9,12 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { openUrl, openPath } from "@tauri-apps/plugin-opener";
 import type { BrainGraph, BrainNode, NodeSnapshotInfo } from "@/lib/types";
 import { relativeDate, cn } from "@/lib/utils";
+import { SOURCE_COLOR } from "@/lib/connector-icons";
 import { exportNodeMd, synthesizeNode, saveNodeContent, loadNodeContent, listNodeSnapshots, getNodeSnapshot, renameNode, askNode, generateContent } from "@/lib/api";
 import { MarkdownEditor } from "./MarkdownEditor";
 import { AiStatusBar, useAiReady, AI_MISSING_HINT } from "./AiStatusBar";
 import { Properties } from "./Properties";
 import { parseFrontmatter, serializeFrontmatter, type Prop } from "@/lib/frontmatter";
-import claudeLogo from "@/assets/claude-logo.png";
-import driveLogo  from "@/assets/google_drive.svg.png";
 
 interface Props {
   node: BrainNode;
@@ -39,21 +38,10 @@ export const KIND_LABEL = {
   page: "Page", leaf: "Page", concept: "Page", source: "Page",
 } as const;
 
-const CONNECTOR_LOGO: Record<string, string> = {
-  "claude-code":  claudeLogo,
-  "google-drive": driveLogo,
-};
 const CONNECTOR_LABEL: Record<string, string> = {
   "claude-code":  "Claude Code",
   "google-drive": "Google Drive",
 };
-
-function ConnectorLogo({ connector }: { connector: string }) {
-  const logo = CONNECTOR_LOGO[connector];
-  const label = CONNECTOR_LABEL[connector] ?? connector;
-  if (logo) return <img src={logo} alt={label} className="size-3.5 shrink-0 rounded-sm object-contain" />;
-  return <FileText className="size-3.5 shrink-0 text-[var(--color-accent)]" />;
-}
 
 /** Arborescence du projet (depuis le plus haut parent hors racine) : branches
  *  repliables, chemin vers la page courante déplié, page courante surlignée. */
@@ -188,81 +176,64 @@ function NodeChat({ node, childCount, onCollapse }: { node: BrainNode; childCoun
   }
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-2.5">
-        <Sparkle className="size-3.5 text-[var(--color-accent)]" />
-        <span className="flex-1 text-xs font-semibold text-[var(--color-text)]">Lucid IA</span>
+    <div className="chat h-full">
+      <div className="chat-head">
+        <span className="bi"><Sparkle className="size-[15px]" /></span>
+        <span className="t">Lucid IA</span>
+        <button
+          className="kids-tog"
+          onClick={() => setWithChildren((v) => !v)}
+          disabled={childCount === 0}
+          aria-pressed={withChildren}
+          title="Inclure le contenu des sous-pages dans le contexte"
+        >
+          <span className="d" />
+          Sous-pages{childCount > 0 ? ` (${childCount})` : ""}
+        </button>
         {onCollapse && (
-          <button onClick={onCollapse} title="Replier l'assistant"
-            className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]">
+          <button className="icon-btn" onClick={onCollapse} title="Replier l'assistant" aria-label="Replier">
             <PanelRightClose className="size-3.5" />
           </button>
         )}
-        <button
-          onClick={() => setWithChildren((v) => !v)}
-          disabled={childCount === 0}
-          title="Inclure le contenu des sous-pages dans le contexte"
-          className={cn(
-            "flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] transition-colors disabled:opacity-40",
-            withChildren
-              ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-              : "border-[var(--color-border)] text-[var(--color-muted)] hover:text-[var(--color-text)]",
-          )}
-        >
-          <span className={cn("size-1.5 rounded-full", withChildren ? "bg-[var(--color-accent)]" : "bg-[var(--color-muted)]")} />
-          Sous-pages{childCount > 0 ? ` (${childCount})` : ""}
-        </button>
       </div>
 
-      <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
+      <div className="chat-log">
         {msgs.length === 0 && (
-          <p className="mt-6 text-center text-xs leading-relaxed text-[var(--color-muted)]">
-            Pose une question sur cette page{withChildren && childCount > 0 ? " et ses sous-pages" : ""}.{"\n"}
+          <p className="chat-hint">
+            Pose une question sur cette page{withChildren && childCount > 0 ? " et ses sous-pages" : ""}.
             Tout reste local.
           </p>
         )}
         {msgs.map((m, i) => (
-          <div key={i} className={cn("flex", m.role === "user" ? "justify-end" : "justify-start")}>
-            <div className={cn(
-              "max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-2 text-xs leading-relaxed",
-              m.role === "user"
-                ? "bg-[var(--color-accent)] text-white"
-                : "border border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text)]",
-            )}>
-              {m.text}
-            </div>
-          </div>
+          <div key={i} className={cn("bub", m.role === "user" ? "me" : "ai")}>{m.text}</div>
         ))}
         {loading && (
-          <div className="flex items-center gap-2 text-xs text-[var(--color-muted)]">
-            <Loader2 className="size-3.5 animate-spin" /> L'assistant réfléchit…
+          <div className="chat-wait">
+            <span className="dots"><i /><i /><i /></span> L'assistant réfléchit…
           </div>
         )}
         <div ref={endRef} />
       </div>
 
-      <div className="border-t border-[var(--color-border)] p-3">
-        <div className="flex items-end gap-2">
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-            placeholder={aiOk === false ? AI_MISSING_HINT : "Poser une question…"}
-            rows={1}
-            disabled={aiOk === false}
-            className="max-h-28 flex-1 resize-none rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-2 text-xs text-[var(--color-text)] outline-none disabled:opacity-50"
-          />
-          <button
-            onClick={send}
-            disabled={loading || !input.trim() || aiOk === false}
-            title={aiOk === false ? AI_MISSING_HINT : undefined}
-            className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--color-accent)] text-white transition-opacity hover:opacity-90 disabled:opacity-40"
-          >
-            <Send className="size-3.5" />
-          </button>
-        </div>
-        <AiStatusBar input={input} />
+      <div className="chat-in">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          placeholder={aiOk === false ? AI_MISSING_HINT : "Poser une question…"}
+          rows={1}
+          disabled={aiOk === false}
+        />
+        <button
+          className="send"
+          onClick={send}
+          disabled={loading || !input.trim() || aiOk === false}
+          title={aiOk === false ? AI_MISSING_HINT : undefined}
+        >
+          {loading ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
+        </button>
       </div>
+      <AiStatusBar input={input} />
     </div>
   );
 }
@@ -282,7 +253,6 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
       default: return null;
     }
   }, [node.id, node.connector, node.source_id]);
-  const Icon = ICON[node.kind as keyof typeof ICON] ?? FileText;
   const children = graph?.nodes.filter((n) => n.parent_id === node.id) ?? [];
 
   const [editingTitle, setEditingTitle] = useState(false);
@@ -445,115 +415,114 @@ export function NodeDetail({ node, graph, onSelect, onClose, expanded, onExpand,
   }
 
   return (
-    <div className="flex h-full w-full flex-col bg-[var(--color-surface)]">
+    <div className="flex h-full w-full flex-col">
 
-      {/* ── Header compact ── */}
-      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-3 py-2.5">
-        <Icon className="size-4 shrink-0 text-[var(--color-accent)]" />
-        <div className="min-w-0 flex-1">
-          {editingTitle ? (
-            <input
-              autoFocus
-              value={titleDraft}
-              onChange={(e) => setTitleDraft(e.target.value)}
-              onBlur={commitTitle}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") { e.preventDefault(); commitTitle(); }
-                else if (e.key === "Escape") setEditingTitle(false);
-              }}
-              className="w-full rounded border border-[var(--color-accent)] bg-[var(--color-surface-2)] px-1 py-0.5 text-sm font-semibold leading-tight text-[var(--color-text)] outline-none"
-            />
-          ) : (
-            <h3
-              className={cn("truncate text-sm font-semibold leading-tight", node.kind !== "root" && "cursor-text hover:text-[var(--color-accent)]")}
-              title={node.kind !== "root" ? "Cliquer pour renommer" : undefined}
-              onClick={() => { if (node.kind !== "root") { setTitleDraft(node.label); setEditingTitle(true); } }}
-            >
-              {node.label}
-            </h3>
-          )}
-          <p className="text-[10px] text-[var(--color-muted)]">
-            {KIND_LABEL[node.kind as keyof typeof KIND_LABEL] ?? "Page"}
-            {node.kind !== "root" && ` · poids ${node.weight}`}
-            {node.connector && (
-              <span className="ml-1.5 inline-flex items-center gap-1">
-                ·
-                <ConnectorLogo connector={node.connector} />
-                {CONNECTOR_LABEL[node.connector] ?? node.connector}
-              </span>
-            )}
-          </p>
-        </div>
+      {/* ── En-tête de page (maquette « l'app vivante ») ── */}
+      <div className="pg-head">
+        <span
+          className="sq"
+          title={node.connector ? (CONNECTOR_LABEL[node.connector] ?? node.connector) : undefined}
+          style={{ background: (node.connector && SOURCE_COLOR[node.connector]) || "var(--color-accent)" }}
+        />
+        {editingTitle ? (
+          <input
+            autoFocus
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") { e.preventDefault(); commitTitle(); }
+              else if (e.key === "Escape") setEditingTitle(false);
+            }}
+            className="nm rounded border border-[var(--color-accent)] bg-transparent px-1 py-0.5 outline-none"
+          />
+        ) : (
+          <span
+            className={cn("nm", node.kind !== "root" && "cursor-text hover:text-[var(--color-accent)]")}
+            title={node.kind !== "root" ? "Cliquer pour renommer" : undefined}
+            onClick={() => { if (node.kind !== "root") { setTitleDraft(node.label); setEditingTitle(true); } }}
+          >
+            {node.label}
+          </span>
+        )}
 
         {saveStatus !== "idle" && (
           <span className={cn(
-            "flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] transition-all",
-            saveStatus === "saving"
-              ? "text-[var(--color-muted)]"
-              : "text-[var(--color-ok)]",
+            "flex shrink-0 items-center gap-1 text-[10.5px]",
+            saveStatus === "saving" ? "text-[var(--sb-label)]" : "text-[var(--color-ok)]",
           )}>
-            {saveStatus === "saving"
-              ? <Loader2 className="size-2.5 animate-spin" />
-              : <Check className="size-2.5" />}
+            {saveStatus === "saving" ? <Loader2 className="size-2.5 animate-spin" /> : <Check className="size-2.5" />}
             {saveStatus === "saving" ? "Enregistrement…" : "Enregistré"}
           </span>
         )}
 
-        {node.kind !== "root" && (
-          <>
-            {openOriginal && (
-              <button
-                onClick={openOriginal}
-                title={node.connector === "local-file"
-                  ? "Ouvrir l'original avec l'app par défaut"
-                  : "Ouvrir l'original dans le navigateur"}
-                className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
-              >
-                <ExternalLink className="size-3.5" />
-              </button>
-            )}
-            <button
-              onClick={handleSynthesize}
-              disabled={synthesizing || aiOk === false}
-              title={aiOk === false ? AI_MISSING_HINT : "Relancer la synthèse IA"}
-              className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-accent)] disabled:opacity-40"
-            >
-              <RefreshCw className={cn("size-3.5", synthesizing && "animate-spin")} />
-            </button>
-            <button
-              onClick={() => downloadNode(node)}
-              title="Exporter en .md"
-              className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
-            >
-              <Download className="size-3.5" />
-            </button>
-            <button
-              onClick={historyMode ? () => setHistoryMode(false) : openHistory}
-              title={historyMode ? "Retour au contenu" : "Historique des versions"}
-              className={cn(
-                "rounded-md p-1 transition-colors hover:bg-[var(--color-surface-2)]",
-                historyMode ? "text-[var(--color-accent)]" : "text-[var(--color-muted)] hover:text-[var(--color-text)]",
+        <div className="pg-tools">
+          {node.kind !== "root" && (
+            <>
+              {openOriginal && (
+                <button
+                  className="icon-btn"
+                  onClick={openOriginal}
+                  title={node.connector === "local-file"
+                    ? "Ouvrir l'original avec l'app par défaut"
+                    : "Ouvrir l'original dans le navigateur"}
+                >
+                  <ExternalLink className="size-3.5" />
+                </button>
               )}
+              <button
+                className="icon-btn"
+                onClick={handleSynthesize}
+                disabled={synthesizing || aiOk === false}
+                title={aiOk === false ? AI_MISSING_HINT : "Relancer la synthèse IA"}
+              >
+                <RefreshCw className={cn("size-3.5", synthesizing && "animate-spin")} />
+              </button>
+              <button className="icon-btn" onClick={() => downloadNode(node)} title="Exporter en .md">
+                <Download className="size-3.5" />
+              </button>
+              <button
+                className="icon-btn"
+                onClick={historyMode ? () => setHistoryMode(false) : openHistory}
+                title={historyMode ? "Retour au contenu" : "Historique des versions"}
+                aria-pressed={historyMode}
+                style={historyMode ? { color: "var(--color-accent)" } : undefined}
+              >
+                <History className="size-3.5" />
+              </button>
+            </>
+          )}
+          {node.kind !== "root" && (
+            <button
+              className="icon-btn"
+              onClick={() => {
+                // Le chat de page n'a la place qu'en pleine page : cliquer ✦ en
+                // colonne sans rien afficher serait un bouton qui ne fait rien.
+                if (!expanded && onExpand) onExpand();
+                if (!chatOpen) toggleChat();
+                else if (expanded) toggleChat();
+              }}
+              aria-pressed={chatOpen && expanded}
+              title="Lucid IA sur cette page"
             >
-              <History className="size-3.5" />
+              <Sparkle className="size-3.5" />
             </button>
-          </>
-        )}
-        {onExpand && (
-          <button
-            onClick={onExpand}
-            title={expanded ? "Réduire" : "Agrandir"}
-            className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
-          >
-            {expanded ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+          )}
+          {onExpand && (
+            <button
+              id="pgWide"
+              className="icon-btn"
+              onClick={onExpand}
+              title={expanded ? "Réduire" : "Pleine page"}
+              aria-pressed={expanded}
+            >
+              {expanded ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+            </button>
+          )}
+          <button className="icon-btn" onClick={onClose} title="Fermer (Échap)" aria-label="Fermer">
+            <X className="size-4" />
           </button>
-        )}
-        <button
-          onClick={onClose}
-          className="rounded-md p-1 text-[var(--color-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]"
-        >
-          <X className="size-4" />
-        </button>
+        </div>
       </div>
 
       {/* ── Fil d'Ariane ── */}

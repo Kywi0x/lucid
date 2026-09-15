@@ -1,23 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
 import type { BrainGraph, BrainNode, Space } from "@/lib/types";
 import { supabase } from "@/lib/supabase";
-import { cn } from "@/lib/utils";
+import { SOURCE_COLOR } from "@/lib/connector-icons";
 import {
   IconChevron, IconSearch, IconPlus, IconSidebarLeft, IconBrain, IconChat,
 } from "./icons";
 
-/** Largeur totale de la sidebar (240 de contenu + 12 de padding de chaque côté). */
-export const SIDEBAR_WIDTH = 264;
+/** Largeur de la sidebar — maquette « l'app vivante » : 234 px, posée à 12 px
+ *  du bord. Le reste du chrome flottant se cale derrière (cf. `dockLeft`). */
+export const SIDEBAR_WIDTH = 234;
 
-// Indentation de l'arbre : 24 px par palier, l'icône de pliage occupe le
-// premier des deux (maquette Figma « Lucid v2 » — une feuille n'a pas d'icône
-// et son libellé retombe donc sur celui de son dossier parent).
-const INDENT = 24;
-const BASE_PAD = 12;
+/** Indentation d'un palier de l'arbre (maquette : `4px + depth * 15px`). */
+const INDENT = 15;
 
 const LUCID_SPACE: Space = { id: "lucid", name: "Lucid", node_ids: null };
 
-function SectionHeader({
+function Section({
   title, open, onToggle, children,
 }: {
   title: string;
@@ -26,26 +24,15 @@ function SectionHeader({
   children?: React.ReactNode;
 }) {
   return (
-    <div className="flex w-full items-center gap-1 pb-[5px] pl-[18px] pr-3 pt-[15px]">
+    <div className="sec" data-open={open}>
+      <button type="button" className="ttl" onClick={onToggle}>{title}</button>
       <button
         type="button"
-        onClick={onToggle}
-        className="flex-1 text-left text-sm font-medium leading-[14px] text-[var(--sb-label)]"
-      >
-        {title}
-      </button>
-      <button
-        type="button"
+        className="icon-btn chev"
         onClick={onToggle}
         aria-label={open ? `Replier ${title}` : `Déplier ${title}`}
-        className="text-[var(--sb-icon)] transition-colors duration-150 hover:text-[var(--sb-label)]"
       >
-        <IconChevron
-          className={cn(
-            "size-4 transition-transform duration-[240ms] [transition-timing-function:var(--sb-ease)]",
-            !open && "-rotate-90",
-          )}
-        />
+        <IconChevron />
       </button>
       {children}
     </div>
@@ -100,65 +87,40 @@ function StructureTree({
     const children = childrenOf.get(node.id) ?? [];
     const hasChildren = children.length > 0;
     const isOpen = expanded.has(node.id) || !!q;
-    const selected = selectedId === node.id;
+    const color = node.connector ? SOURCE_COLOR[node.connector] : undefined;
 
     return (
       <li key={node.id}>
-        <div
+        <button
+          type="button"
+          className="row"
+          style={{ paddingLeft: 4 + depth * INDENT }}
+          aria-selected={selectedId === node.id || undefined}
+          data-exp={hasChildren ? isOpen : undefined}
           onClick={() => { if (hasChildren) toggle(node.id); onSelect(node); }}
-          style={{ paddingLeft: BASE_PAD + depth * INDENT }}
-          className={cn(
-            "sb-press flex cursor-pointer items-center gap-2 rounded-[6px] py-1 pr-3",
-            "transition-colors duration-150 [transition-timing-function:var(--sb-ease)]",
-            selected
-              ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-              : "text-[var(--sb-text)] hover:bg-[var(--sb-hover)]",
-          )}
         >
-          {hasChildren && (
-            <button
-              type="button"
-              aria-expanded={isOpen}
-              aria-label={isOpen ? `Replier ${node.label}` : `Déplier ${node.label}`}
-              onClick={(e) => { e.stopPropagation(); toggle(node.id); }}
-              // Cible de 24 px sans grossir la ligne : le glyphe reste à 16 px,
-              // la marge négative absorbe le padding.
-              className={cn(
-                "-m-1 shrink-0 rounded p-1 transition-colors duration-150",
-                selected ? "text-[var(--color-accent)]" : "text-[var(--sb-icon)]",
-              )}
-            >
-                <IconChevron
-                  className={cn(
-                    "size-4 transition-transform duration-[240ms] [transition-timing-function:var(--sb-ease)]",
-                    !isOpen && "-rotate-90",
-                  )}
-                />
-            </button>
-          )}
-          <span
-            className={cn(
-              "min-w-0 flex-1 truncate text-[13px]",
-              hasChildren ? "font-medium" : "font-normal",
-            )}
-          >
-            {node.label}
-          </span>
-        </div>
+          <span className="tw">{hasChildren && <IconChevron />}</span>
+          <span className="nm">{node.label}</span>
+          {color && <span className="dot-src" style={{ background: color }} />}
+        </button>
         {hasChildren && (
-          <div className="sb-collapse" data-open={isOpen}>
-            <ul>{children.map((c) => renderNode(c, depth + 1))}</ul>
+          <div className="fold" data-open={isOpen}>
+            <ul className="tree">{children.map((c) => renderNode(c, depth + 1))}</ul>
           </div>
         )}
       </li>
     );
   }
 
-  return (
-    <ul className="w-full px-3 py-1">
-      {topLevel.filter(nodeMatches).map((n) => renderNode(n, 0))}
-    </ul>
-  );
+  const rows = topLevel.filter(nodeMatches);
+  if (!rows.length) {
+    return (
+      <ul className="tree">
+        <li style={{ padding: "8px 12px", fontSize: 12, color: "var(--sb-label)" }}>Aucun résultat</li>
+      </ul>
+    );
+  }
+  return <ul className="tree">{rows.map((n) => renderNode(n, 0))}</ul>;
 }
 
 // ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -172,6 +134,7 @@ export function Sidebar({
   onCollapse,
   onOpenChat,
   chatOpen = false,
+  onOpenSettings,
   spaces,
   activeSpaceId,
   onSpaceSelect,
@@ -189,6 +152,8 @@ export function Sidebar({
   /** Bulle « open-chat » de la top-bar → panneau Lucid IA. */
   onOpenChat?: () => void;
   chatOpen?: boolean;
+  /** Pied de la sidebar (avatar + adresse) → Réglages. */
+  onOpenSettings?: () => void;
   spaces: Space[];
   activeSpaceId: string | null;
   onSpaceSelect: (id: string | null) => void;
@@ -225,79 +190,70 @@ export function Sidebar({
   }
 
   return (
-    <div
-      className="sidebar glass flex h-full flex-col rounded-[22px] p-3 text-[var(--sb-text)]"
-      style={{ width: SIDEBAR_WIDTH }}
-    >
-      {/* ── top-bar ── */}
-      <div className="flex w-full shrink-0 flex-col gap-3 px-3 py-2">
-        <div className="flex w-full items-center justify-between">
-          <div className="flex items-center gap-0.5">
-            <span className="whitespace-nowrap text-sm font-semibold leading-[14px]">
-              {docCount} Documents
-            </span>
+    <div className="sidebar lg" style={{ width: SIDEBAR_WIDTH }}>
+      <div className="sb-top">
+        <div className="sb-row">
+          <div className="sb-count">
+            <b>{docCount}</b><em>document{docCount > 1 ? "s" : ""}</em>
+          </div>
+          <div style={{ display: "flex", gap: 2 }}>
             <button
               type="button"
+              className="icon-btn accent"
               onClick={onOpenChat}
               title="Lucid IA"
-              className={cn(
-                "sb-press p-0.5 transition-[opacity,transform] duration-200",
-                "[transition-timing-function:var(--sb-ease)] hover:scale-110 hover:opacity-100",
-                chatOpen ? "opacity-100" : "opacity-90",
-              )}
-              style={{ color: "var(--color-accent)" }}
+              aria-label="Lucid IA"
+              aria-pressed={chatOpen}
             >
-              <IconChat className="size-5" />
+              <IconChat className="size-[17px]" />
+            </button>
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={onCollapse}
+              title="Replier la barre latérale"
+              aria-label="Replier la barre latérale"
+            >
+              <IconSidebarLeft className="size-[17px]" />
             </button>
           </div>
-          <button
-            type="button"
-            onClick={onCollapse}
-            title="Replier la barre latérale"
-            className="sb-press text-[var(--sb-text)] opacity-70 transition-opacity duration-200 hover:opacity-100"
-          >
-            <IconSidebarLeft className="size-5" />
-          </button>
         </div>
 
-        <div className="flex h-8 w-full items-center gap-2 rounded-lg border-[0.5px] border-[var(--sb-field)] px-2 transition-colors duration-200 [transition-timing-function:var(--sb-ease)] focus-within:border-[var(--color-accent)]">
+        <label className="field">
           <input
+            type="text"
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
-            placeholder="Rechercher un fichier…"
-            className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-[var(--sb-placeholder)]"
+            placeholder="Rechercher…"
+            aria-label="Rechercher un document"
           />
-          <IconSearch className="size-4 shrink-0 text-[var(--sb-label)]" />
-        </div>
+          <IconSearch className="size-[14px]" />
+        </label>
       </div>
 
-      {/* ── content-bar ── */}
-      <div className="flex min-h-0 w-full flex-1 flex-col overflow-y-auto">
-        <div className="w-full shrink-0">
-          <SectionHeader title="Structure" open={structureOpen} onToggle={() => setStructureOpen((v) => !v)} />
-        </div>
-        <div className="sb-collapse shrink-0" data-open={structureOpen && !!graph}>
-          <div className="max-h-[45vh] overflow-y-auto">
+      <div className="sb-body">
+        <Section title="Structure" open={structureOpen} onToggle={() => setStructureOpen((v) => !v)} />
+        <div className="fold" data-open={structureOpen && !!graph}>
+          <div>
             {graph && (
               <StructureTree graph={graph} onSelect={onSelect} selectedId={selectedId} query={query} />
             )}
           </div>
         </div>
 
-        <div className="w-full shrink-0">
-          <SectionHeader title="Spaces" open={spacesOpen} onToggle={() => setSpacesOpen((v) => !v)}>
-            <button
-              type="button"
-              onClick={() => { setSpacesOpen(true); setCreating(true); }}
-              title="Nouveau space"
-              className="sb-press text-[var(--sb-icon)] transition-[color,transform] duration-200 [transition-timing-function:var(--sb-ease)] hover:rotate-90 hover:text-[var(--color-accent)]"
-            >
-              <IconPlus className="size-4" />
-            </button>
-          </SectionHeader>
-        </div>
+        <Section title="Spaces" open={spacesOpen} onToggle={() => setSpacesOpen((v) => !v)}>
+          <button
+            type="button"
+            className="icon-btn plus"
+            onClick={() => { setSpacesOpen(true); setCreating(true); }}
+            title="Nouveau space"
+            aria-label="Nouveau space"
+          >
+            <IconPlus className="size-[14px]" />
+          </button>
+        </Section>
 
-        <div className="sb-collapse w-full shrink-0" data-open={spacesOpen}>
+        <div className="fold" data-open={spacesOpen}>
           <div>
             {allSpaces.map((s) => {
               const isActive = s.id === "lucid"
@@ -305,40 +261,34 @@ export function Sidebar({
                 : activeSpaceId === s.id;
               const shareable = s.id !== "lucid" && !!onSpaceShare;
               return (
-                // Chaque space a son propre conteneur px-3/py-1 : c'est ce qui
-                // donne les 8 px d'air entre les lignes de la maquette.
-                <div key={s.id} className="w-full px-3 py-1">
-                  <div
+                <div key={s.id} className="space-wrap">
+                  <button
+                    type="button"
+                    className="space group"
+                    aria-selected={isActive || undefined}
                     onClick={() => onSpaceSelect(s.id === "lucid" ? null : s.id)}
-                    className={cn(
-                      "sb-press group flex cursor-pointer items-center gap-2 rounded-[6px] px-3 py-1",
-                      "transition-colors duration-150 [transition-timing-function:var(--sb-ease)]",
-                      isActive
-                        ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                        : "text-[var(--sb-text)] hover:bg-[var(--sb-hover)]",
-                    )}
                   >
-                    <span style={{ color: "var(--color-accent)" }}>
-                      <IconBrain className="size-5 shrink-0" />
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{s.name}</span>
+                    <span className="bi"><IconBrain /></span>
+                    <span className="nm">{s.name}</span>
                     {shareable && (
-                      <button
-                        type="button"
+                      <span
+                        role="button"
+                        tabIndex={0}
                         onClick={(e) => { e.stopPropagation(); onSpaceShare!(s); }}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.stopPropagation(); onSpaceShare!(s); } }}
                         title="Partager ce space"
                         className="shrink-0 text-[var(--sb-icon)] opacity-0 transition-opacity hover:text-[var(--color-accent)] group-hover:opacity-100"
                       >
-                        <IconPlus className="size-4 rotate-45" />
-                      </button>
+                        <IconPlus className="size-[14px] rotate-45" />
+                      </span>
                     )}
-                  </div>
+                  </button>
                 </div>
               );
             })}
 
             {creating && (
-              <div className="w-full px-3 py-1">
+              <div className="space-wrap">
                 <input
                   autoFocus
                   value={newName}
@@ -349,27 +299,19 @@ export function Sidebar({
                   }}
                   onBlur={submitCreate}
                   placeholder="Nom du space…"
-                  className="w-full rounded-[6px] border-[0.5px] border-[var(--color-accent)] bg-transparent px-3 py-1 text-[13px] outline-none placeholder:text-[var(--sb-placeholder)]"
+                  className="w-full rounded-[7px] border-[0.5px] border-[var(--color-accent)] bg-transparent px-2 py-1 text-[12.5px] text-[var(--sb-text)] outline-none placeholder:text-[var(--sb-placeholder)]"
                 />
               </div>
             )}
 
             {sharedWithMe.length > 0 && (
               <>
-                <div className="px-[18px] pb-[5px] pt-[15px] text-sm font-medium leading-[14px] text-[var(--sb-label)]">
-                  Partagés avec moi
-                </div>
+                <div className="sec"><span className="ttl">Partagés avec moi</span></div>
                 {sharedWithMe.map((s) => (
-                  <div key={s.id} className="w-full px-3 py-1">
-                    <button
-                      type="button"
-                      onClick={() => onOpenShared?.(s.id)}
-                      className="flex w-full cursor-pointer items-center gap-2 rounded-[6px] px-3 py-1 text-left text-[var(--sb-text)] hover:bg-[var(--sb-hover)]"
-                    >
-                      <span className="text-[var(--sb-icon)]">
-                        <IconBrain className="size-5 shrink-0" />
-                      </span>
-                      <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{s.title}</span>
+                  <div key={s.id} className="space-wrap">
+                    <button type="button" className="space" onClick={() => onOpenShared?.(s.id)}>
+                      <span className="bi" style={{ color: "var(--sb-icon)" }}><IconBrain /></span>
+                      <span className="nm">{s.title}</span>
                     </button>
                   </div>
                 ))}
@@ -379,11 +321,11 @@ export function Sidebar({
         </div>
       </div>
 
-      {/* ── bottom-bar ── */}
       {email && (
-        <div className="flex w-full shrink-0 items-center py-2">
-          <span className="truncate text-sm font-semibold leading-[14px]">{email}</span>
-        </div>
+        <button type="button" className="sb-foot" onClick={onOpenSettings} title="Réglages (⌘,)">
+          <span className="avatar">{email.slice(0, 1).toUpperCase()}</span>
+          <span>{email}</span>
+        </button>
       )}
     </div>
   );

@@ -511,6 +511,14 @@ export function BrainMap({
   // Refs partagés avec la boucle de rendu / les handlers (évite les closures périmées).
   const cam = useRef({ x: 0, y: 0, zoom: 1 });
   const camTarget = useRef({ x: 0, y: 0, zoom: 1 });
+  // Pastille de zoom (maquette « l'app vivante »). Le libellé est écrit
+  // directement dans le DOM par la boucle de rendu : un state React rerendrait
+  // tout le canvas 60 fois par seconde pour trois caractères.
+  const zLvlRef = useRef<HTMLSpanElement>(null);
+  const zoomBy = (f: number) => {
+    const ct = camTarget.current;
+    ct.zoom = Math.max(0.12, Math.min(4, ct.zoom * f));
+  };
   // Premier cadrage instantané ; les suivants (graphe qui grandit en live,
   // régénération) glissent via le lerp caméra au lieu de sauter.
   const didFit = useRef(false);
@@ -769,6 +777,11 @@ export function BrainMap({
       if (Math.abs(ct.x - c.x) < 0.1) c.x = ct.x;
       if (Math.abs(ct.y - c.y) < 0.1) c.y = ct.y;
       if (Math.abs(ct.zoom - c.zoom) < 0.0005) c.zoom = ct.zoom;
+      const pct = Math.round(c.zoom * 100);
+      if (zLvlRef.current && zLvlRef.current.dataset.pct !== String(pct)) {
+        zLvlRef.current.dataset.pct = String(pct);
+        zLvlRef.current.textContent = `${pct} %`;
+      }
 
       const sx = (wx: number) => CX + (wx - c.x) * c.zoom;
       const sy = (wy: number) => H / 2 + (wy - c.y) * c.zoom;
@@ -1295,6 +1308,14 @@ export function BrainMap({
           )}
         </div>
       )}
+
+      {/* ── Pastille de zoom : le « zoom analogique » de la maquette ── */}
+      <div className="zoom lg">
+        <button onClick={() => zoomBy(1 / 1.25)} title="Dézoomer" aria-label="Dézoomer">−</button>
+        <span className="lv" ref={zLvlRef}>100 %</span>
+        <button onClick={() => zoomBy(1.25)} title="Zoomer" aria-label="Zoomer">+</button>
+        <button onClick={() => { needsFit.current = true; }} title="Tout voir" aria-label="Tout voir">⤢</button>
+      </div>
 
       {movePicker && onMoveNode && (() => {
         const banned = new Set([movePicker, ...getDescendants(movePicker, childrenOf)]);
